@@ -433,6 +433,12 @@ mod tests {
     }
     const ROOT: u64 = (5 << 48) | 5;
 
+    /// The path `VolumeTree::path` builds from these components, on any host OS (CI runs Linux,
+    /// where `PathBuf::from(r"C:\a")` is a single component).
+    fn p(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
     #[test]
     fn rebuilds_paths_from_mft_order() {
         let mut b = TreeBuilder::new();
@@ -451,8 +457,8 @@ mod tests {
             assert!(t.parent(i).unwrap() < i, "parents precede children");
         }
         let paths: Vec<_> = (0..t.len() as u32).map(|i| t.path(i)).collect();
-        assert!(paths.contains(&PathBuf::from(r"C:\Users\docs\notes.txt")));
-        assert!(paths.contains(&PathBuf::from(r"C:\pagefile.sys")));
+        assert!(paths.contains(&p(&["C:\\", "Users", "docs", "notes.txt"])));
+        assert!(paths.contains(&p(&["C:\\", "pagefile.sys"])));
         let docs = t.iter().find(|e| e.name == "docs").unwrap();
         assert!(docs.is_dir());
         assert_eq!(docs.size, None);
@@ -471,7 +477,7 @@ mod tests {
         let t = b.finish("D:\\");
         assert_eq!(t.len(), 2);
         assert_eq!(t.orphan_count(), 5);
-        assert_eq!(t.path(1), PathBuf::from(r"D:\ok"));
+        assert_eq!(t.path(1), p(&["D:\\", "ok"]));
     }
 
     #[test]
@@ -493,7 +499,7 @@ mod tests {
         b.push(r(7, 1), r(1 << 40, 1), 0, "child");
         let t = b.finish("C:\\");
         assert_eq!(t.len(), 3);
-        assert_eq!(t.path(2), PathBuf::from(r"C:\far\child"));
+        assert_eq!(t.path(2), p(&["C:\\", "far", "child"]));
         assert!(matches!(t.ref_lookup().map, RefMap::Sparse(_)));
     }
 
