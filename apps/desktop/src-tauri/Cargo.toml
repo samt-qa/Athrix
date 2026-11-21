@@ -18,8 +18,18 @@ tauri-build.workspace = true
 
 [dependencies]
 athrix-core.workspace = true
+athrix-fs-index.workspace = true
+athrix-query.workspace = true
 athrix-text-ar.workspace = true
+nass.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

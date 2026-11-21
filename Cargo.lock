@@ -228,12 +228,17 @@ name = "athrix-desktop"
 version = "0.0.1"
 dependencies = [
  "athrix-core",
+ "athrix-fs-index",
+ "athrix-query",
  "athrix-text-ar",
+ "nass",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -248,11 +253,15 @@ name = "athrix-fs-index"
 version = "0.0.1"
 dependencies = [
  "athrix-core",
+ "athrix-query",
  "athrix-text-ar",
+ "chrono",
+ "crc32fast",
  "criterion",
  "globset",
  "jwalk",
  "memchr",
+ "proptest",
  "rayon",
  "tempfile",
  "tracing",

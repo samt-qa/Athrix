@@ -315,7 +315,11 @@ mod tests {
             assert!(ix.path(id).exists(), "{:?}", ix.path(id));
         }
         let id = ix
-            .search(&Query::parse("محاضرة"), 10, &AtomicBool::new(false))
+            .search(
+                &Query::parse("محاضرة").unwrap(),
+                10,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(id.len(), 1);
         let meta = ix.meta(id[0]);

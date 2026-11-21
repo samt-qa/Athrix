@@ -6,10 +6,10 @@ use std::path::PathBuf;
 pub type EntryId = u32;
 
 /// Marks a root entry (no parent).
-const NO_PARENT: u32 = u32::MAX;
+pub(crate) const NO_PARENT: u32 = u32::MAX;
 
-const FLAG_DIR: u8 = 1;
-const FLAG_SYMLINK: u8 = 1 << 1;
+pub(crate) const FLAG_DIR: u8 = 1;
+pub(crate) const FLAG_SYMLINK: u8 = 1 << 1;
 
 /// Metadata stored for every entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,10 +66,10 @@ impl Arena {
 pub struct FileIndex {
     pub(crate) names: Arena,
     pub(crate) normalized: Arena,
-    parents: Vec<u32>,
-    flags: Vec<u8>,
-    sizes: Vec<u64>,
-    mtimes: Vec<i64>,
+    pub(crate) parents: Vec<u32>,
+    pub(crate) flags: Vec<u8>,
+    pub(crate) sizes: Vec<u64>,
+    pub(crate) mtimes: Vec<i64>,
 }
 
 impl FileIndex {

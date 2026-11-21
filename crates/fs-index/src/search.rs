@@ -1,28 +1,41 @@
-//! Name search over the normalized-name arena.
+//! Compiled queries and the parallel scan over the index.
 //!
-//! Query syntax (a subset of `docs/01-RESEARCH-AND-FEATURES.md` §5.1):
+//! The query text is parsed by [`athrix_query::parse`] (full syntax: `AND`/`|`/`!`/`< >`,
+//! filters, Arabic synonyms) and then **compiled** once into a [`Query`]: every term is
+//! normalized with [`athrix_text_ar::normalize_name_into`] (exactly like the index), wildcard
+//! patterns are pre-split, extensions are lower-cased and dates are resolved against a clock.
+//! [`FileIndex::search`] then evaluates the compiled tree for each entry.
 //!
-//! - Words separated by spaces are ANDed; each word must match the entry's **name**.
-//!   (Matching words against the full path is planned and not done yet.)
-//! - `word` matches anywhere in the name (substring).
+//! # Plain terms
+//!
+//! - `word` matches anywhere in the entry's **name** (substring).
 //! - `^word` matches at the start of the name, `word$` at the end, `^word$` the whole name.
 //! - A word containing `*` (any run of characters) or `?` (exactly one character) is a
 //!   wildcard pattern matched against the **whole** name, Everything-style: `*.pdf`, `فاتورة_??`.
+//! - A `"quoted phrase"` is a literal substring (spaces included; `*`, `?`, `^`, `$` are not
+//!   special inside quotes).
 //!
-//! Both the query and the names go through the same Arabic/Latin normalization
-//! ([`athrix_text_ar::normalize_name_into`]): case, diacritics, tatweel and alef/yaa variants are
-//! ignored, Arabic-Indic digits equal ASCII digits, and punctuation (`.`, `_`, `-`, ...) becomes a
-//! single space. Consequently `?` counts normalized characters, and punctuation at the very edge
-//! of a name is dropped (`*.pdf` does not match a file named just `.pdf`).
+//! Both the query and the names go through the same Arabic/Latin normalization: case,
+//! diacritics, tatweel and alef/yaa variants are ignored, Arabic-Indic digits equal ASCII digits,
+//! and punctuation (`.`, `_`, `-`, ...) becomes a single space. Consequently `?` counts normalized
+//! characters, and punctuation at the very edge of a name is dropped (`*.pdf` does not match a
+//! file named just `.pdf`). A term that normalizes to nothing (a lone `^`) matches everything.
+//!
+//! The supported filters are listed in [`crate::exec`]'s documentation. Filters the name index
+//! cannot answer are rejected at compile time with [`QueryError::Unsupported`] instead of
+//! silently matching everything.
 //!
 //! Results come back in index (walk) order; ranking/sorting is a later task.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use athrix_core::{Error, Result};
+use athrix_query::{FilterName, ParseError, Span};
 use memchr::memmem;
 use rayon::prelude::*;
 
+use crate::exec::{self, Clock, Entry, Node, Scratch};
 use crate::index::{EntryId, FileIndex};
 
 /// Entries scanned per parallel task.
@@ -30,61 +43,207 @@ const CHUNK: usize = 16 * 1024;
 /// How often (in entries) a task checks the cancellation flag.
 const CANCEL_CHECK_EVERY: usize = 4 * 1024;
 
-/// A parsed, normalized name query. Parse once per keystroke with [`Query::parse`], then run it
-/// with [`FileIndex::search`].
+/// Why a query could not be compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QueryError {
+    /// The text is not a valid query (see [`athrix_query::ParseErrorKind`]).
+    Parse(ParseError),
+    /// The query is valid, but uses a filter (or a form of one) that the name index cannot
+    /// answer yet, such as `content:` or `sem:`. The UI should show `message` at `span`.
+    Unsupported {
+        /// The filter.
+        filter: FilterName,
+        /// The bytes of the whole filter (`content:foo`) in the query string.
+        span: Span,
+        /// A friendly English explanation.
+        message: String,
+    },
+}
+
+impl QueryError {
+    /// The offending bytes of the query string.
+    pub fn span(&self) -> Span {
+        match self {
+            QueryError::Parse(e) => e.span,
+            QueryError::Unsupported { span, .. } => *span,
+        }
+    }
+
+    /// A friendly English explanation.
+    pub fn message(&self) -> &str {
+        match self {
+            QueryError::Parse(e) => &e.message,
+            QueryError::Unsupported { message, .. } => message,
+        }
+    }
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryError::Parse(e) => e.fmt(f),
+            QueryError::Unsupported { span, message, .. } => {
+                write!(f, "unsupported query at position {}: {message}", span.start)
+            }
+        }
+    }
+}
+
+impl std::error::Error for QueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            QueryError::Parse(e) => Some(e),
+            QueryError::Unsupported { .. } => None,
+        }
+    }
+}
+
+impl From<ParseError> for QueryError {
+    fn from(e: ParseError) -> Self {
+        QueryError::Parse(e)
+    }
+}
+
+impl From<QueryError> for Error {
+    fn from(e: QueryError) -> Self {
+        match e {
+            QueryError::Parse(p) => p.into(),
+            QueryError::Unsupported { span, message, .. } => Error::InvalidQuery {
+                position: span.start,
+                message,
+            },
+        }
+    }
+}
+
+/// A compiled query. Build it once per keystroke with [`Query::parse`] (or [`Query::compile`]
+/// from an already parsed [`athrix_query::Query`]), then run it with [`FileIndex::search`].
 #[derive(Debug, Clone)]
 pub struct Query {
-    terms: Vec<Term>,
+    plan: Plan,
 }
 
 #[derive(Debug, Clone)]
-enum Term {
+enum Plan {
+    /// Matches every entry.
+    All,
+    /// Matches no entry.
+    Nothing,
+    /// Only name terms, all ANDed: the hot path, evaluated without the tree machinery.
+    Names(Vec<NameMatcher>),
+    /// Anything else.
+    Tree(Node),
+}
+
+impl Query {
+    /// Parses and compiles `text`, resolving relative dates (`dm:today`) against the system
+    /// clock and local time zone.
+    pub fn parse(text: &str) -> std::result::Result<Self, QueryError> {
+        Self::compile(&athrix_query::parse(text)?)
+    }
+
+    /// Like [`Query::parse`], with an explicit clock (see [`Query::compile_at`]).
+    pub fn parse_at(
+        text: &str,
+        now_unix_secs: i64,
+        utc_offset_secs: i32,
+    ) -> std::result::Result<Self, QueryError> {
+        Self::compile_at(&athrix_query::parse(text)?, now_unix_secs, utc_offset_secs)
+    }
+
+    /// Compiles a parsed query against the system clock and local time zone.
+    pub fn compile(ast: &athrix_query::Query) -> std::result::Result<Self, QueryError> {
+        let (now, offset) = exec::system_clock();
+        Self::compile_at(ast, now, offset)
+    }
+
+    /// Compiles a parsed query. Relative and calendar dates are resolved as local dates for a
+    /// clock reading `now_unix_secs` (seconds since the Unix epoch) in a zone `utc_offset_secs`
+    /// east of UTC (for example `10800` for UTC+3). The offset is applied to all dates, so a
+    /// period on the other side of a daylight-saving change may be off by that hour.
+    pub fn compile_at(
+        ast: &athrix_query::Query,
+        now_unix_secs: i64,
+        utc_offset_secs: i32,
+    ) -> std::result::Result<Self, QueryError> {
+        let clock = Clock {
+            now: now_unix_secs,
+            utc_offset: i64::from(utc_offset_secs),
+        };
+        let node = match &ast.root {
+            None => Node::Const(true),
+            Some(e) => exec::compile(e, &clock)?,
+        };
+        let plan = match node {
+            Node::Const(true) => Plan::All,
+            Node::Const(false) => Plan::Nothing,
+            Node::Name(m) => Plan::Names(vec![m]),
+            Node::And(children) if children.iter().all(|c| matches!(c, Node::Name(_))) => {
+                Plan::Names(
+                    children
+                        .into_iter()
+                        .filter_map(|c| match c {
+                            Node::Name(m) => Some(m),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            other => Plan::Tree(other),
+        };
+        Ok(Query { plan })
+    }
+
+    /// True if the query matches every entry (empty query, or only terms such as `*`).
+    pub fn is_empty(&self) -> bool {
+        matches!(self.plan, Plan::All)
+    }
+
+    /// Evaluates the query against a name alone. `normalized_name` must already be passed
+    /// through [`athrix_text_ar::normalize_name_into`]. Returns `None` when the query also needs
+    /// other entry data (extension, size, dates, path...): use [`FileIndex::is_match`] then.
+    pub fn matches_name(&self, normalized_name: &str) -> Option<bool> {
+        match &self.plan {
+            Plan::All => Some(true),
+            Plan::Nothing => Some(false),
+            Plan::Names(terms) => Some(terms.iter().all(|t| t.matches(normalized_name))),
+            Plan::Tree(_) => None,
+        }
+    }
+}
+
+/// A compiled plain term, matched against a normalized name or path.
+#[derive(Debug, Clone)]
+pub(crate) enum NameMatcher {
     Contains(Box<memmem::Finder<'static>>),
-    Prefix(String),
-    Suffix(String),
-    Exact(String),
+    Prefix(Box<str>),
+    Suffix(Box<str>),
+    Exact(Box<str>),
     Glob(Vec<Segment>),
 }
 
 /// A run of pieces between two `*`.
-type Segment = Vec<Piece>;
+pub(crate) type Segment = Vec<Piece>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Piece {
+pub(crate) enum Piece {
     Lit(String),
     AnyChar,
 }
 
-impl Query {
-    /// Parses `input` (see the module docs for the syntax). Words that normalize to nothing
-    /// (for example a lone `-`) are dropped; an empty query matches every entry.
-    pub fn parse(input: &str) -> Self {
-        let mut buf = String::new();
-        let terms = input
-            .split_whitespace()
-            .filter_map(|word| parse_term(word, &mut buf))
-            .collect();
-        Query { terms }
-    }
-
-    /// True if the query has no terms and therefore matches everything.
-    pub fn is_empty(&self) -> bool {
-        self.terms.is_empty()
-    }
-
-    /// True if `normalized_name` (a name already passed through
-    /// [`athrix_text_ar::normalize_name_into`]) matches every term.
-    pub fn matches(&self, normalized_name: &str) -> bool {
-        self.terms.iter().all(|t| t.matches(normalized_name))
-    }
+/// True if `word` is a wildcard pattern.
+pub(crate) fn is_wildcard(word: &str) -> bool {
+    word.contains(['*', '?'])
 }
 
-fn parse_term(word: &str, buf: &mut String) -> Option<Term> {
-    if word.contains(['*', '?']) {
+/// Compiles an unquoted term. `None` if it normalizes to nothing (matches everything).
+pub(crate) fn compile_term(word: &str, buf: &mut String) -> Option<NameMatcher> {
+    if is_wildcard(word) {
         // Anchors are implicit for wildcard patterns; ignore explicit ones.
         let word = word.strip_prefix('^').unwrap_or(word);
         let word = word.strip_suffix('$').unwrap_or(word);
-        return parse_glob(word, buf);
+        return compile_glob(word, buf).map(NameMatcher::Glob);
     }
     let (anchored_start, rest) = match word.strip_prefix('^') {
         Some(r) => (true, r),
@@ -98,16 +257,23 @@ fn parse_term(word: &str, buf: &mut String) -> Option<Term> {
     if buf.is_empty() {
         return None;
     }
-    let s = buf.clone();
+    let s: Box<str> = buf.as_str().into();
     Some(match (anchored_start, anchored_end) {
-        (false, false) => Term::Contains(Box::new(memmem::Finder::new(s.as_bytes()).into_owned())),
-        (true, false) => Term::Prefix(s),
-        (false, true) => Term::Suffix(s),
-        (true, true) => Term::Exact(s),
+        (false, false) => NameMatcher::contains(&s),
+        (true, false) => NameMatcher::Prefix(s),
+        (false, true) => NameMatcher::Suffix(s),
+        (true, true) => NameMatcher::Exact(s),
     })
 }
 
-fn parse_glob(word: &str, buf: &mut String) -> Option<Term> {
+/// Compiles a quoted phrase: a literal substring. `None` if it normalizes to nothing.
+pub(crate) fn compile_phrase(text: &str, buf: &mut String) -> Option<NameMatcher> {
+    athrix_text_ar::normalize_name_into(text, buf);
+    (!buf.is_empty()).then(|| NameMatcher::contains(buf))
+}
+
+/// Splits a wildcard pattern into normalized segments. `None` if it is only stars.
+pub(crate) fn compile_glob(word: &str, buf: &mut String) -> Option<Vec<Segment>> {
     let mut segments: Vec<Segment> = Vec::new();
     for raw_segment in word.split('*') {
         let mut seg = Segment::new();
@@ -138,7 +304,7 @@ fn parse_glob(word: &str, buf: &mut String) -> Option<Term> {
     if segments.iter().all(Vec::is_empty) {
         return None;
     }
-    Some(Term::Glob(segments))
+    Some(segments)
 }
 
 /// Normalizes a literal that sits between wildcards, keeping a leading/trailing separator as a
@@ -159,15 +325,19 @@ fn normalize_inner(lit: &str, buf: &mut String) -> String {
     }
 }
 
-impl Term {
+impl NameMatcher {
+    fn contains(s: &str) -> Self {
+        NameMatcher::Contains(Box::new(memmem::Finder::new(s.as_bytes()).into_owned()))
+    }
+
     #[inline]
-    fn matches(&self, name: &str) -> bool {
+    pub(crate) fn matches(&self, name: &str) -> bool {
         match self {
-            Term::Contains(f) => f.find(name.as_bytes()).is_some(),
-            Term::Prefix(p) => name.starts_with(p.as_str()),
-            Term::Suffix(s) => name.ends_with(s.as_str()),
-            Term::Exact(s) => name == s,
-            Term::Glob(segs) => glob_match(name, segs),
+            NameMatcher::Contains(f) => f.find(name.as_bytes()).is_some(),
+            NameMatcher::Prefix(p) => name.starts_with(&**p),
+            NameMatcher::Suffix(s) => name.ends_with(&**s),
+            NameMatcher::Exact(s) => name == &**s,
+            NameMatcher::Glob(segs) => glob_match(name, segs),
         }
     }
 }
@@ -199,7 +369,7 @@ fn boundaries(hay: &str, from: usize) -> impl Iterator<Item = usize> + '_ {
 /// Whole-string glob match. `segs` are the parts between `*`s, so there is an implicit `*`
 /// between consecutive segments. Leftmost matching of middle segments is optimal because each
 /// segment has a fixed length in characters.
-fn glob_match(hay: &str, segs: &[Segment]) -> bool {
+pub(crate) fn glob_match(hay: &str, segs: &[Segment]) -> bool {
     let (first, rest) = match segs.split_first() {
         Some(x) => x,
         None => return hay.is_empty(),
@@ -244,6 +414,12 @@ impl FileIndex {
         if limit == 0 {
             return Ok(out);
         }
+        if matches!(query.plan, Plan::Nothing) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            return Ok(out);
+        }
         let chunks = n.div_ceil(CHUNK);
         let wave = rayon::current_num_threads().max(1) * 4;
         let mut first = 0;
@@ -268,6 +444,20 @@ impl FileIndex {
         Ok(out)
     }
 
+    /// True if entry `id` matches `query` (the per-entry check [`FileIndex::search`] runs).
+    ///
+    /// # Panics
+    /// If `id` is out of range.
+    pub fn is_match(&self, query: &Query, id: EntryId) -> bool {
+        let name = self.normalized_name(id);
+        match &query.plan {
+            Plan::All => true,
+            Plan::Nothing => false,
+            Plan::Names(terms) => terms.iter().all(|t| t.matches(name)),
+            Plan::Tree(node) => node.eval(&Entry { ix: self, id, name }, &mut Scratch::default()),
+        }
+    }
+
     /// Scans ids `start..end`; `None` if cancelled.
     fn scan(
         &self,
@@ -285,13 +475,22 @@ impl FileIndex {
         } else {
             arena.ends[start - 1] as usize
         };
+        let mut scratch = Scratch::default();
         for (i, &to) in arena.ends[start..end].iter().enumerate() {
             if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
                 return None;
             }
             let to = to as usize;
-            if query.matches(&text[from..to]) {
-                hits.push((start + i) as EntryId);
+            let name = &text[from..to];
+            let id = (start + i) as EntryId;
+            let hit = match &query.plan {
+                Plan::All => true,
+                Plan::Nothing => false,
+                Plan::Names(terms) => terms.iter().all(|t| t.matches(name)),
+                Plan::Tree(node) => node.eval(&Entry { ix: self, id, name }, &mut scratch),
+            };
+            if hit {
+                hits.push(id);
                 if hits.len() >= limit {
                     break;
                 }
@@ -323,8 +522,12 @@ mod tests {
         b.finish()
     }
 
-    fn find(ix: &FileIndex, q: &str) -> Vec<String> {
-        ix.search(&Query::parse(q), usize::MAX, &AtomicBool::new(false))
+    fn q(text: &str) -> Query {
+        Query::parse(text).unwrap()
+    }
+
+    fn find(ix: &FileIndex, text: &str) -> Vec<String> {
+        ix.search(&q(text), usize::MAX, &AtomicBool::new(false))
             .unwrap()
             .into_iter()
             .map(|id| ix.name(id).to_owned())
@@ -395,14 +598,22 @@ mod tests {
 
     #[test]
     fn glob_matcher_edge_cases() {
-        let q = |p: &str, s: &str| Query::parse(p).matches(s);
-        assert!(q("*a", "aaa"));
-        assert!(q("a*a", "aa"));
-        assert!(!q("a*a", "a"));
-        assert!(q("*?*", "x"));
-        assert!(!q("?", ""));
-        assert!(q("?", "ح"));
-        assert!(q("ab*ab*ab", "abxabyab"));
+        let m = |p: &str, s: &str| q(p).matches_name(s).unwrap();
+        assert!(m("*a", "aaa"));
+        assert!(m("a*a", "aa"));
+        assert!(!m("a*a", "a"));
+        assert!(m("*?*", "x"));
+        assert!(!m("?", ""));
+        assert!(m("?", "ح"));
+        assert!(m("ab*ab*ab", "abxabyab"));
+    }
+
+    #[test]
+    fn quoted_phrase_is_a_literal_substring() {
+        let ix = index(&["annual report 2026.pdf", "report annual.pdf", "a*b.txt"]);
+        assert_eq!(find(&ix, "\"annual report\""), ["annual report 2026.pdf"]);
+        // `*` inside quotes is not a wildcard (it normalizes like punctuation).
+        assert_eq!(find(&ix, "\"a*b\""), ["a*b.txt"]);
     }
 
     #[test]
@@ -410,12 +621,11 @@ mod tests {
         let ix = index(&["a", "b", "c"]);
         assert_eq!(find(&ix, "   ").len(), 4);
         assert_eq!(find(&ix, "*").len(), 4);
-        let ids = ix
-            .search(&Query::parse(""), 2, &AtomicBool::new(false))
-            .unwrap();
+        assert!(q("").is_empty());
+        let ids = ix.search(&q(""), 2, &AtomicBool::new(false)).unwrap();
         assert_eq!(ids, [0, 1]);
         assert!(
-            ix.search(&Query::parse(""), 0, &AtomicBool::new(false))
+            ix.search(&q(""), 0, &AtomicBool::new(false))
                 .unwrap()
                 .is_empty()
         );
@@ -427,26 +637,39 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let ix = index(&refs);
         let all = ix
-            .search(&Query::parse("file"), usize::MAX, &AtomicBool::new(false))
+            .search(&q("file"), usize::MAX, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(all.len(), 100_000);
         assert!(all.windows(2).all(|w| w[0] < w[1]));
         let some = ix
-            .search(&Query::parse("file"), 50_000, &AtomicBool::new(false))
+            .search(&q("file"), 50_000, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(some, all[..50_000]);
         let nines = ix
-            .search(&Query::parse("99$"), usize::MAX, &AtomicBool::new(false))
+            .search(&q("99$"), usize::MAX, &AtomicBool::new(false))
             .unwrap();
         assert!(nines.is_empty()); // names end in "txt"
+        // A tree query also keeps order and limit across chunks.
+        let tree = ix
+            .search(&q("file | nothing"), 70_000, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(tree, all[..70_000]);
     }
 
     #[test]
     fn cancellation_returns_cancelled() {
         let ix = index(&["a", "b"]);
-        let err = ix
-            .search(&Query::parse("a"), 10, &AtomicBool::new(true))
-            .unwrap_err();
-        assert!(matches!(err, Error::Cancelled));
+        for text in ["a", "a | b", "ext:pdf", "!a !*"] {
+            let err = ix.search(&q(text), 10, &AtomicBool::new(true)).unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{text}");
+        }
+    }
+
+    #[test]
+    fn errors_convert_into_core_errors() {
+        let e: Error = Query::parse("szie:1").unwrap_err().into();
+        assert!(matches!(e, Error::InvalidQuery { position: 0, .. }));
+        let e: Error = Query::parse("a content:x").unwrap_err().into();
+        assert!(matches!(e, Error::InvalidQuery { position: 2, .. }));
     }
 }

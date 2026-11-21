@@ -133,6 +133,17 @@ const QUERIES: &[&str] = &[
     "*.pdf",
     "فاتورة_*",
     "zzqxv",
+    // Filters (query language, task 3.x): metadata, booleans and lazily built paths.
+    "ext:pdf",
+    "تقرير ext:pdf",
+    "type:image;video",
+    "size:>10mb",
+    "dm:2020",
+    "report | invoice",
+    "!report ext:md",
+    "report path:src",
+    "infolder:مشروع",
+    "path:zzqxv",
 ];
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -153,6 +164,25 @@ fn print_summary(entries: &[Entry], ix: &FileIndex) {
         build_time,
         rayon::current_num_threads(),
     );
+    // Path filters rebuild paths, so their cost depends on depth and path length.
+    let (mut depth_sum, mut depth_max, mut path_bytes) = (0usize, 0usize, 0usize);
+    for id in 0..ix.len() as EntryId {
+        let (mut d, mut cur) = (0, ix.parent(id));
+        path_bytes += ix.normalized_name(id).len();
+        while let Some(p) = cur {
+            d += 1;
+            path_bytes += ix.normalized_name(p).len() + 1;
+            cur = ix.parent(p);
+        }
+        depth_sum += d;
+        depth_max = depth_max.max(d);
+    }
+    eprintln!(
+        "[fs-index] depth avg {:.1} max {}, normalized path avg {:.0} bytes",
+        depth_sum as f64 / ix.len() as f64,
+        depth_max,
+        path_bytes as f64 / ix.len() as f64,
+    );
     let cancel = AtomicBool::new(false);
     for limit in [100, usize::MAX] {
         for q in QUERIES {
@@ -161,13 +191,15 @@ fn print_summary(entries: &[Entry], ix: &FileIndex) {
             for _ in 0..200 {
                 let t = Instant::now();
                 // Parse inside the loop: the UI parses on every keystroke too.
-                let r = ix.search(&Query::parse(q), limit, &cancel).unwrap();
+                let r = ix
+                    .search(&Query::parse(q).unwrap(), limit, &cancel)
+                    .unwrap();
                 times.push(t.elapsed());
                 hits = r.len();
             }
             times.sort();
             eprintln!(
-                "[fs-index] limit {:>5} {:<14} hits {:>7}  p50 {:>9.3?}  p95 {:>9.3?}  max {:>9.3?}",
+                "[fs-index] limit {:>5} {:<18} hits {:>7}  p50 {:>9.3?}  p95 {:>9.3?}  max {:>9.3?}",
                 if limit == usize::MAX {
                     "all".to_string()
                 } else {
@@ -198,13 +230,13 @@ fn benches(c: &mut Criterion) {
     for q in QUERIES {
         g.bench_function(format!("limit100/{q}"), |b| {
             b.iter(|| {
-                ix.search(&Query::parse(black_box(q)), 100, &cancel)
+                ix.search(&Query::parse(black_box(q)).unwrap(), 100, &cancel)
                     .unwrap()
             })
         });
         g.bench_function(format!("all/{q}"), |b| {
             b.iter(|| {
-                ix.search(&Query::parse(black_box(q)), usize::MAX, &cancel)
+                ix.search(&Query::parse(black_box(q)).unwrap(), usize::MAX, &cancel)
                     .unwrap()
             })
         });

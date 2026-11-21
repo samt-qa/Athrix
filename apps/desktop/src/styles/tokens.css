@@ -36,6 +36,23 @@
   --kbd-bg: var(--beige-200);
   --kbd-edge: var(--beige-400);
 
+  /* Status (design §2.4) */
+  --success: #3F7A5A;
+  --warning: #A6722A;
+  --danger: #B3261E;
+  --info: #3E6A8A;
+
+  /* File-type colors (design §2.5): icon glyphs; badges use them at ~12% as background. */
+  --type-doc: var(--burgundy-700);
+  --type-sheet: #3F7A5A;
+  --type-slides: #A6722A;
+  --type-image: #6A4C8A;
+  --type-media: #3E6A8A;
+  --type-code: var(--gray-700);
+  --type-archive: #8A6A4C;
+  --type-folder: #A08B6C; /* beige-400 darkened: #C9B79C is too faint as a glyph on light rows */
+  --type-other: var(--gray-500);
+
   /* Type (bundled in styles/fonts.css). Latin first: IBM Plex Sans Arabic has no Latin glyphs
      in its arabic subset, so the browser falls through to it only for Arabic text. */
   --font-ui: "IBM Plex Sans", "IBM Plex Sans Arabic", "Segoe UI", system-ui, sans-serif;
@@ -65,6 +82,9 @@
     --border:#3A3236; --border-strong:#4D4448; --border-warm:#3F3530;
     --focus-ring: rgb(227 135 149 / .50); --match-bg:#4A1F28; --match-fg:#F3C9CF;
     --kbd-bg:#2F272B; --kbd-edge:#4D4448;
+    --success:#7FBF9A; --warning:#E0B26A; --danger:#F2867E; --info:#8DB3D1;
+    --type-doc:#E38795; --type-sheet:#7FBF9A; --type-slides:#E0B26A; --type-image:#B79CD6;
+    --type-media:#8DB3D1; --type-code:#BDB7BA; --type-archive:#C9A584; --type-folder:#C9B79C; --type-other:#A39A9E;
     --shadow-lg: 0 18px 48px rgb(0 0 0 / .45), 0 4px 12px rgb(0 0 0 / .30);
   }
 }
@@ -76,7 +96,10 @@
   --accent:#E38795; --accent-hover:#EC9AA6; --accent-pressed:#D4707F; --accent-subtle:#2E1A1F;
   --border:#3A3236; --border-strong:#4D4448; --border-warm:#3F3530;
   --focus-ring: rgb(227 135 149 / .50); --match-bg:#4A1F28; --match-fg:#F3C9CF;
-  --kbd-bg:#2F272B; --kbd-edge:#4D4448;
+    --kbd-bg:#2F272B; --kbd-edge:#4D4448;
+  --success:#7FBF9A; --warning:#E0B26A; --danger:#F2867E; --info:#8DB3D1;
+  --type-doc:#E38795; --type-sheet:#7FBF9A; --type-slides:#E0B26A; --type-image:#B79CD6;
+  --type-media:#8DB3D1; --type-code:#BDB7BA; --type-archive:#C9A584; --type-folder:#C9B79C; --type-other:#A39A9E;
   --shadow-lg: 0 18px 48px rgb(0 0 0 / .45), 0 4px 12px rgb(0 0 0 / .30);
 }
 

@@ -1,27 +1,244 @@
-import { createResource, createSignal, Show } from "solid-js";
-import { isTauri } from "@tauri-apps/api/core";
+import { batch, createEffect, createMemo, createResource, createSignal, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
 import { t } from "./i18n";
-import { safeInvoke } from "./lib/tauri";
+import {
+  api, errorMessage, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
+} from "./lib/api";
+import { applySuggestion, composeQuery, type ChipKind } from "./lib/query";
 import SettingsControls from "./components/SettingsControls";
+import SearchField from "./components/SearchField";
+import FilterChips from "./components/FilterChips";
+import QueryErrorBar from "./components/QueryErrorBar";
+import ResultList, { optionId, type ResultListHandle } from "./components/ResultList";
+import { EmptyState, NoResults, NotReady } from "./components/EmptyState";
+import HintBar from "./components/HintBar";
+import StatusBar from "./components/StatusBar";
 
-type AppInfo = { name: string; version: string };
+/** Results per query (contract `limit`). Dev-only override for scroll testing: `?limit=5000`. */
+const LIMIT = (() => {
+  const v = import.meta.env.DEV ? Number(new URLSearchParams(window.location.search).get("limit")) : NaN;
+  return Number.isFinite(v) && v > 0 ? Math.floor(Math.min(v, 100_000)) : 200;
+})();
 
-function SearchIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <circle cx="11" cy="11" r="7" />
-      <path d="m20 20-3.5-3.5" />
-    </svg>
-  );
-}
+const LIST_ID = "results";
+const ERROR_ID = "query-error";
 
 export default function App() {
-  const inTauri = isTauri();
-  const [info] = createResource(() => safeInvoke<AppInfo>("app_info"));
-  const [query, setQuery] = createSignal("");
-  // Temporary demo of the UI-to-Rust bridge: how the name index will store the text (task 1.6 replaces it).
-  const [normalized] = createResource(query, (q) => safeInvoke<string>("normalize_preview", { text: q }));
+  let input!: HTMLInputElement;
+  let list: ResultListHandle | undefined;
+
+  const [info] = createResource(() => api.appInfo().catch(() => null));
+
+  // ---- index status: subscribe first, then read the current state ----
+  const [index, setIndex] = createSignal<IndexStatus | null>(null);
+  const loadIndex = async () => {
+    let gotEvent = false;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
+    try {
+      unlisten = await onIndexStatus((s) => {
+        gotEvent = true;
+        setIndex(s);
+      });
+      if (disposed) unlisten();
+      const s = await api.indexStatus();
+      if (!gotEvent) setIndex(s);
+      // The backend starts indexing at launch; kick it only if it is still idle.
+      if (s.state === "idle") await api.startIndexing();
+    } catch (err) {
+      console.error("index status unavailable", err);
+    }
+  };
+  onMount(loadIndex);
+  const retryIndexing = () => api.startIndexing().catch((e) => showNotice(t("notice.actionFailed", { message: errorMessage(e) })));
+
+  // ---- search ----
+  const [text, setText] = createSignal("");
+  const [chip, setChip] = createSignal<ChipKind>("all");
+  const [response, setResponse] = createSignal<SearchResponse | null>(null);
+  const [failure, setFailure] = createSignal<string | null>(null);
+  const [selected, setSelected] = createSignal(0);
+  const sent = createMemo(() => composeQuery(text(), chip()));
+
+  // Whole numbers: Rust reads requestId as u64. Seeded from the clock so ids keep increasing
+  // across a webview reload (or HMR) while the backend stays alive.
+  let lastRequest = Date.now();
+  async function runSearch(query: string) {
+    const requestId = ++lastRequest;
+    if (!query.trim()) {
+      batch(() => {
+        setResponse(null);
+        setFailure(null);
+        setSelected(0);
+      });
+      return;
+    }
+    try {
+      const r = await api.search(query, LIMIT, requestId);
+      // Drop anything older than the latest request, and cancelled ones.
+      if (r.requestId !== lastRequest || requestId !== lastRequest || r.cancelled) return;
+      batch(() => {
+        setResponse(r);
+        setFailure(null);
+        setSelected(0);
+      });
+    } catch (err) {
+      if (requestId === lastRequest) {
+        batch(() => {
+          setResponse(null);
+          setFailure(t("queryError.searchFailed", { message: errorMessage(err) }));
+        });
+      }
+    }
+  }
+  // No debounce: a search takes a few ms, and stale responses are dropped by requestId.
+  // Re-runs when the index becomes ready, so a query typed during indexing fills in.
+  createEffect(on([sent, () => index()?.state], ([q]) => void runSearch(q)));
+
+  const items = () => response()?.items ?? [];
+  const queryError = () => response()?.error ?? null;
+  const current = () => items()[selected()];
+
+  // Relative times ("3 minutes ago") refresh every minute.
+  const [now, setNow] = createSignal(Date.now());
+  const clock = setInterval(() => setNow(Date.now()), 60_000);
+  onCleanup(() => clearInterval(clock));
+
+  // ---- transient notices (copied, opening…) ----
+  const [notice, setNotice] = createSignal<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  function showNotice(msg: string) {
+    setNotice(msg);
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => setNotice(null), 2500);
+  }
+  onCleanup(() => clearTimeout(noticeTimer));
+
+  // ---- actions on the selected entry ----
+  async function open(i = selected(), reveal = false) {
+    const it = items()[i];
+    if (!it) return;
+    try {
+      if (reveal) {
+        await api.revealEntry(it.id);
+        showNotice(t("notice.revealing", { name: it.name }));
+      } else {
+        await api.openEntry(it.id);
+        showNotice(t("notice.opening", { name: it.name }));
+      }
+    } catch (err) {
+      showNotice(t("notice.actionFailed", { message: errorMessage(err) }));
+    }
+  }
+
+  async function copyPath() {
+    const it = current();
+    if (!it) return;
+    try {
+      const path = await api.entryPath(it.id);
+      try {
+        await navigator.clipboard.writeText(path);
+      } catch (err) {
+        if (!legacyCopy(path)) throw err;
+      }
+      showNotice(t("notice.copied"));
+    } catch (err) {
+      showNotice(t("notice.copyFailed", { message: errorMessage(err) }));
+    }
+  }
+
+  /** Fallback when the async Clipboard API is denied: copy through a hidden textarea. */
+  function legacyCopy(value: string): boolean {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    input.focus();
+    return ok;
+  }
+
+  function move(to: number) {
+    const n = items().length;
+    if (n) setSelected(Math.max(0, Math.min(n - 1, to)));
+  }
+
+  function onKeyDown(e: KeyboardEvent) {
+    if (e.isComposing) return;
+    const n = items().length;
+    const page = list?.pageSize() ?? 8;
+    const ctrl = e.ctrlKey || e.metaKey;
+    // Physical keys (KeyboardEvent.code) so shortcuts work under the Arabic layout too (design §11).
+    switch (e.code === "NumpadEnter" ? "Enter" : e.key) {
+      case "ArrowDown": move(selected() + 1); break;
+      case "ArrowUp": move(selected() - 1); break;
+      case "PageDown": move(selected() + page); break;
+      case "PageUp": move(selected() - page); break;
+      case "Home":
+      case "End":
+        // Shift+Home/End keeps its text-selection meaning in the input.
+        if (e.shiftKey || !n) return;
+        move(e.key === "Home" ? 0 : n - 1);
+        break;
+      case "Enter":
+        if (!n) return;
+        void open(selected(), ctrl);
+        break;
+      case "Escape":
+        if (!text()) return;
+        setText("");
+        break;
+      default:
+        // (`key` only as a fallback for synthetic events that carry no `code`.)
+        if (ctrl && !e.altKey && !e.shiftKey && (e.code === "KeyC" || (!e.code && e.key.toLowerCase() === "c"))) {
+          const el = e.currentTarget as HTMLInputElement;
+          // With text selected in the input, Ctrl+C copies that text as usual.
+          if (el.selectionStart !== el.selectionEnd || !current()) return;
+          void copyPath();
+          break;
+        }
+        return;
+    }
+    e.preventDefault();
+  }
+
+  const activeDescendant = () => {
+    const it = current();
+    return it && list?.isRendered(selected()) ? optionId(LIST_ID, it) : undefined;
+  };
+
+  // Error span in the user's text (a span inside the appended chip token is not underlined).
+  const errorSpan = () => {
+    const err = queryError();
+    return err && err.start < text().length ? { start: err.start, end: err.end } : null;
+  };
+
+  function useSuggestion(err: QueryError, suggestion: string) {
+    if (err.start >= text().length) return;
+    setText(applySuggestion(text(), err.start, err.end, suggestion));
+    input.focus();
+  }
+
+  function setQuery(q: string) {
+    setText(q);
+    input.focus();
+    input.setSelectionRange(q.length, q.length);
+  }
+
+  const indexing = () => index()?.state === "indexing";
+  const notReady = () => index()?.state !== "ready";
 
   return (
     <div class="shell">
@@ -43,37 +260,61 @@ export default function App() {
 
       <main class="main">
         <section class="panel" aria-label={t("search.region")}>
-          <label class="search">
-            <SearchIcon />
-            <input
-              dir="auto"
-              autofocus
-              aria-label={t("search.inputLabel")}
-              placeholder={t("search.placeholder")}
-              value={query()}
-              onInput={(e) => setQuery(e.currentTarget.value)}
-              onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+          <SearchField
+            ref={(el) => (input = el)}
+            value={text()}
+            onInput={setText}
+            onKeyDown={onKeyDown}
+            errorSpan={errorSpan()}
+            listId={LIST_ID}
+            expanded={items().length > 0}
+            activeDescendant={activeDescendant()}
+            describedBy={queryError() || failure() ? ERROR_ID : undefined}
+          />
+          <div class="progress" classList={{ active: indexing() }} aria-hidden="true" />
+          <FilterChips value={chip()} onChange={setChip} />
+          <QueryErrorBar
+            id={ERROR_ID}
+            text={text()}
+            error={queryError()}
+            failure={failure()}
+            onApplySuggestion={useSuggestion}
+          />
+
+          <div class="results-area">
+            <Switch>
+              <Match when={!text().trim()}>
+                <EmptyState onExample={setQuery} />
+              </Match>
+              <Match when={queryError() || failure()}>{null}</Match>
+              <Match when={notReady() && !items().length}>
+                <NotReady failed={index()?.state === "error"} />
+              </Match>
+              <Match when={response() && !items().length}>
+                <NoResults query={text().trim()} filtered={chip() !== "all"} onClearFilter={() => setChip("all")} />
+              </Match>
+            </Switch>
+            {/* Always mounted so aria-controls points at a real listbox. */}
+            <ResultList
+              ref={(h) => (list = h)}
+              id={LIST_ID}
+              label={t("search.resultsLabel")}
+              items={items()}
+              selected={selected()}
+              now={now()}
+              onSelect={setSelected}
+              onOpen={(i) => {
+                setSelected(i);
+                void open(i);
+              }}
             />
-          </label>
-          <div class="progress" />
-          <div class="preview">
-            <span class="label">{t("preview.label")}</span>
-            <bdi class="normalized" dir="auto">
-              {!query()
-                ? <span class="empty">{t("preview.empty")}</span>
-                : inTauri
-                  ? normalized() ?? ""
-                  : <span class="empty">{t("preview.unavailable")}</span>}
-            </bdi>
-            <span class="hint">{t("preview.hint")}</span>
           </div>
+
+          <HintBar />
         </section>
       </main>
 
-      <footer class="statusbar">
-        <span>{t("status.index")}</span>
-        <span><kbd>Esc</kbd> {t("status.clear")}</span>
-      </footer>
+      <StatusBar index={index()} response={notReady() ? null : response()} notice={notice()} mock={usingMock} onRetry={retryIndexing} />
     </div>
   );
 }

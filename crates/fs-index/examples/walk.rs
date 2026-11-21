@@ -20,7 +20,7 @@ fn main() -> athrix_core::Result<()> {
         index.heap_bytes() as f64 / 1e6
     );
     let t = Instant::now();
-    let hits = index.search(&Query::parse(&query), 20, &AtomicBool::new(false))?;
+    let hits = index.search(&Query::parse(&query)?, 20, &AtomicBool::new(false))?;
     println!("query {query:?}: {} hits in {:?}", hits.len(), t.elapsed());
     for id in hits {
         println!("  {}", index.path(id).display());

@@ -45,3 +45,24 @@ export function t(key: MessageKey, params?: MessageParams): string {
   if (!params) return text;
   return text.replace(/\{(\w+)\}/g, (m, name: string) => (name in params ? String(params[name]) : m));
 }
+
+/** True when `key` exists in the dictionaries (for keys built at runtime, e.g. from an error kind). */
+export function hasMessage(key: string): key is MessageKey {
+  return Object.prototype.hasOwnProperty.call(dictionaries[DEFAULT_LOCALE], key);
+}
+
+const pluralRules = new Map<Locale, Intl.PluralRules>();
+
+/**
+ * Plural-aware translation: picks `${base}.${category}` using Intl.PluralRules for the current
+ * locale (Arabic has zero/one/two/few/many/other), falling back to `${base}.other`.
+ * `{count}` receives the formatted number.
+ */
+export function tPlural(base: string, count: number, formatted: string, params?: MessageParams): string {
+  const l = locale();
+  let rules = pluralRules.get(l);
+  if (!rules) pluralRules.set(l, (rules = new Intl.PluralRules(l)));
+  const exact = `${base}.${count === 0 ? "zero" : rules.select(count)}`;
+  const key = hasMessage(exact) ? exact : `${base}.other`;
+  return hasMessage(key) ? t(key, { ...params, count: formatted }) : key;
+}

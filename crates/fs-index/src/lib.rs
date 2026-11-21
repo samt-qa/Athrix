@@ -7,7 +7,7 @@
 //!
 //! let index = walk(&WalkOptions::new(["D:/Documents"]).exclude_glob("node_modules"))?;
 //! let cancel = AtomicBool::new(false);
-//! for id in index.search(&Query::parse("تقرير *.pdf"), 100, &cancel)? {
+//! for id in index.search(&Query::parse("تقرير *.pdf")?, 100, &cancel)? {
 //!     println!("{}", index.path(id).display());
 //! }
 //! # Ok::<(), athrix_core::Error>(())
@@ -16,10 +16,13 @@
 //! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): snapshots, live watching,
 //! NTFS MFT/USN, path matching and ranking.
 
+mod exec;
 mod index;
 mod search;
+mod snapshot;
 mod walk;
 
+pub use exec::kind_extensions;
 pub use index::{EntryId, EntryMeta, FileIndex, IndexBuilder};
-pub use search::Query;
+pub use search::{Query, QueryError};
 pub use walk::{WalkOptions, walk};
