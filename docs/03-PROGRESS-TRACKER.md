@@ -52,7 +52,7 @@
 
 | المرحلة | الحالة | التقدّم |
 |---|---|---|
-| M0 — الأساس | 🟦 | 5 / 7 |
+| M0 — الأساس | 🟦 | 6 / 7 |
 | M1 — بحث الأسماء | 🟦 | 4 / 9 |
 | M2 — ويندوز السريع (MFT/USN) | ⬜ | 0 / 6 |
 | M3 — العربية ولغة الاستعلام | 🟦 | 3 / 9 |
@@ -72,7 +72,7 @@
 | 0.2 | إنشاء تطبيق Tauri 2 في `apps/desktop` مع SolidJS/Svelte + TypeScript + Vite | ✅ | Tauri 2 + SolidJS + TS + Vite في `apps/desktop`، وعضو في الـ workspace. أمران: `app_info` و`normalize_preview` (مؤقت). CSP مضبوط |
 | 0.3 | ملف `tokens.css` من `02` §13 + تحميل الخطوط محليًا (IBM Plex Sans Arabic، Readex Pro، JetBrains Mono) | ✅ | الخطوط مضمّنة محليًا (Fontsource، OFL) في `styles/fonts.css`؛ أيقونات التطبيق مولّدة من `public/athrix.svg` |
 | 0.4 | نظام i18n (ar/en) + تبديل `dir` + تبديل الثيم (فاتح/داكن/النظام) | ✅ | `src/i18n` (ar/en بمفاتيح مُتحقَّق منها في TypeScript)، تبديل `lang`/`dir`، ثيم نظام/فاتح/داكن، حفظ في localStorage. لم يُختبر داخل نافذة Tauri |
-| 0.5 | CI على GitHub Actions: fmt + clippy + test + build (Windows أولًا) | ⚠️ | `.github/workflows/ci.yml`: واجهة + Rust (Ubuntu/Windows × stable/1.85) مع `--locked`. لم يُشغَّل على GitHub بعد |
+| 0.5 | CI على GitHub Actions: fmt + clippy + test + build (Windows أولًا) | ✅ | `.github/workflows/ci.yml`: واجهة + Rust (Ubuntu/Windows × stable/1.85) مع `--locked`. أول تشغيل على `eb77536`: الوظائف الخمس ناجحة |
 | 0.6 | `tracing` للسجلات + هيكل الأخطاء (`thiserror`) في `core` | ✅ | `athrix_core::Error` + `logging::init` (متغير `ATHRIX_LOG`) |
 | 0.7 | `README.md` + `CONTRIBUTING.md` + الترخيص | ⬜ | الترخيص يُحدَّد: ADR مفتوح |
 
@@ -165,8 +165,7 @@
 
 ## 4. ▶️ الخطوة التالية (ابدأ من هنا)
 
-> **أولًا:** تأكّد أن CI نجح على GitHub بعد آخر رفع (0.5)، وأصلح ما يفشل.
-> **ثم:** `1.6` — ربط `fs-index` بالواجهة (أوامر Tauri `search`/`open`/`reveal`/`copy_path` + بث النتائج + إلغاء الاستعلام القديم)، مع توحيد محلّل الاستعلام على `athrix-query` بدل المحلّل البسيط داخل `fs-index`. ويمكن بالتوازي: `1.4` (لقطة الفهرس)، `1.5` (المراقبة)، `0.7` (CONTRIBUTING).
+> **التالي:** `1.6` — ربط `fs-index` بالواجهة (أوامر Tauri `search`/`open`/`reveal`/`copy_path` + بث النتائج + إلغاء الاستعلام القديم)، مع توحيد محلّل الاستعلام على `athrix-query` بدل المحلّل البسيط داخل `fs-index`. ويمكن بالتوازي: `1.4` (لقطة الفهرس)، `1.5` (المراقبة)، `0.7` (CONTRIBUTING).
 > **التشغيل:** `cd apps/desktop && npm install && npm run tauri dev`.
 
 *(حدّث هذا القسم في نهاية كل جلسة ليشير إلى المهمة التالية بالضبط.)*
@@ -181,7 +180,8 @@
 - المُتحقَّق منه على الـ workspace كاملًا: `npm run typecheck` و`build`؛ `cargo fmt --check`؛ `cargo clippy --workspace --all-targets --locked -D warnings`؛ `cargo test --workspace --locked`: 51 اختبارًا ناجحًا.
 - لم يُتحقَّق منه: CI على GitHub، والواجهة داخل نافذة Tauri (اختُبرت في المتصفح فقط)، وفهرسة شجرة حقيقية بمليون ملف.
 - قرارات من محلّل الاستعلام تحتاج مراجعة: الأولوية NOT > AND > OR (عكس Everything في OR)، و`|` دائمًا OR والقوائم بـ `;`، ووحدات الحجم بأساس 1024.
-- التالي: CI ثم 1.6.
+- CI على GitHub: الوظائف الخمس ناجحة (run 44903287967).
+- التالي: 1.6.
 
 ### [2026-11-21] — وكيل التنفيذ (2)
 - المهام: 0.2 ⇠ ✅، 0.3 ⇠ ⚠️ جزئيًا.
