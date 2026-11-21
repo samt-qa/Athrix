@@ -182,11 +182,15 @@ pub fn walk_options(roots: &[PathBuf]) -> WalkOptions {
     opts.exclude_glob(DEFAULT_EXCLUDED_PATH_GLOB)
 }
 
-/// The default root: the user's home folder.
+/// The default root: the user's home folder (`USERPROFILE` on Windows, `HOME` elsewhere).
+///
+/// Read from the environment instead of `std::env::home_dir`, which is deprecated on the MSRV
+/// (Rust 1.85) and would fail clippy with `-D warnings` there.
 pub fn default_roots() -> Result<Vec<PathBuf>, String> {
-    std::env::home_dir()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| vec![p])
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .filter(|p| !p.is_empty())
+        .map(|p| vec![PathBuf::from(p)])
         .ok_or_else(|| "cannot find the user's home folder".to_owned())
 }
 
