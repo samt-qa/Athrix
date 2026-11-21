@@ -8,7 +8,8 @@
 //! - `bench content <ROOT>…`: walks the roots, extracts up to `--max-files` documents with
 //!   `athrix-extract` on all cores, builds a content index in `--index-dir`, then times word,
 //!   phrase, Arabic and name + content (`AND`) queries through `athrix_ranking::execute`, like
-//!   the app's content path.
+//!   the app's content path, then snippets for the first 30 content rows (what the app's
+//!   `search` command returns), and reports each phase.
 //!
 //! Both are measuring tools only: nothing here changes what the product does.
 
@@ -32,6 +33,8 @@ const APP_LIMIT: usize = 200;
 const NAME_CAP: usize = 20_000;
 /// The app's content cap (`CONTENT_CAP`).
 const CONTENT_CAP: usize = 10_000;
+/// Rows whose snippets the app's `search` builds (`SNIPPET_ROWS` in the app's `content.rs`).
+const SNIPPET_ROWS: usize = 30;
 
 /// What a user types, one query per keystroke (every prefix of each string).
 const TYPING: &[&str] = &[
@@ -484,32 +487,54 @@ fn query_content(content: &ContentIndex, names: &FileIndex, rounds: usize) -> Re
     for (group, queries) in CONTENT_QUERIES {
         let both = group.starts_with("plain");
         let mut times = Vec::new();
-        println!("\n== {group}");
+        let mut search_times = Vec::new();
+        let mut snippet_times = Vec::new();
+        println!(
+            "\n== {group}   (end-to-end = search without snippets + snippets of {SNIPPET_ROWS} rows)"
+        );
         for text in *queries {
             let mut q_times = Vec::with_capacity(rounds);
+            let mut s_times = Vec::with_capacity(rounds);
+            let mut n_times = Vec::with_capacity(rounds);
             let mut hits = 0;
             for _ in 0..rounds {
                 let t = Instant::now();
-                hits = content_query(content, names, text, both, now)?;
+                let run = content_query(content, names, text, both, now)?;
                 q_times.push(ms(t.elapsed()));
+                s_times.push(ms(run.search));
+                n_times.push(ms(run.snippets));
+                hits = run.hits;
             }
-            q_times.sort_by(f64::total_cmp);
+            for v in [&mut q_times, &mut s_times, &mut n_times] {
+                v.sort_by(f64::total_cmp);
+            }
             println!(
-                "  {text:<34} hits {hits:>4}  p50 {:>7.2} ms  p95 {:>7.2} ms  max {:>7.2} ms",
+                "  {text:<34} hits {hits:>4}  p50 {:>7.2} ms  p95 {:>7.2} ms  max {:>7.2} ms  \
+                 (search p95 {:>7.2} ms, snippets p95 {:>6.2} ms)",
                 pct(&q_times, 50.0),
                 pct(&q_times, 95.0),
-                q_times.last().copied().unwrap_or(f64::NAN)
+                q_times.last().copied().unwrap_or(f64::NAN),
+                pct(&s_times, 95.0),
+                pct(&n_times, 95.0),
             );
             times.extend_from_slice(&q_times);
+            search_times.extend_from_slice(&s_times);
+            snippet_times.extend_from_slice(&n_times);
         }
-        println!("  {group}: {}", summary(&mut times));
+        println!("  {group} end-to-end: {}", summary(&mut times));
+        println!("  {group} search:     {}", summary(&mut search_times));
+        println!("  {group} snippets:   {}", summary(&mut snippet_times));
         all.extend(times);
     }
     println!("\nall content queries: {}", summary(&mut all));
 
-    // Where the time goes: matching alone (count), then top-N with a snippet per hit. The
-    // executor's first content fetch for the app's limit is max(4 × 201, 200) = 804.
-    println!("\n== raw ContentIndex (p50 of {rounds}): count | top 20 | top 201 | top 804");
+    // Where the time goes, straight on the index: matching alone (count), top-N hits (no
+    // snippets; the executor's first fetch for the app's limit is max(4 × 201, 200) = 804,
+    // and an AND deepens up to 10,000), then snippets of the best 30 hits.
+    println!(
+        "\n== raw ContentIndex (p50 of {rounds}): count | top 20 | top 804 | top 10000 | \
+         snippets of top {SNIPPET_ROWS}"
+    );
     for q in RAW_CONTENT {
         let p50 = |f: &dyn Fn() -> bool| -> f64 {
             let mut v: Vec<f64> = (0..rounds)
@@ -525,11 +550,16 @@ fn query_content(content: &ContentIndex, names: &FileIndex, rounds: usize) -> Re
         let n = content.count(q).unwrap_or(0);
         let count = p50(&|| content.count(q).is_ok());
         let top = |k: usize| p50(&|| content.search(q, k).is_ok());
+        let shown: Vec<String> = content
+            .search(q, SNIPPET_ROWS)
+            .map(|h| h.into_iter().map(|h| h.path).collect())
+            .unwrap_or_default();
+        let snippets = p50(&|| content.snippets(q, &shown).is_ok());
         println!(
-            "  {q:<22} matches {n:>6}  {count:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} ms",
+            "  {q:<22} matches {n:>6}  {count:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {snippets:>8.2} ms",
             top(20),
-            top(201),
-            top(804)
+            top(804),
+            top(10_000)
         );
     }
     Ok(())
@@ -546,15 +576,26 @@ const RAW_CONTENT: &[&str] = &[
     "\"بسم الله\"",
 ];
 
-/// One content query the way the app runs it: plan, then `execute` over a name source (the
-/// whole name index) and the content index, then the rows of the shown hits.
+/// Timings of one [`content_query`].
+struct QueryRun {
+    /// Rows returned.
+    hits: usize,
+    /// `execute` (no snippets).
+    search: Duration,
+    /// Snippets of the first [`SNIPPET_ROWS`] content rows.
+    snippets: Duration,
+}
+
+/// One content query the way the app's `search` command runs it: plan, then `execute` over a
+/// name source (the whole name index) and the content index (hits without snippets), then
+/// snippets for the content rows among the first [`SNIPPET_ROWS`].
 fn content_query(
     content: &ContentIndex,
     names: &FileIndex,
     text: &str,
     plain_words_search_content: bool,
     now: i64,
-) -> Result<usize, CliError> {
+) -> Result<QueryRun, CliError> {
     let ast = athrix_query::parse(text).map_err(|e| CliError::Other(format!("{e:?}")))?;
     let plan = athrix_query::plan(
         &ast,
@@ -583,19 +624,18 @@ fn content_query(
             ranked: compiled.is_ranked(),
         })
     };
-    let mut content_fn =
-        |q: &str, limit: usize| -> Result<Vec<ContentHit<athrix_content_index::Snippet>>, String> {
-            let hits = content.search(q, limit).map_err(|e| e.to_string())?;
-            Ok(hits
-                .into_iter()
-                .map(|h| ContentHit {
-                    path: h.path,
-                    score: h.score,
-                    mtime: None,
-                    snippet: h.snippet,
-                })
-                .collect())
-        };
+    let mut content_fn = |q: &str, limit: usize| -> Result<Vec<ContentHit<()>>, String> {
+        let hits = content.search(q, limit).map_err(|e| e.to_string())?;
+        Ok(hits
+            .into_iter()
+            .map(|h| ContentHit {
+                path: h.path,
+                score: h.score,
+                mtime: None,
+                snippet: (),
+            })
+            .collect())
+    };
     let mut sources = Closures {
         names: &mut name_fn,
         content: &mut content_fn,
@@ -606,6 +646,43 @@ fn content_query(
     options.name_cap = NAME_CAP;
     options.content_cap = CONTENT_CAP;
     options.exclusion_cap = CONTENT_CAP;
+    let t = Instant::now();
     let results = execute(&plan, &options, None, &mut sources).map_err(CliError::Other)?;
-    Ok(results.hits.len().min(APP_LIMIT))
+    let search = t.elapsed();
+
+    // The app's snippets on first paint: the first SNIPPET_ROWS rows that matched content.
+    let t = Instant::now();
+    let shown: Vec<&str> = results
+        .hits
+        .iter()
+        .take(APP_LIMIT)
+        .take(SNIPPET_ROWS)
+        .filter(|h| h.matched.has_content())
+        .map(|h| h.path.as_str())
+        .collect();
+    if let Some(text) = plan_content_text(&plan) {
+        std::hint::black_box(
+            content
+                .snippets(&text, &shown)
+                .map_err(|e| CliError::Other(format!("snippets: {e}")))?,
+        );
+    }
+    Ok(QueryRun {
+        hits: results.hits.len().min(APP_LIMIT),
+        search,
+        snippets: t.elapsed(),
+    })
+}
+
+/// The content-query text of a plan's positive content part (what the app builds snippets
+/// for), `None` when it has none.
+fn plan_content_text(plan: &SearchPlan) -> Option<String> {
+    match plan {
+        SearchPlan::NameAndContent { content, .. } | SearchPlan::NameOrContent { content, .. }
+            if content.has_positive() =>
+        {
+            Some(content.to_query_text())
+        }
+        _ => None,
+    }
 }

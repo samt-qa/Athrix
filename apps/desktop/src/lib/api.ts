@@ -37,8 +37,18 @@ export interface ResultItem {
   highlights: Range16[];
   /** What matched (task 4.7): always "name" for name-only searches. Optional for older backends. */
   matched?: MatchSource;
-  /** An excerpt of the content when the content matched, else null. */
+  /**
+   * An excerpt of the content when the content matched, else null. Only the first rows of a
+   * response carry it (about a screenful); the others are fetched with `content_snippets`.
+   */
   snippet?: ContentSnippet | null;
+}
+
+/** One answer of `content_snippets`. */
+export interface RowSnippet {
+  id: number;
+  /** null: no snippet (stale id, a row of another search, or the file is not in the content index). */
+  snippet: ContentSnippet | null;
 }
 
 export type MatchSource = "name" | "content" | "both";
@@ -225,6 +235,11 @@ export interface Commands {
   entry_path: [{ id: number }, string];
   /** `maxChars`: text characters to return (default 65536). Each call cancels the previous one. */
   preview_entry: [{ id: number; requestId: number; maxChars?: number }, PreviewResponse];
+  /**
+   * Snippets of content rows of the last content search that came without one, in the order of
+   * `ids` (at most 200 are built; the rest get null). Ask only while no newer search is pending.
+   */
+  content_snippets: [{ ids: number[] }, RowSnippet[]];
   content_status: [undefined, ContentStatus];
   /** Pause by the user (other reasons, battery or a busy machine, come from the backend). */
   content_pause: [undefined, void];
@@ -340,6 +355,7 @@ export const api = {
   entryPath: (id: number) => call("entry_path", { id }),
   previewEntry: (id: number, requestId: number, maxChars?: number) =>
     call("preview_entry", maxChars === undefined ? { id, requestId } : { id, requestId, maxChars }),
+  contentSnippets: (ids: number[]) => call("content_snippets", { ids }),
   contentStatus: () => call("content_status"),
   contentPause: () => call("content_pause"),
   contentResume: () => call("content_resume"),

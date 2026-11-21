@@ -4,10 +4,20 @@
 //! The stored text is re-tokenized with the same analyzer; tokens whose term is one of the
 //! query's terms are matches, and their spans are already byte spans of the original text, so
 //! highlights land on «الْمَكْتَبَاتِ» even though the query was «مكتبة».
+//!
+//! Cost: tokenizing is the expensive part (about 15 µs per KiB of Arabic), so the text is
+//! scanned in growing windows (the first [`FIRST_WINDOW`] bytes, then 4× more each round,
+//! always cut at a whitespace) and the scan stops at the first window holding a match, plus
+//! [`snippet_bytes`](crate::IndexOptions::snippet_bytes) of context after it so a cluster
+//! that straddles the cut is kept whole. A document whose first match is near its start costs
+//! the same whatever its length; one without a match in the stored text is scanned once.
 
 use athrix_text_ar::Analyzer;
 use std::collections::BTreeSet;
 use std::ops::Range;
+
+/// Bytes of text tokenized first when looking for matches (see the module docs).
+pub(crate) const FIRST_WINDOW: usize = 64 << 10;
 
 /// A fragment of a document's text with the matched words marked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +39,8 @@ impl Snippet {
     }
 }
 
-/// Builds the snippet of `text` for the query `terms`, at most about `max_bytes` long.
+/// Builds the snippet of `text` for the query `terms`, at most about `max_bytes` long, from
+/// the first window of the text that holds a match (see the module docs).
 /// Without a match in `text` (e.g. the match lies past the stored prefix), returns the start
 /// of the text with no highlights.
 pub(crate) fn make(
@@ -38,15 +49,7 @@ pub(crate) fn make(
     analyzer: Analyzer,
     max_bytes: usize,
 ) -> Snippet {
-    // Matched spans, in order, one per source word (variants share the span).
-    let mut spans: Vec<(Range<usize>, &str)> = Vec::new();
-    for t in analyzer.tokens(text) {
-        if let Some(term) = terms.get(&t.text) {
-            if spans.last().is_none_or(|(r, _)| r.start != t.start) {
-                spans.push((t.span(), term.as_str()));
-            }
-        }
-    }
+    let spans = match_spans(text, terms, analyzer, max_bytes);
 
     // Best window: most distinct terms, then most matches, within max_bytes.
     let mut best: Option<(usize, usize, usize, usize)> = None; // (distinct, count, i, j)
@@ -80,6 +83,68 @@ pub(crate) fn make(
             .map(|(r, _)| r.start - start..r.end.min(end) - start)
             .collect(),
     }
+}
+
+/// Matched spans, in order, one per source word (variants share the span), of the first
+/// window of `text` that has any, plus `context` bytes after that window.
+fn match_spans<'t>(
+    text: &str,
+    terms: &'t BTreeSet<String>,
+    analyzer: Analyzer,
+    context: usize,
+) -> Vec<(Range<usize>, &'t str)> {
+    let mut spans = Vec::new();
+    if terms.is_empty() {
+        return spans;
+    }
+    let mut start = 0;
+    let mut window = FIRST_WINDOW;
+    while start < text.len() {
+        let end = word_end(text, start.saturating_add(window));
+        collect(text, start..end, terms, analyzer, &mut spans);
+        if !spans.is_empty() {
+            let tail = word_end(text, end.saturating_add(context));
+            collect(text, end..tail, terms, analyzer, &mut spans);
+            break;
+        }
+        start = end;
+        window = window.saturating_mul(4);
+    }
+    spans
+}
+
+/// Appends the matches of `text[range]` to `spans` (offsets in the whole text).
+fn collect<'t>(
+    text: &str,
+    range: Range<usize>,
+    terms: &'t BTreeSet<String>,
+    analyzer: Analyzer,
+    spans: &mut Vec<(Range<usize>, &'t str)>,
+) {
+    let base = range.start;
+    for t in analyzer.tokens(&text[range]) {
+        if let Some(term) = terms.get(&t.text) {
+            let span = base + t.start..base + t.end;
+            if spans.last().is_none_or(|(r, _)| r.start != span.start) {
+                spans.push((span, term.as_str()));
+            }
+        }
+    }
+}
+
+/// The first whitespace at or after `at` (on a char boundary), or the end of the text: a
+/// window cut there never splits a word.
+fn word_end(text: &str, at: usize) -> usize {
+    if at >= text.len() {
+        return text.len();
+    }
+    let mut i = at;
+    while !text.is_char_boundary(i) {
+        i += 1;
+    }
+    text[i..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |j| i + j)
 }
 
 /// Grows `lo..hi` with context up to `max_bytes`, a third before and the rest after, snapped
@@ -173,6 +238,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_match_past_the_first_window_is_found() {
+        let filler = "كلام عادي بلا شيء ".repeat(FIRST_WINDOW / 20);
+        assert!(filler.len() > FIRST_WINDOW);
+        let text = format!("{filler}وهنا الْمَكْتَبَاتُ أخيرا");
+        let s = make(&text, &terms(&["مكتب"]), Analyzer::default(), 100);
+        let words: Vec<_> = s.original_ranges().map(|r| &text[r]).collect();
+        assert_eq!(words, ["الْمَكْتَبَاتُ"]);
+    }
+
+    #[test]
+    fn a_cluster_across_the_window_cut_is_kept_whole() {
+        // The first window ends right after «عقد»; «الايجار» follows just past the cut.
+        let pad = "س ".repeat((FIRST_WINDOW - 4) / 3);
+        let text = format!("{pad}عقد الايجار {}", "ص ".repeat(1000));
+        let s = make(&text, &terms(&["عقد", "ايجار"]), Analyzer::default(), 60);
+        let words: Vec<_> = s.original_ranges().map(|r| &text[r]).collect();
+        assert_eq!(words, ["عقد", "الايجار"]);
+    }
+
+    #[test]
+    fn a_word_is_never_cut_at_a_window_edge() {
+        // «reporting» straddles the window end, which falls right after «report»: cutting
+        // there would give a false match.
+        let pad = "a".repeat(FIRST_WINDOW - 7);
+        let text = format!("{pad} reporting end");
+        assert_eq!(&text[FIRST_WINDOW - 6..FIRST_WINDOW], "report");
+        let s = make(&text, &terms(&["report"]), Analyzer::default(), 60);
+        assert!(s.highlights.is_empty(), "{s:?}");
     }
 
     #[test]

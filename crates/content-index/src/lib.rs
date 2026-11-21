@@ -20,6 +20,14 @@
 //! pane (task 4.6) can re-extract that one file on demand. Set the limit to 0 to store
 //! nothing and always re-extract.
 //!
+//! # Searching and snippets
+//!
+//! Searches return [`Hit`]s read from the fast columns only (path, key, size, mtime and the
+//! score): fetching thousands of hits for ranking or an AND with the name index costs
+//! milliseconds. A snippet needs the stored text (decompressed, then tokenized until the
+//! first match), so it is built separately, with [`ContentIndex::snippets`], for the few hits
+//! on screen.
+//!
 //! # Writing
 //!
 //! One writer per index directory (tantivy's lock), single indexing thread, bounded memory
@@ -174,7 +182,8 @@ pub enum RebuildReason {
     },
 }
 
-/// One search result.
+/// One search result: identity and score only. Its snippet is built separately, for the hits
+/// actually shown, by [`ContentIndex::snippets`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     /// The file path, as given to [`ContentIndex::add_or_update`].
@@ -185,8 +194,6 @@ pub struct Hit {
     pub meta: FileMeta,
     /// BM25 score.
     pub score: f32,
-    /// A fragment of the original text with the matches marked.
-    pub snippet: Snippet,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -452,11 +459,8 @@ impl ContentIndex {
     }
 
     /// Searches the committed documents. Words are ANDed, `"…"` is a phrase, `-word`
-    /// excludes (see the `query` module docs). Returns at most `limit` hits, best first, each
-    /// with a snippet of the original text.
-    /// Searches the committed documents. Words are ANDed, `"…"` is a phrase, `-word`
-    /// excludes (see the `query` module docs). Returns at most `limit` hits, best first, each
-    /// with a snippet of the original text.
+    /// excludes (see the `query` module docs). Returns at most `limit` hits, best first,
+    /// without snippets (see [`snippets`](Self::snippets)).
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Hit>> {
         let opts = SearchOptions {
             limit,
@@ -545,24 +549,113 @@ impl ContentIndex {
                 (top, Some(n as u64))
             }
         };
+        // Identity from the fast columns: the doc store (lz4 blocks holding up to
+        // `stored_text_limit` of text per document) is never read here.
+        let mut columns: Vec<Option<HitColumns>> = Vec::new();
+        columns.resize_with(searcher.segment_readers().len(), || None);
         let mut hits = Vec::with_capacity(top.len());
+        let mut path = String::new();
         for (score, addr) in top {
-            let doc: TantivyDocument = searcher.doc(addr).map_err(|e| self.err(e))?;
-            let text = |field| doc.get_first(field).and_then(|v| v.as_str()).unwrap_or("");
-            let u = |field| doc.get_first(field).and_then(|v| v.as_u64()).unwrap_or(0);
-            let preview = text(f.preview);
+            let seg = addr.segment_ord as usize;
+            let cols = match &mut columns[seg] {
+                Some(c) => c,
+                slot => slot.insert(
+                    HitColumns::open(searcher.segment_reader(addr.segment_ord))
+                        .map_err(|e| self.err(e))?,
+                ),
+            };
+            path.clear();
+            if let Some(paths) = &cols.paths {
+                if let Some(ord) = paths.ords().first(addr.doc_id) {
+                    paths
+                        .ord_to_str(ord, &mut path)
+                        .map_err(|e| self.err(e.into()))?;
+                }
+            }
+            let doc = addr.doc_id;
             hits.push(Hit {
-                path: text(f.path).to_owned(),
-                key: FileKey(u(f.key)),
+                path: path.clone(),
+                key: FileKey(cols.keys.first(doc).unwrap_or(0)),
                 meta: FileMeta {
-                    size: u(f.size),
-                    mtime: doc.get_first(f.mtime).and_then(|v| v.as_i64()).unwrap_or(0),
+                    size: cols.sizes.first(doc).unwrap_or(0),
+                    mtime: cols.mtimes.first(doc).unwrap_or(0),
                 },
                 score,
-                snippet: snippet::make(preview, &built.terms, analyzer, self.options.snippet_bytes),
             });
         }
         Ok(SearchPage { hits, total })
+    }
+
+    /// Snippets of the committed documents at `paths` (compared by [`path_key`]) for
+    /// `query_text` (the same syntax as [`search`](Self::search)), in the order of `paths`;
+    /// `None` for a path the index does not hold.
+    ///
+    /// A snippet is the fragment of the stored text around the best cluster of matches, with
+    /// highlights on the original (diacritized) words. Each one reads the document's stored
+    /// text and tokenizes it from the start until a match is found, so build snippets only
+    /// for the hits shown, not for every hit of a search. Without a match in the stored text
+    /// (past the stored prefix, or a query with only excluded words) the snippet is the start
+    /// of the text with no highlights. The documents are read on a few threads when there
+    /// are many.
+    pub fn snippets<S: AsRef<str> + Sync>(
+        &self,
+        query_text: &str,
+        paths: &[S],
+    ) -> Result<Vec<Option<Snippet>>> {
+        let analyzer = Analyzer::default();
+        let terms = query::build(query_text, self.fields.body, analyzer).terms;
+        let searcher = self.reader.searcher();
+        let one = |path: &S| self.snippet_of(&searcher, &terms, analyzer, path.as_ref());
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(paths.len().div_ceil(SNIPPETS_PER_THREAD))
+            .min(MAX_SNIPPET_THREADS);
+        if threads <= 1 {
+            return paths.iter().map(one).collect();
+        }
+        let chunk = paths.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let workers: Vec<_> = paths
+                .chunks(chunk)
+                .map(|part| s.spawn(move || part.iter().map(one).collect::<Result<Vec<_>>>()))
+                .collect();
+            let mut out = Vec::with_capacity(paths.len());
+            for w in workers {
+                let part = w.join().unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+                out.extend(part);
+            }
+            Ok(out)
+        })
+    }
+
+    fn snippet_of(
+        &self,
+        searcher: &tantivy::Searcher,
+        terms: &std::collections::BTreeSet<String>,
+        analyzer: Analyzer,
+        path: &str,
+    ) -> Result<Option<Snippet>> {
+        let q = TermQuery::new(
+            Term::from_field_text(self.fields.pkey, &path_key(path)),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher
+            .search(&q, &TopDocs::with_limit(1))
+            .map_err(|e| self.err(e))?;
+        let Some(&(_, addr)) = top.first() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(addr).map_err(|e| self.err(e))?;
+        let text = doc
+            .get_first(self.fields.preview)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Ok(Some(snippet::make(
+            text,
+            terms,
+            analyzer,
+            self.options.snippet_bytes,
+        )))
     }
 
     /// Calls `f` with the path (as last given to [`add_or_update`](Self::add_or_update)) and
@@ -664,6 +757,31 @@ impl ContentIndex {
             .map_err(|e| self.err(e))?;
         self.writer().delete_query(q).map_err(|e| self.err(e))?;
         Ok(n as u64)
+    }
+}
+
+/// [`ContentIndex::snippets`] uses one more thread per this many paths...
+const SNIPPETS_PER_THREAD: usize = 4;
+/// ...up to this many threads.
+const MAX_SNIPPET_THREADS: usize = 8;
+
+/// The fast columns a [`Hit`] is read from, opened once per segment and search.
+struct HitColumns {
+    paths: Option<tantivy::columnar::StrColumn>,
+    keys: tantivy::columnar::Column<u64>,
+    sizes: tantivy::columnar::Column<u64>,
+    mtimes: tantivy::columnar::Column<i64>,
+}
+
+impl HitColumns {
+    fn open(segment: &tantivy::SegmentReader) -> tantivy::Result<Self> {
+        let ff = segment.fast_fields();
+        Ok(HitColumns {
+            paths: ff.str("path")?,
+            keys: ff.u64("key")?,
+            sizes: ff.u64("size")?,
+            mtimes: ff.i64("mtime")?,
+        })
     }
 }
 

@@ -17,7 +17,7 @@ use athrix_query::{PlanOptions, SearchPlan};
 use crate::content::{ContentService, StatusSink};
 use crate::indexing::{IndexObserver, IndexView, Indexer, SnapshotStore, StatusListener};
 use crate::model::{
-    ContentStatus, IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem,
+    ContentStatus, IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem, RowSnippet,
     SearchResponse, SearchSuggestion,
 };
 use crate::preview::{DEFAULT_MAX_CHARS, build_preview};
@@ -400,6 +400,31 @@ pub async fn open_entry(app: AppHandle, state: State<'_, AppState>, id: u64) -> 
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     state.content.record_open(&text);
     Ok(())
+}
+
+/// Most ids one `content_snippets` call builds snippets for (the rest get `None`).
+pub const MAX_SNIPPET_IDS: usize = 200;
+
+/// Snippets of result rows of the last content search (rows past the first
+/// [`crate::content::SNIPPET_ROWS`], which `search` sends without one), in the order of `ids`.
+/// A row of another search, a stale id or a file the content index lacks gets `null`. Runs on
+/// the blocking pool; not cancelled by searches (the UI drops answers for an old list).
+#[tauri::command]
+pub async fn content_snippets(
+    state: State<'_, AppState>,
+    ids: Vec<u64>,
+) -> Result<Vec<RowSnippet>, String> {
+    let indexer = Arc::clone(&state.indexer);
+    let content = Arc::clone(&state.content);
+    blocking(move || row_snippets(&indexer, &content, &ids)).await
+}
+
+/// The blocking part of [`content_snippets`].
+fn row_snippets(indexer: &Indexer, content: &ContentService, ids: &[u64]) -> Vec<RowSnippet> {
+    let (built, rest) = ids.split_at(ids.len().min(MAX_SNIPPET_IDS));
+    let mut out = content.row_snippets(built, |id| resolve(indexer, id).ok());
+    out.extend(rest.iter().map(|&id| RowSnippet { id, snippet: None }));
+    out
 }
 
 /// The state of background content indexing.
@@ -967,6 +992,51 @@ mod content_search_tests {
         }
         let after = f.items("content:قرار", None, false);
         assert_eq!(after[0].name, last.name, "{after:?}");
+    }
+
+    #[test]
+    fn only_the_first_rows_carry_snippets_and_the_rest_come_on_request() {
+        use crate::content::SNIPPET_ROWS;
+        let count = SNIPPET_ROWS + 5;
+        let files: Vec<(String, Vec<u8>)> = (0..count)
+            .map(|i| {
+                let text = format!("مقدمة {i} ثم الْمِيزَانِيَّةُ هنا");
+                (format!("doc{i:02}.txt"), text.into_bytes())
+            })
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> =
+            files.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+        let f = Fixture::new(&[&refs]);
+        let items = f.items("content:ميزانية", None, false);
+        assert_eq!(items.len(), count);
+        assert!(items[..SNIPPET_ROWS].iter().all(|i| i.snippet.is_some()));
+        assert!(items[SNIPPET_ROWS..].iter().all(|i| i.snippet.is_none()));
+
+        // Every row on request, in the order asked: the same snippet as `search` gave.
+        let resolve = |id: u64| decode_id(id).map(|(_, entry)| f.view.path(entry));
+        let ids: Vec<u64> = items.iter().rev().map(|i| i.id).collect();
+        let got = f.content.row_snippets(&ids, resolve);
+        assert_eq!(got.len(), count);
+        for (row, item) in got.iter().zip(items.iter().rev()) {
+            assert_eq!(row.id, item.id);
+            let s = row.snippet.as_ref().expect("a snippet");
+            assert_eq!(js_slice(&s.text, s.highlights[0]), "الْمِيزَانِيَّةُ");
+            if let Some(first) = &item.snippet {
+                assert_eq!(first, s, "built later = built in the search");
+            }
+        }
+        // An id of another generation (another view) gets nothing.
+        let (_, entry) = decode_id(items[0].id).unwrap();
+        let other = crate::results::encode_id(f.view.generation() + 1, entry);
+        assert_eq!(f.content.row_snippets(&[other], resolve)[0].snippet, None);
+
+        // A name-only search does not change what the content rows get.
+        let _ = f.items("doc01", None, false);
+        assert!(
+            f.content.row_snippets(&ids[..1], resolve)[0]
+                .snippet
+                .is_some()
+        );
     }
 
     #[test]

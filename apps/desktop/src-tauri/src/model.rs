@@ -75,7 +75,20 @@ pub struct ResultItem {
     /// Which part of the query found this result: always [`Matched::Name`] for name-only
     /// searches.
     pub matched: Matched,
-    /// A fragment of the file's text with the matched words, when the content matched.
+    /// A fragment of the file's text with the matched words, when the content matched. Only
+    /// the first [`crate::content::SNIPPET_ROWS`] rows of a response carry it; the UI asks
+    /// for the others with `content_snippets` ([`RowSnippet`]).
+    pub snippet: Option<ContentSnippet>,
+}
+
+/// One answer of `content_snippets`: the snippet of the result row `id`, or `None` when the
+/// row is stale, not from the last content search, or its file is not in the content index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowSnippet {
+    /// The result id, as given.
+    pub id: u64,
+    /// Its snippet.
     pub snippet: Option<ContentSnippet>,
 }
 

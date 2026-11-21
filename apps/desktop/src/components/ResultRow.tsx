@@ -1,6 +1,6 @@
 import { createMemo, For, Show } from "solid-js";
 import { locale, t } from "../i18n";
-import type { ResultItem } from "../lib/api";
+import type { ContentSnippet, ResultItem } from "../lib/api";
 import { categoryOf } from "../lib/fileKinds";
 import {
   formatDateTime, formatRelative, formatSize, highlightParts, snippetParts, splitName, splitPath, type TextPart,
@@ -12,14 +12,21 @@ export const ROW_HEIGHT = 44;
 /** A content match in the main window: name + path + snippet line. */
 export const SNIPPET_ROW_HEIGHT = 64;
 
+/** The content matched: the row has (or will get) a snippet. */
+export function hasContentMatch(item: ResultItem): boolean {
+  return item.matched === "content" || item.matched === "both";
+}
+
 /**
  * Fixed height of a row, from its data alone (the virtual list places rows without measuring).
- * In the main window a row with a content snippet gets a third line, so the path stays visible;
- * the compact popup keeps every row at 44px and shows the snippet instead of the path, as in
- * the design's popup mockup (§9.1).
+ * In the main window a content match gets a third line for its snippet, so the path stays
+ * visible; the line is reserved even before the snippet arrives (the backend sends snippets
+ * for the first rows only, the list fetches the rest as they scroll into view), so nothing
+ * moves when it does. The compact popup keeps every row at 44px and shows the snippet instead
+ * of the path, as in the design's popup mockup (§9.1).
  */
 export function rowHeight(item: ResultItem, compact: boolean): number {
-  return !compact && item.snippet ? SNIPPET_ROW_HEIGHT : ROW_HEIGHT;
+  return !compact && (item.snippet || hasContentMatch(item)) ? SNIPPET_ROW_HEIGHT : ROW_HEIGHT;
 }
 
 type Props = {
@@ -31,6 +38,9 @@ type Props = {
   selected: boolean;
   /** Quick-search popup: the snippet, if any, replaces the path line. */
   compact: boolean;
+  /** The snippet fetched after the search, for a row the backend sent without one: undefined = not
+   * fetched yet (a placeholder bar shows), null = there is none (the line stays empty). */
+  snippet?: ContentSnippet | null;
   /** Re-read every minute so relative times stay fresh. */
   now: number;
   onSelect: () => void;
@@ -82,19 +92,20 @@ export default function ResultRow(props: Props) {
   });
 
   const snippet = createMemo(() => {
-    const sn = props.item.snippet;
+    const sn = props.item.snippet ?? props.snippet;
     return sn ? snippetParts(sn.text, sn.highlights) : null;
   });
   const source = () => props.item.matched ?? "name";
   const sourceLabel = () => (source() === "both" ? t("results.matchedBoth") : t("results.matchedContent"));
   const showPath = () => !(props.compact && snippet());
+  const tall = () => !props.compact && (!!snippet() || hasContentMatch(props.item));
 
   return (
     <div
       id={props.id}
       role="option"
       class="row"
-      classList={{ "row-tall": !props.compact && !!snippet() }}
+      classList={{ "row-tall": tall() }}
       aria-selected={props.selected}
       aria-setsize={props.setSize}
       aria-posinset={props.index + 1}
@@ -125,7 +136,7 @@ export default function ResultRow(props: Props) {
             <Show when={path().tail}>{(s) => <bdi class="row-path-tail">{s().text}</bdi>}</Show>
           </bdi>
         </Show>
-        <Show when={snippet()}>
+        <Show when={snippet()} fallback={<Show when={tall()}><span class="row-snippet" classList={{ "row-snippet-pending": props.snippet === undefined }} aria-hidden="true" /></Show>}>
           {(parts) => (
             // Its own direction (the excerpt may be English in an Arabic UI); one line, ellipsis.
             <span class="row-snippet" dir="auto" title={props.compact ? props.item.parent : undefined}>

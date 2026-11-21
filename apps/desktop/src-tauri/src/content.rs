@@ -67,10 +67,10 @@ use athrix_ranking::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::indexing::{IndexObserver, IndexView};
-use crate::model::{ContentSnippet, ContentState, ContentStatus, PauseReason};
+use crate::indexing::{GENERATION_MASK, IndexObserver, IndexView};
+use crate::model::{ContentSnippet, ContentState, ContentStatus, PauseReason, RowSnippet};
 use crate::query::{CompiledQuery, utf16_offset};
-use crate::results::{SearchFailure, SearchHits, SearchScope, build_row, search_ids};
+use crate::results::{SearchFailure, SearchHits, SearchScope, build_row, decode_id, search_ids};
 use crate::roots::path_key;
 
 /// Folder of the content index inside the app data folder.
@@ -95,6 +95,10 @@ const NAME_CAP: usize = 20_000;
 
 /// Most content hits fetched while filtering by scope / name index.
 const CONTENT_CAP: usize = 10_000;
+
+/// Rows of a content search that get their snippet in the `search` response: about what the
+/// list shows on first paint. The rest come from `content_snippets` as they scroll into view.
+pub const SNIPPET_ROWS: usize = 30;
 
 const SETTING_VERSION: u32 = 1;
 
@@ -180,6 +184,28 @@ impl std::fmt::Debug for SinkSlot {
 /// `path key → id` of the live files added since the base.
 type DeltaMap = HashMap<String, EntryId>;
 
+/// What `row_snippets` needs to know about the last content search.
+#[derive(Debug, Clone)]
+struct SnippetQuery {
+    /// Generation of its index view, as result ids carry it.
+    generation: u32,
+    /// Its positive content part, in content-query syntax.
+    text: String,
+}
+
+/// The content-query text snippets are built for: the plan's content part, when it has a
+/// positive clause (an excluded-only content part finds no content rows).
+fn snippet_text(plan: &SearchPlan) -> Option<String> {
+    match plan {
+        SearchPlan::NameAndContent { content, .. } | SearchPlan::NameOrContent { content, .. }
+            if content.has_positive() =>
+        {
+            Some(content.to_query_text())
+        }
+        _ => None,
+    }
+}
+
 /// The content index, its scheduler, the frecency store and the status events. Shared by the
 /// commands (through `AppState`) and the name indexer (as its [`IndexObserver`]).
 #[derive(Debug)]
@@ -198,6 +224,8 @@ pub struct ContentService {
     frecency: RwLock<Frecency>,
     lookup: Mutex<Option<Arc<PathLookup>>>,
     delta: Mutex<Option<(Weak<IndexSnapshot>, Arc<DeltaMap>)>>,
+    /// The content query of the last content search, for `row_snippets`.
+    snippet_query: Mutex<Option<SnippetQuery>>,
     sink: SinkSlot,
     emit: Mutex<EmitState>,
 }
@@ -221,6 +249,7 @@ impl ContentService {
             ))),
             lookup: Mutex::new(None),
             delta: Mutex::new(None),
+            snippet_query: Mutex::new(None),
             sink: SinkSlot::default(),
             emit: Mutex::new(EmitState::default()),
         })
@@ -648,7 +677,9 @@ impl ContentService {
 
     /// Runs a content plan on `view` (only under `scope` if given) and the content index,
     /// returning up to `limit` items. `name_query` gives the name highlights (the plan's name
-    /// part, compiled). Items carry `matched` and the content snippet.
+    /// part, compiled). Items carry `matched`; the content rows among the first
+    /// [`SNIPPET_ROWS`] also carry their snippet, the others get theirs through
+    /// [`row_snippets`](Self::row_snippets), which uses the content query remembered here.
     pub fn search(
         &self,
         view: &IndexView,
@@ -684,6 +715,8 @@ impl ContentService {
         };
         let truncated = results.hits.len() > limit;
         let mut items = Vec::with_capacity(results.hits.len().min(limit));
+        // (row, path) of the content rows that get their snippet now.
+        let mut shown: Vec<(usize, String)> = Vec::new();
         for hit in results.hits.into_iter().take(limit) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(SearchFailure::Cancelled);
@@ -695,10 +728,69 @@ impl ContentService {
                 name_query.map_or_else(Vec::new, |q| q.highlights(name))
             });
             item.matched = hit.matched.into();
-            item.snippet = hit.snippet.map(ui_snippet);
+            if items.len() < SNIPPET_ROWS && hit.matched.has_content() {
+                shown.push((items.len(), hit.path));
+            }
             items.push(item);
         }
+        let text = snippet_text(plan);
+        if let (Some(index), Some(text)) = (&index, &text) {
+            let paths: Vec<&str> = shown.iter().map(|(_, p)| p.as_str()).collect();
+            match index.snippets(text, &paths) {
+                Ok(snippets) => {
+                    for ((row, _), s) in shown.iter().zip(snippets) {
+                        items[*row].snippet = s.map(ui_snippet);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "cannot build content snippets"),
+            }
+        }
+        // Remember the query for `row_snippets`, unless a newer search started meanwhile (it
+        // set `cancel` before running, so it stores its own query after this one).
+        let mut slot = self.lock(&self.snippet_query);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SearchFailure::Cancelled);
+        }
+        *slot = text.map(|text| SnippetQuery {
+            generation: view.generation() & GENERATION_MASK,
+            text,
+        });
         Ok(SearchHits { items, truncated })
+    }
+
+    /// Snippets of the result rows `ids` (in that order) for the content query of the last
+    /// content search, built now. A row gets `None` when it is not from that search's index
+    /// view, `resolve` cannot map it to a file (stale id), or the content index does not hold
+    /// the file. `resolve` maps a result id to its file path, as the commands do.
+    pub fn row_snippets(
+        &self,
+        ids: &[u64],
+        resolve: impl Fn(u64) -> Option<PathBuf>,
+    ) -> Vec<RowSnippet> {
+        let mut out: Vec<RowSnippet> = ids
+            .iter()
+            .map(|&id| RowSnippet { id, snippet: None })
+            .collect();
+        let query = self.lock(&self.snippet_query).clone();
+        let (Some(query), Some(index)) = (query, self.index()) else {
+            return out;
+        };
+        let wanted: Vec<(usize, String)> = ids
+            .iter()
+            .enumerate()
+            .filter(|&(_, &id)| decode_id(id).is_some_and(|(g, _)| g == query.generation))
+            .filter_map(|(row, &id)| Some((row, resolve(id)?.to_string_lossy().into_owned())))
+            .collect();
+        let paths: Vec<&str> = wanted.iter().map(|(_, p)| p.as_str()).collect();
+        match index.snippets(&query.text, &paths) {
+            Ok(snippets) => {
+                for ((row, _), s) in wanted.iter().zip(snippets) {
+                    out[*row].snippet = s.map(ui_snippet);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot build content snippets"),
+        }
+        out
     }
 
     /// The path lookup of `view`'s base, built if the cached one is of another base.
@@ -885,7 +977,8 @@ impl PlanSources<'_> {
 }
 
 impl Sources for PlanSources<'_> {
-    type Snippet = Snippet;
+    // Snippets are built after ranking, for the rows shown only.
+    type Snippet = ();
     type Error = SearchFailure;
 
     fn search_names(
@@ -917,7 +1010,7 @@ impl Sources for PlanSources<'_> {
         &mut self,
         text: &str,
         limit: usize,
-    ) -> Result<Vec<ContentHit<Snippet>>, SearchFailure> {
+    ) -> Result<Vec<ContentHit<()>>, SearchFailure> {
         self.check()?;
         let Some(index) = self.content else {
             return Ok(Vec::new());
@@ -948,7 +1041,7 @@ impl Sources for PlanSources<'_> {
                     path: h.path,
                     score: h.score,
                     mtime: self.view.meta(id).modified,
-                    snippet: h.snippet,
+                    snippet: (),
                 });
                 if out.len() >= limit {
                     return Ok(out);

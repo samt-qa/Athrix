@@ -18,8 +18,8 @@
 // `?mockContentError` (the content indexer fails), `?mockContentRate=N` (docs per second).
 import type {
   CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, Favorite, HistoryEntry, IndexRoots,
-  IndexStatus, MatchSource, PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, SavedSearch,
-  SearchResponse, SearchSuggestion, Volume,
+  IndexStatus, MatchSource, PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, RowSnippet,
+  SavedSearch, SearchResponse, SearchSuggestion, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
 import { tokenize, type Token } from "./queryLang";
@@ -913,10 +913,33 @@ function search(
     }
   }
   hits.sort((a, b) => a.score - b.score || a.e.item.name.localeCompare(b.e.item.name));
-  const items = hits.slice(0, limit).map((h): ResultItem => ({
-    ...h.e.item, highlights: h.highlights, matched: h.matched, snippet: h.snippet,
+  // Like the Rust side: only the first SNIPPET_ROWS rows carry their snippet; the others come
+  // from `content_snippets`, which uses the content words of the last search remembered here.
+  const shown = hits.slice(0, limit);
+  const snippetWords = wanted.length ? wanted : nameOrContent ? terms : [];
+  if (withSuggestion) {
+    lastSnippetQuery = snippetWords.length
+      ? { words: snippetWords, entries: new Map(shown.filter((h) => h.snippet).map((h) => [h.e.item.id, h.e])) }
+      : null;
+  }
+  const items = shown.map((h, i): ResultItem => ({
+    ...h.e.item, highlights: h.highlights, matched: h.matched, snippet: i < SNIPPET_ROWS ? h.snippet : null,
   }));
   return done(items, hits.length > limit);
+}
+
+/** Rows of a response that carry their snippet (`SNIPPET_ROWS` in the app's content.rs). */
+const SNIPPET_ROWS = 30;
+
+/** The content words and content rows of the last search, for `content_snippets`. */
+let lastSnippetQuery: { words: string[]; entries: Map<number, MockEntry> } | null = null;
+
+/** `content_snippets`: the snippet of each id of the last search, null for any other id. */
+function rowSnippets(ids: number[]): RowSnippet[] {
+  return ids.map((id, i) => {
+    const e = i < 200 ? lastSnippetQuery?.entries.get(id) : undefined;
+    return { id, snippet: e && lastSnippetQuery ? makeSnippet(e.body!, lastSnippetQuery.words) : null };
+  });
 }
 
 function mergeRanges(r: Range16[]): Range16[] {
@@ -1249,6 +1272,10 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       } satisfies PreviewResponse;
       break;
     }
+    case "content_snippets":
+      await sleep(15);
+      result = rowSnippets(args.ids as number[]);
+      break;
     case "content_status":
       result = { ...content, pausedBy: [...content.pausedBy] } satisfies ContentStatus;
       break;

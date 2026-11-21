@@ -99,6 +99,9 @@ export default function App(props: { mode: WindowMode }) {
   // Whole numbers: Rust reads requestId as u64. Seeded from the clock so ids keep increasing
   // across a webview reload (or HMR) while the backend stays alive.
   let lastRequest = Date.now();
+  // A search is on its way: the list holds `content_snippets` requests meanwhile, since the
+  // backend answers them with the query of the last search it finished.
+  const [searchPending, setSearchPending] = createSignal(false);
   async function runSearch(query: string, where: string, withContent = searchContent()) {
     const requestId = ++lastRequest;
     if (!query.trim()) {
@@ -106,21 +109,29 @@ export default function App(props: { mode: WindowMode }) {
         setResponse(null);
         setFailure(null);
         setSelected(0);
+        setSearchPending(false);
       });
       return;
     }
+    setSearchPending(true);
     try {
       const r = await api.search(query, LIMIT, requestId, where || null, withContent);
       // Drop anything older than the latest request, and cancelled ones.
-      if (r.requestId !== lastRequest || requestId !== lastRequest || r.cancelled) return;
+      if (requestId !== lastRequest) return;
+      if (r.requestId !== lastRequest || r.cancelled) {
+        setSearchPending(false);
+        return;
+      }
       batch(() => {
         setResponse(r);
         setFailure(null);
         setSelected(0);
+        setSearchPending(false);
       });
     } catch (err) {
       if (requestId === lastRequest) {
         batch(() => {
+          setSearchPending(false);
           setResponse(null);
           setFailure(t("queryError.searchFailed", { message: errorMessage(err) }));
         });
@@ -671,6 +682,8 @@ export default function App(props: { mode: WindowMode }) {
           selected={selected()}
           now={now()}
           compact={quick}
+          loadSnippets={api.contentSnippets}
+          snippetsPaused={searchPending()}
           onHeight={setListHeight}
           onSelect={setSelected}
           onOpen={(i) => {

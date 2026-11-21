@@ -1,13 +1,15 @@
 //! Small end-to-end benchmark: index 10k synthetic ~2 KB documents (Arabic with partial
 //! diacritics + some English and digits), then run queries. A second part builds a 50k-doc
 //! index (~1 KB each, 100 folders) and measures scoped search (a 10k-path set and a folder
-//! prefix), paging, counts, listing every path, the retain sweep and a prefix delete.
+//! prefix), paging, counts, listing every path, the retain sweep and a prefix delete. A third
+//! part indexes 300 long documents (~520 KiB, the stored-text limit, like real epub books) and
+//! measures deep fetches and the snippets of the 30 hits shown.
 //!
 //! `cargo bench -p athrix-content-index --bench content_bench` (optionally `-- <docs>` for the
 //! first part).
 //!
 //! Reference run (Windows dev machine, schema 2, other builds running alongside, so ±2×), 50k
-//! documents, 300 mixed queries, top 20 + snippets, p50 / p95:
+//! documents, 300 mixed queries, top 20 (snippets were then built for every hit), p50 / p95:
 //!
 //! | case | p50 | p95 |
 //! |---|---|---|
@@ -21,6 +23,12 @@
 //! 4–7 ms; `retain` removing 40k queues its deletes in 26–37 ms (+35–53 ms commit);
 //! `delete_prefix` of a 500-doc folder 20–30 ms with the commit. The same 10k-path filter as
 //! a `TermSetQuery` on the key field (first attempt) was p95 16 ms.
+//!
+//! Without snippets in search (task 5.8 follow-up), the same 50k run: unscoped top 20 p50
+//! 0.15 ms / p95 1.9 ms. Long documents (300 × ~520 KiB): top 804 p95 1.4 ms; snippets of the
+//! best 30 p50 10 ms / p95 13 ms; 30 snippets with no match in the stored text (whole-text
+//! scans, the worst case) 45 ms. Before, a snippet was built for every hit, about 8 ms per
+//! long Arabic document.
 
 use athrix_content_index::{ContentIndex, FileMeta, PathFilter, SearchOptions};
 use std::time::{Duration, Instant};
@@ -266,6 +274,50 @@ fn scoped(rng: &mut Rng) {
     );
 }
 
+/// Long documents (~512 KiB stored each, like epub books): searching must stay independent of
+/// document length, and snippets of the shown hits must stay a few ms (regression guard for
+/// the per-hit snippet cost found by the perf audit, task 5.8).
+fn long_documents(rng: &mut Rng) {
+    const N: usize = 300;
+    let dir = tempfile::TempDir::new().unwrap();
+    let idx = ContentIndex::open_or_create(dir.path()).unwrap();
+    let t = Instant::now();
+    let mut paths = Vec::with_capacity(N);
+    for i in 0..N {
+        let doc = make_doc(rng, 520 << 10);
+        let path = format!("C:/bench/long/book{i:04}.epub");
+        let meta = FileMeta {
+            size: doc.len() as u64,
+            mtime: i as i64,
+        };
+        idx.add_or_update(&path, meta, &doc).unwrap();
+        paths.push(path);
+    }
+    idx.commit().unwrap();
+    println!(
+        "\n--- long: {N} documents of ~520 KiB, indexed in {:.2?}",
+        t.elapsed()
+    );
+    let queries: Vec<String> = ["تقرير", "وزارة", "الْمَكْتَبَاتُ", "report", "\"عقد الإيجار\""]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    timed("long: top 804 (no snippets)", &queries, |q| {
+        idx.search(q, 804).unwrap().len()
+    });
+    timed("long: snippets of the best 30", &queries, |q| {
+        let hits = idx.search(q, 30).unwrap();
+        let shown: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        idx.snippets(q, &shown).unwrap().len()
+    });
+    // A word that is in no document: each snippet scans the whole stored text once.
+    let rare = vec!["كلمةغيرموجودة".to_owned()];
+    timed("long: 30 snippets without a match", &rare, |q| {
+        let shown: Vec<&str> = paths.iter().take(30).map(String::as_str).collect();
+        idx.snippets(q, &shown).unwrap().len()
+    });
+}
+
 fn main() {
     let n: usize = std::env::args()
         .skip(1)
@@ -324,7 +376,7 @@ fn main() {
         100.0 * size as f64 / bytes as f64
     );
     println!(
-        "query (top 20 + snippets, {} queries, {} hits)  p50 {:?}  p95 {:?}  max {:?}",
+        "query (top 20, {} queries, {} hits)  p50 {:?}  p95 {:?}  max {:?}",
         queries.len(),
         total_hits,
         percentile(&lat, 0.5),
@@ -333,4 +385,5 @@ fn main() {
     );
     drop(idx);
     scoped(&mut rng);
+    long_documents(&mut rng);
 }

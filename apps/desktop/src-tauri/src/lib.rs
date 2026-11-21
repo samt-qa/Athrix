@@ -150,6 +150,7 @@ pub fn run() {
             commands::reveal_entry,
             commands::entry_path,
             commands::preview_entry,
+            commands::content_snippets,
             commands::content_status,
             commands::content_pause,
             commands::content_resume,

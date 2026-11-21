@@ -20,6 +20,10 @@
 //! 3. If the name set was cut at `name_cap`, content hits outside it are checked one by one
 //!    with [`Sources::name_matches`] (when the caller provides it) instead of being dropped.
 //!
+//! Content hits should be cheap to fetch (no snippets: build those afterwards for the results
+//! shown, with `S = ()` here); then even a deepening to 10 000 costs a few ms (measured in
+//! `docs/PERF-AUDIT.md`), and restricting the content search to the name set is not needed.
+//!
 //! Bounds: at most `1 + log₄(content_cap / first fetch)` content searches (4 with the
 //! defaults) and one name search. Whenever a bound may have hidden a valid result,
 //! [`SearchResults::truncated`] says so; with the defaults that only happens when more than
@@ -82,7 +86,7 @@ pub struct ContentHit<S> {
     pub score: f32,
     /// Modification time, Unix seconds, for the recency boost.
     pub mtime: Option<i64>,
-    /// The snippet with the matches.
+    /// The snippet with the matches, or `()` when snippets are built after ranking.
     pub snippet: S,
 }
 

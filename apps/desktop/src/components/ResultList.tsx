@@ -1,11 +1,13 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount } from "solid-js";
 import { locale, t, tPlural } from "../i18n";
-import type { ResultItem } from "../lib/api";
+import type { ContentSnippet, ResultItem, RowSnippet } from "../lib/api";
 import { formatCount } from "../lib/format";
-import ResultRow, { ROW_HEIGHT, rowHeight } from "./ResultRow";
+import ResultRow, { hasContentMatch, ROW_HEIGHT, rowHeight } from "./ResultRow";
 
 /** Rows rendered above and below the viewport. */
 const OVERSCAN = 6;
+/** Snippets of rows scrolled into view are requested once scrolling pauses this long. */
+const SNIPPET_DELAY_MS = 80;
 /** The count is announced once typing pauses this long (not on every keystroke). */
 const ANNOUNCE_DELAY_MS = 450;
 
@@ -30,6 +32,13 @@ type Props = {
   truncated?: boolean;
   /** Total height of all rows, in px (the popup sizes its list area with it). */
   onHeight?: (px: number) => void;
+  /**
+   * Fetches the snippets of content rows the backend sent without one (`content_snippets`).
+   * Without it, such rows keep an empty snippet line.
+   */
+  loadSnippets?: (ids: number[]) => Promise<RowSnippet[]>;
+  /** A newer search is on its way: hold snippet requests (they would use its query). */
+  snippetsPaused?: boolean;
   ref?: (handle: ResultListHandle) => void;
 };
 
@@ -101,6 +110,53 @@ export default function ResultList(props: Props) {
   // Slicing keeps item identity, so <For> reuses rows that stay in view while scrolling.
   const visible = createMemo(() => props.items.slice(range().start, range().end));
 
+  // ---- snippets of content rows past the first ones (the backend sends only those) ----
+  // Fetched per result set: `items` identity is the generation, so answers for an older list
+  // are dropped and its cache is never reused.
+  const [fetched, setFetched] = createSignal<{ items: ResultItem[]; map: Map<number, ContentSnippet | null> }>({
+    items: [],
+    map: new Map(),
+  });
+  let requested: { items: ResultItem[]; ids: Set<number> } = { items: [], ids: new Set() };
+  let snippetTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(snippetTimer));
+  const fetchedSnippet = (item: ResultItem) => {
+    const f = fetched();
+    return f.items === props.items ? f.map.get(item.id) : undefined;
+  };
+  createEffect(() => {
+    const load = props.loadSnippets;
+    const items = props.items;
+    const { start, end } = range();
+    clearTimeout(snippetTimer);
+    if (!load || props.snippetsPaused) return;
+    if (requested.items !== items) requested = { items, ids: new Set() };
+    const ids: number[] = [];
+    for (let i = start; i < end; i++) {
+      const it = items[i];
+      if (hasContentMatch(it) && !it.snippet && !requested.ids.has(it.id)) ids.push(it.id);
+    }
+    if (!ids.length) return;
+    snippetTimer = setTimeout(() => {
+      if (items !== props.items) return;
+      for (const id of ids) requested.ids.add(id);
+      load(ids).then(
+        (rows) => {
+          if (items !== props.items) return;
+          setFetched((prev) => {
+            const map = prev.items === items ? new Map(prev.map) : new Map<number, ContentSnippet | null>();
+            for (const r of rows) map.set(r.id, r.snippet);
+            return { items, map };
+          });
+        },
+        // Failed: let the next scroll ask again.
+        () => {
+          if (requested.items === items) for (const id of ids) requested.ids.delete(id);
+        },
+      );
+    }, SNIPPET_DELAY_MS);
+  });
+
   const scrollTo = (top: number) => {
     viewport.scrollTop = top;
     setScrollTop(viewport.scrollTop);
@@ -159,6 +215,7 @@ export default function ResultList(props: Props) {
                 top={topOf(index())}
                 selected={index() === props.selected}
                 compact={!!props.compact}
+                snippet={fetchedSnippet(item)}
                 now={props.now}
                 onSelect={() => props.onSelect(index())}
                 onOpen={() => props.onOpen(index())}

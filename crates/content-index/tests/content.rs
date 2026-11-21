@@ -1,6 +1,8 @@
 //! End-to-end tests of the content index: Arabic and English documents.
 
-use athrix_content_index::{ContentIndex, Error, FileKey, FileMeta, IndexOptions, RebuildReason};
+use athrix_content_index::{
+    ContentIndex, Error, FileKey, FileMeta, IndexOptions, RebuildReason, Snippet,
+};
 use tempfile::TempDir;
 
 const META: FileMeta = FileMeta {
@@ -17,6 +19,13 @@ fn index_with(docs: &[(&str, &str)]) -> (TempDir, ContentIndex) {
     }
     idx.commit().unwrap();
     (dir, idx)
+}
+
+/// The snippet of the document at `path` for `q`.
+fn snippet(idx: &ContentIndex, q: &str, path: &str) -> Snippet {
+    let mut s = idx.snippets(q, &[path]).unwrap();
+    assert_eq!(s.len(), 1);
+    s.pop().unwrap().expect("the path is indexed")
 }
 
 fn paths(idx: &ContentIndex, q: &str) -> Vec<String> {
@@ -96,7 +105,7 @@ fn english_is_lowercased_not_stemmed() {
     assert_eq!(paths(&idx, "report"), ["C:/docs/english.md"]);
     assert_eq!(paths(&idx, "REVENUE 2026"), ["C:/docs/english.md"]);
     let reports = idx.search("report", 10).unwrap();
-    let s = &reports[0].snippet;
+    let s = snippet(&idx, "report", &reports[0].path);
     let words: Vec<_> = s
         .highlights
         .iter()
@@ -166,7 +175,7 @@ fn snippet_highlights_point_at_the_diacritized_original() {
     let (_d, idx) = corpus();
     let hits = idx.search("مكتبة تقرير", 10).unwrap();
     assert_eq!(hits.len(), 1);
-    let s = &hits[0].snippet;
+    let s = snippet(&idx, "مكتبة تقرير", &hits[0].path);
     let words: Vec<_> = s.original_ranges().map(|r| &LIBRARIES[r]).collect();
     assert_eq!(words, ["الْمَكْتَبَاتُ", "تَقَارِيرَهَا"]);
     assert_eq!(
@@ -181,9 +190,99 @@ fn snippet_of_a_long_document_is_short_and_centered() {
     let text = format!("{filler}وهنا الْكَلِمَةُ الْمَطْلُوبَةُ أخيرا. {filler}");
     let (_d, idx) = index_with(&[("long", &text)]);
     let hit = &idx.search("المطلوبة", 1).unwrap()[0];
-    assert!(hit.snippet.fragment.len() <= IndexOptions::default().snippet_bytes);
-    let r = hit.snippet.original_ranges().next().unwrap();
+    let s = snippet(&idx, "المطلوبة", &hit.path);
+    assert!(s.fragment.len() <= IndexOptions::default().snippet_bytes);
+    let r = s.original_ranges().next().unwrap();
     assert_eq!(&text[r], "الْمَطْلُوبَةُ");
+}
+
+#[test]
+fn snippets_follow_the_order_of_the_paths_and_skip_unknown_ones() {
+    let (_d, idx) = corpus();
+    let got = idx
+        .snippets(
+            "تقرير",
+            &[
+                "C:/docs/hospital.pdf",
+                "C:/nope.txt",
+                "C:/docs/libraries.txt",
+            ],
+        )
+        .unwrap();
+    assert_eq!(got.len(), 3);
+    assert!(got[1].is_none());
+    let word = |s: &Option<Snippet>, text: &str| {
+        let s = s.as_ref().unwrap();
+        let r = s.original_ranges().next().unwrap();
+        text[r].to_owned()
+    };
+    assert_eq!(word(&got[0], HOSPITAL), "تقريرًا");
+    assert_eq!(word(&got[2], LIBRARIES), "تَقَارِيرَهَا");
+    // Paths compare by path key: another case / separator is the same document on Windows.
+    if cfg!(windows) {
+        let s = idx.snippets("عقد", &["c:\\DOCS\\contract.docx"]).unwrap();
+        assert!(s[0].as_ref().is_some_and(|s| !s.highlights.is_empty()));
+    }
+    assert!(idx.snippets("عقد", &[] as &[&str]).unwrap().is_empty());
+}
+
+#[test]
+fn snippets_of_many_hits_match_one_at_a_time() {
+    // Enough paths to use several threads; each result must be the snippet of its own path.
+    let docs: Vec<(String, String)> = (0..40)
+        .map(|i| {
+            (
+                format!("C:/many/{i:02}.txt"),
+                format!("رقم {i} ثم تقرير رقم {i}"),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = docs.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    let (_d, idx) = index_with(&refs);
+    let paths: Vec<&str> = docs.iter().map(|(p, _)| p.as_str()).collect();
+    let all = idx.snippets("تقرير", &paths).unwrap();
+    for ((path, text), s) in docs.iter().zip(&all) {
+        let s = s.as_ref().unwrap();
+        assert_eq!(*s, snippet(&idx, "تقرير", path));
+        assert_eq!(s.fragment, *text);
+        assert_eq!(
+            s.original_ranges().map(|r| &text[r]).collect::<Vec<_>>(),
+            ["تقرير"]
+        );
+    }
+}
+
+#[test]
+fn a_long_document_gets_the_same_snippet_as_a_full_scan() {
+    // The match sits far past the first scan window (64 KiB) of a long stored text.
+    let filler = "هذه جملة عادية لا تحتوي على الكلمة. ".repeat(5000);
+    assert!(filler.len() > 200 << 10);
+    let text = format!("{filler}وهنا الْكَلِمَةُ الْمَطْلُوبَةُ أخيرا. {filler}");
+    let (_d, idx) = index_with(&[("long", &text)]);
+    let hits = idx.search("المطلوبة", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    let s = snippet(&idx, "المطلوبة", &hits[0].path);
+    let words: Vec<_> = s.original_ranges().map(|r| &text[r]).collect();
+    assert_eq!(words, ["الْمَطْلُوبَةُ"]);
+    assert_eq!(&text[s.offset..s.offset + s.fragment.len()], s.fragment);
+}
+
+#[test]
+fn hits_carry_identity_from_the_fast_columns() {
+    let (_d, idx) = corpus();
+    let meta = FileMeta {
+        size: 1234,
+        mtime: -5,
+    };
+    let key = idx
+        .add_or_update("C:/docs/Extra Report.md", meta, "report extra")
+        .unwrap();
+    idx.commit().unwrap();
+    let hits = idx.search("extra", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, "C:/docs/Extra Report.md");
+    assert_eq!((hits[0].key, hits[0].meta), (key, meta));
+    assert!(hits[0].score > 0.0);
 }
 
 #[test]
@@ -198,8 +297,9 @@ fn match_past_the_stored_prefix_still_matches() {
     idx.add_or_update("p", META, &text).unwrap();
     idx.commit().unwrap();
     let hit = &idx.search("نهاية", 1).unwrap()[0];
-    assert!(hit.snippet.highlights.is_empty());
-    assert_eq!(hit.snippet.offset, 0);
+    let s = snippet(&idx, "نهاية", &hit.path);
+    assert!(s.highlights.is_empty());
+    assert_eq!(s.offset, 0);
 }
 
 #[test]
