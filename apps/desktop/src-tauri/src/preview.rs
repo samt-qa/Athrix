@@ -612,16 +612,28 @@ mod tests {
         ));
     }
 
-    /// Through the real worker, which tauri-build copies next to the test binary's parent
-    /// (`target/<profile>/`) from `src-tauri/binaries/` (staged by `npm run worker`).
+    /// Through the real worker staged by `npm run worker` in `src-tauri/binaries/`.
     #[test]
     fn pdf_is_a_document_through_the_worker() {
-        let program = athrix_extract::worker::default_program().unwrap();
-        assert!(
-            program.is_file(),
-            "{} is missing: run `npm run worker` in apps/desktop",
-            program.display()
-        );
+        // The staged worker, not the copy beside the test binary: `cargo test --workspace`
+        // also builds the worker crate (without `pdf`) into `target/<profile>/`, and newer
+        // cargo puts test binaries in another directory.
+        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+        let program = fs::read_dir(&staged)
+            .ok()
+            .and_then(|dir| {
+                dir.flatten().map(|e| e.path()).find(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("athrix-extract-worker-"))
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no worker in {}: run `npm run worker` in apps/desktop",
+                    staged.display()
+                )
+            });
         let mut config = athrix_extract::WorkerConfig::default();
         config.program = Some(program);
         let pool = WorkerPool::new(config);
