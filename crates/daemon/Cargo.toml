@@ -1,6 +1,6 @@
 [package]
 name = "athrix-daemon"
-description = "Background service that keeps the index in memory."
+description = "Background services: the content-indexing scheduler that keeps the full-text index current."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,24 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-athrix-core.workspace = true
 athrix-fs-index.workspace = true
+athrix-extract.workspace = true
+athrix-content-index.workspace = true
+tracing.workspace = true
+sysinfo = { workspace = true, features = ["system"] }
+starship-battery = { workspace = true, optional = true }
+thread-priority.workspace = true
+
+[features]
+default = ["battery"]
+# Battery / AC detection for auto-pause (starship-battery). Without it the default probe
+# reports "on AC" and only CPU load pauses indexing.
+battery = ["dep:starship-battery"]
+
+[dev-dependencies]
+tempfile.workspace = true
+encoding_rs.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

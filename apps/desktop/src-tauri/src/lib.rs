@@ -5,6 +5,7 @@
 //! - [`indexing`]: background indexing, live updates from the file watcher and the shared index;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
+//! - [`preview`]: previews for the preview pane and the scheme serving previewed images;
 //! - [`suggest`]: the "did you mean…" rewrite offered when a search finds nothing;
 //! - [`roots`]: which drives / folders are indexed, persisted for the next start;
 //! - [`volumes`]: the drives of this computer;
@@ -18,6 +19,7 @@ pub mod commands;
 pub mod indexing;
 pub mod model;
 pub mod popup;
+pub mod preview;
 pub mod query;
 pub mod results;
 pub mod roots;
@@ -28,6 +30,8 @@ pub mod tray;
 pub mod volumes;
 
 use serde::Serialize;
+use tauri::Manager;
+use tauri::http::{Request, Response, header};
 
 /// Name and version, shown in the UI.
 #[derive(Serialize)]
@@ -48,6 +52,33 @@ fn app_info() -> AppInfo {
 #[tauri::command]
 fn normalize_preview(text: &str) -> String {
     athrix_text_ar::normalize_name(text)
+}
+
+/// Answers a request of the [`preview::SCHEME`] scheme: a previewed image, by token, only to
+/// the main window and only for GET (see [`preview::PreviewAssets::serve`]).
+fn serve_preview_asset(
+    app: &tauri::AppHandle,
+    webview: &str,
+    request: &Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    let served =
+        if webview != preview::PREVIEW_WINDOW || request.method() != tauri::http::Method::GET {
+            preview::Served::forbidden()
+        } else {
+            app.state::<state::AppState>()
+                .preview_assets
+                .serve(request.uri().path())
+        };
+    let mut response = Response::builder()
+        .status(served.status)
+        .header(header::CONTENT_TYPE, served.mime);
+    for (name, value) in preview::SECURITY_HEADERS {
+        response = response.header(name, value);
+    }
+    response.body(served.body).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "cannot build a preview response");
+        Response::default()
+    })
 }
 
 /// Builds and runs the Tauri app. Indexing of the chosen drives (by default every fixed drive)
@@ -78,6 +109,14 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(popup::on_window_event)
+        .register_asynchronous_uri_scheme_protocol(preview::SCHEME, |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let webview = ctx.webview_label().to_owned();
+            // File reads stay off the webview's thread.
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(serve_preview_asset(&app, &webview, &request));
+            }));
+        })
         .invoke_handler(tauri::generate_handler![
             app_info,
             normalize_preview,
@@ -90,6 +129,7 @@ pub fn run() {
             commands::open_entry,
             commands::reveal_entry,
             commands::entry_path,
+            commands::preview_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Athrix app");

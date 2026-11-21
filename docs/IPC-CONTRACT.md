@@ -67,6 +67,25 @@ interface SearchSuggestion {
   kind: "layout" | "fuzzy"; // layout: الكلمات أُعيدت كتابتها بلوحة المفاتيح الأخرى؛ fuzzy: أُضيف `fuzzy: ` في أوله
   count: number;            // عدد نتائجه (1..limit، مقصوص عند limit)
 }
+
+interface PreviewResponse {   // preview_entry
+  requestId: number;        // يُعاد كما أُرسل؛ الواجهة تتجاهل أي استجابة أقدم من آخر طلب
+  cancelled: boolean;       // true إن ألغاه طلب معاينة أحدث (preview = null)
+  preview: Preview | null;
+}
+
+interface Preview {
+  entry: { name: string; path: string; isDir: boolean; size: number | null; modified: number | null; ext: string };
+  body: PreviewBody;
+}
+
+type PreviewBody =          // موسوم بالحقل kind
+  | { kind: "text"; text: string; truncated: boolean; encoding: string | null }   // نص عادي (md، txt، csv، سجلات…)
+  | { kind: "code"; text: string; truncated: boolean; encoding: string | null; language: string } // تلميح لغة للتلوين: "rust"، "python"، "json"…
+  | { kind: "document"; text: string; truncated: boolean; format: string; title: string | null; author: string | null } // docx/xlsx/pptx/odt/ods/odp/epub/html/eml
+  | { kind: "image"; src: string; mime: string } // عنوان athrix-preview لهذه المعاينة فقط (لا بايتات عبر IPC، ولا مسار)
+  | { kind: "folder"; childCount: number; children: { name: string; isDir: boolean }[] } // أول 200 ابن: المجلدات أولًا ثم بالاسم
+  | { kind: "unsupported"; reason: "pdf" | "format" | "tooLarge" | "encrypted" | "corrupt" | "missing" | "unreadable"; message: string };
 ```
 
 ## الأوامر (`invoke`)
@@ -82,6 +101,7 @@ interface SearchSuggestion {
 | `open_entry` | `{ id: number }` | `void` | يفتح الملف بالبرنامج الافتراضي |
 | `reveal_entry` | `{ id: number }` | `void` | يفتح المجلد ويحدّد العنصر |
 | `entry_path` | `{ id: number }` | `string` | المسار الكامل (للنسخ بـ `navigator.clipboard`) |
+| `preview_entry` | `{ id: number, requestId: number, maxChars?: number }` | `PreviewResponse` | معاينة للوحة المعاينة (انظر "المعاينة" أدناه). كل طلب يلغي السابق. معرّف قديم ⇠ رفض بـ `"this result is out of date; search again"` |
 | `app_info` | — | `{ name, version }` | موجود |
 
 الأخطاء غير المتوقعة في الأوامر تُرفض كـ string (رسالة إنجليزية).
@@ -109,6 +129,27 @@ interface SearchSuggestion {
 ## نسخة واحدة من التطبيق
 - تشغيل التطبيق مرة ثانية لا يفتح نسخة ثانية (لا أيقونة صينية ثانية ولا فشل في تسجيل الاختصار): النسخة الثانية تخرج فورًا
   وتُظهر النسخة الأولى نافذتها الرئيسية وتركّز عليها (`tauri-plugin-single-instance`).
+
+## المعاينة (`preview_entry`، المهمتان 4.8 و 4.9)
+- **النص والكود**: أول `maxChars` حرفًا (الافتراضي 65536، الحد الأعلى 1048576) عبر `athrix_extract::extract`، مع كشف
+  الترميز (UTF-8/16، و windows-1256 و ISO-8859-6 للعربية). لا يُقرأ من الملف النصي إلا ما يكفي لهذا العدد مهما كان حجمه.
+  `code` حين يُعرف للامتداد (أو لاسم مثل `Makefile`) تلميح لغة، وإلا `text`. الأسطر مفصولة بـ `\n`.
+- **المستندات**: نص `athrix_extract` مع العنوان والمؤلف إن وُجدا؛ مستند أكبر من 32MB ⇠ `unsupported/tooLarge`.
+  حدود الضغط (zip-bomb) من `Limits` مشدّدة للمعاينة.
+- **PDF**: `unsupported/pdf` حاليًا؛ نقطة الربط `TODO(pdf-worker)` في `src-tauri/src/preview.rs` تنتظر عامل PDF المعزول.
+- **الصور** (png، jpg/jpeg/jfif، gif، webp، bmp، ico، avif، svg): لا تمر بايتاتها عبر IPC. تسجّل الخلفية الملف تحت رمز
+  عشوائي (128 بت) وتعيد `src` بمخطط URI خاص `athrix-preview` (`http://athrix-preview.localhost/<token>` على ويندوز،
+  `athrix-preview://localhost/<token>` غيره). المعالج يخدم **فقط** آخر 8 صور عوينت، بالرمز (لا مسار في العنوان، والواجهة لا
+  ترسل مسارًا أبدًا)، **للنافذة الرئيسية فقط** و GET فقط (غير ذلك ⇠ 403؛ رمز مجهول ⇠ 404)، بنوع MIME ثابت من قائمة
+  بيضاء، مع `X-Content-Type-Options: nosniff` و `Cache-Control: no-store` و CSP مقفل (`default-src 'none'; sandbox`)،
+  وحد 64MB. SVG يُعرض في `<img>` فقط (لا سكربتات). CSP التطبيق: `img-src` يشمل `athrix-preview:` و `http://athrix-preview.localhost`.
+  أبعاد الصورة تقرؤها الواجهة من `naturalWidth/Height`.
+- **المجلدات**: عدد الأبناء المباشرين من الفهرس (مسح للعرض كله مع فحص الإلغاء كل 64K عنصر) وأول 200 منهم.
+- **التنفيذ**: على مجمّع المهام الحاجبة، معاينة واحدة في كل مرة (قفل)، والطلب الأحدث يلغي الأقدم: الملغى قبل بدئه لا يبدأ،
+  ونتيجة الملغى بعد انتهائه تُهمل (`cancelled: true`). الاستخراج نفسه لا يُقطع لكنه محدود بـ `Limits`.
+- **الإبراز داخل المعاينة (4.9)** يجري في الواجهة: كلمات الاستعلام العادية والعبارات وقيم `content:` (دون المنفية والمرشّحات)
+  تُطبَّع (حالة الأحرف، التشكيل، التطويل، الهمزات، ى، الأرقام الهندية) وتُطابق في نص المعاينة مع خريطة إزاحات تعيد المدى
+  إلى النص الأصلي بوحدات UTF-16. لا حاجة لأمر إضافي لكل ضغطة مفتاح.
 
 ## الأحداث (`listen`)
 

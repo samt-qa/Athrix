@@ -53,6 +53,12 @@
   --type-folder: #A08B6C; /* beige-400 darkened: #C9B79C is too faint as a glyph on light rows */
   --type-other: var(--gray-500);
 
+  /* Code coloring in the preview (lib/syntax.ts): semantic tokens, so dark mode follows. */
+  --code-keyword: var(--accent);
+  --code-string: var(--success);
+  --code-number: var(--info);
+  --code-comment: var(--text-muted);
+
   /* Type (bundled in styles/fonts.css). Latin first: IBM Plex Sans Arabic has no Latin glyphs
      in its arabic subset, so the browser falls through to it only for Arabic text. */
   --font-ui: "IBM Plex Sans", "IBM Plex Sans Arabic", "Segoe UI", system-ui, sans-serif;

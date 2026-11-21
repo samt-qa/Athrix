@@ -3,17 +3,21 @@
 //! Errors the UI does not expect are returned as English strings (the promise rejects).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
+use athrix_fs_index::EntryId;
+
 use crate::indexing::{IndexView, Indexer, SnapshotStore, StatusListener};
 use crate::model::{
-    IndexState, IndexStatus, QueryError, ResultItem, SearchResponse, SearchSuggestion,
+    IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem, SearchResponse,
+    SearchSuggestion,
 };
+use crate::preview::{DEFAULT_MAX_CHARS, build_preview};
 use crate::query::compile_query;
 use crate::results::{SearchFailure, SearchScope, decode_id, run_search};
 use crate::roots::{
@@ -322,14 +326,53 @@ pub fn entry_path(state: State<'_, AppState>, id: u64) -> Result<String, String>
 /// [`crate::indexing::RECENT_VIEWS`]). An id whose view is gone is rejected with
 /// [`STALE_ID_ERROR`], never resolved against another view.
 fn resolve(indexer: &Indexer, id: u64) -> Result<PathBuf, String> {
+    resolve_entry(indexer, id).map(|(view, entry)| view.path(entry))
+}
+
+/// [`resolve`], keeping the view and the entry (for previews, which read metadata too).
+fn resolve_entry(indexer: &Indexer, id: u64) -> Result<(Arc<IndexView>, EntryId), String> {
     if indexer.index().is_none() {
         return Err("the index is not ready yet".to_owned());
     }
     let (generation, entry) = decode_id(id).ok_or_else(|| format!("invalid result id {id}"))?;
     match indexer.view(generation) {
-        Some(view) if view.has_entry(entry) => Ok(view.path(entry)),
+        Some(view) if view.has_entry(entry) => Ok((view, entry)),
         _ => Err(STALE_ID_ERROR.to_owned()),
     }
+}
+
+/// A preview of the entry for the preview pane (see [`crate::preview`]): text or code (the
+/// first `max_chars` characters, default [`DEFAULT_MAX_CHARS`]), document text, an image URL,
+/// a folder listing, or why there is none. Ids resolve like `open_entry` (stale ids reject with
+/// [`STALE_ID_ERROR`]). Each call cancels the previous one; previews run one at a time on the
+/// blocking pool, and a cancelled one answers `cancelled: true`.
+#[tauri::command]
+pub async fn preview_entry(
+    state: State<'_, AppState>,
+    id: u64,
+    request_id: u64,
+    max_chars: Option<u32>,
+) -> Result<PreviewResponse, String> {
+    let cancel = state.begin_preview();
+    let (view, entry) = resolve_entry(&state.indexer, id)?;
+    let gate = Arc::clone(&state.preview_gate);
+    let assets = Arc::clone(&state.preview_assets);
+    let max_chars = max_chars.map_or(DEFAULT_MAX_CHARS, |m| m as usize);
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        let _turn = gate.lock().unwrap_or_else(PoisonError::into_inner);
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let preview = build_preview(&view, entry, max_chars, &cancel, &assets).ok()?;
+        (!cancel.load(Ordering::Relaxed)).then_some(preview)
+    })
+    .await
+    .map_err(|e| format!("preview task failed: {e}"))?;
+    Ok(PreviewResponse {
+        request_id,
+        cancelled: preview.is_none(),
+        preview,
+    })
 }
 
 #[cfg(test)]

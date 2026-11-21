@@ -1,6 +1,6 @@
 [package]
 name = "athrix-ranking"
-description = "Result fusion (RRF) and frecency ranking."
+description = "Result fusion (RRF), frecency ranking and name+content query execution."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,11 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-athrix-core.workspace = true
+athrix-query.workspace = true
+athrix-text-ar.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = "1.7"

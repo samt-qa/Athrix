@@ -8,10 +8,11 @@
 // `?mockStale` (the first open / reveal / copy acts as if a re-index ran after the search:
 // it rejects with the stale-id error and the ids change, like the Rust side).
 import type {
-  CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, QueryError, Range16, ResultItem, SearchResponse,
-  SearchSuggestion, Volume,
+  CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, PreviewBody, PreviewResponse, QueryError, Range16,
+  ResultItem, SearchResponse, SearchSuggestion, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
+import { normalizeWithMap, toOriginalRange as toOriginal } from "./textMatch";
 
 const params = new URLSearchParams(window.location.search);
 const ENTRY_COUNT = clampInt(Number(params.get("mockEntries") ?? 4000), 10, 200_000);
@@ -159,41 +160,12 @@ function buildIndex(count: number): MockEntry[] {
 }
 
 // ---------- normalization (approximation of nass: case, harakat, tatweel, hamza, ya, digits) ----------
-
-const HAMZA: Record<string, string> = { "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي" };
-
-function normalizeWithMap(s: string): { norm: string; map: number[] } {
-  let norm = "";
-  const map: number[] = [];
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    const code = c.charCodeAt(0);
-    // Harakat, superscript alef, Quranic marks and tatweel vanish.
-    if ((code >= 0x064b && code <= 0x065f) || code === 0x0670 || code === 0x0640) continue;
-    let n = HAMZA[c] ?? c;
-    if (code >= 0x0660 && code <= 0x0669) n = String(code - 0x0660);
-    else if (code >= 0x06f0 && code <= 0x06f9) n = String(code - 0x06f0);
-    n = n.toLowerCase();
-    for (let k = 0; k < n.length; k++) {
-      norm += n[k];
-      map.push(i);
-    }
-  }
-  return { norm, map };
-}
+// Shared with the preview's match highlighting (lib/textMatch.ts).
 
 /** Maps a [start, end) range of the normalized name back to UTF-16 units of the original,
  *  stretching the end over trailing diacritics so marks stay with their letter. */
 function toOriginalRange(e: MockEntry, start: number, end: number): Range16 {
-  const name = e.item.name;
-  const from = e.map[start];
-  let to = e.map[end - 1] + 1;
-  while (to < name.length) {
-    const code = name.charCodeAt(to);
-    if ((code >= 0x064b && code <= 0x065f) || code === 0x0670 || code === 0x0640) to++;
-    else break;
-  }
-  return [from, to];
+  return toOriginal(e.item.name, e.map, start, end);
 }
 
 // ---------- a tiny subset of the query language ----------
@@ -570,6 +542,160 @@ function findEntry(id: number) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- previews ----------
+
+const CODE_LANGUAGES: Record<string, string> = {
+  rs: "rust", ts: "typescript", tsx: "typescript", js: "javascript", py: "python", go: "go", json: "json",
+};
+const DOCUMENTS = new Set(["docx", "xlsx", "pptx", "odt", "epub", "html"]);
+const IMAGES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", svg: "image/svg+xml",
+};
+let latestPreview = 0;
+
+const SAMPLE_CODE: Record<string, (stem: string) => string[]> = {
+  rust: (stem) => [
+    `//! ${stem}: وحدة تجريبية (demo module)`,
+    "use std::collections::HashMap;",
+    "",
+    "/// يحسب عدد الكلمات في التقرير.",
+    "pub fn count_words(text: &str) -> HashMap<String, usize> {",
+    "    let mut counts = HashMap::new();",
+    "    for word in text.split_whitespace() {",
+    "        *counts.entry(word.to_lowercase()).or_insert(0) += 1;",
+    "    }",
+    "    counts",
+    "}",
+    "",
+    "fn main() {",
+    '    let report = "التقرير السنوي 2026";',
+    "    let n = count_words(report).len();",
+    '    println!("{} words, ratio {}", n, 0.75);',
+    "    /* block",
+    "       comment */",
+    "}",
+  ],
+  typescript: (stem) => [
+    `// ${stem} — مثال`,
+    'import { createSignal } from "solid-js";',
+    "",
+    "export interface Report {",
+    "  title: string;",
+    "  pages: number;",
+    "}",
+    "",
+    "/** التقرير الافتراضي */",
+    'const fallback: Report = { title: "تقرير المبيعات", pages: 12 };',
+    "",
+    "export function useReport(initial = fallback) {",
+    "  const [report, setReport] = createSignal(initial);",
+    "  return { report, rename: (title: string) => setReport({ ...report(), title }) };",
+    "}",
+  ],
+  javascript: (stem) => [
+    `// ${stem}`,
+    "const items = [1, 2, 3];",
+    "for (const x of items) {",
+    "  if (x > 1) console.log(`item ${x}`);",
+    "}",
+  ],
+  python: (stem) => [
+    `# ${stem}: ملخص التقرير`,
+    "import json",
+    "",
+    "def summarize(path: str) -> dict:",
+    '    """Return word counts for the report."""',
+    '    with open(path, encoding="utf-8") as f:',
+    "        words = f.read().split()",
+    '    return {"words": len(words), "ratio": 0.5}',
+    "",
+    'if __name__ == "__main__":',
+    '    print(summarize("التقرير.txt"))',
+  ],
+  go: (stem) => [
+    `// ${stem}`,
+    "package main",
+    "",
+    'import "fmt"',
+    "",
+    "func main() {",
+    "\tfor i := 0; i < 3; i++ {",
+    '\t\tfmt.Println("التقرير", i)',
+    "\t}",
+    "}",
+  ],
+  json: () => [
+    "{",
+    '  "title": "تقرير المبيعات",',
+    '  "year": 2026,',
+    '  "final": true,',
+    '  "tags": ["مبيعات", "report"]',
+    "}",
+  ],
+};
+
+function sampleText(stem: string, lines: number): string {
+  const out = [
+    `# ${stem}`,
+    "",
+    "هذا ملف تجريبي يعرض لوحة المعاينة. يحتوي على نص عربي مُشَكَّل مثل: التَّقْرِيرُ السَّنَوِيُّ لِلْمَبِيعَاتِ.",
+    "This line is English: the quarterly report is attached below.",
+    "سطر مختلط: Report رقم ١٢٣ للعام 2026 — أُعِدَّ التقرير في الرياض.",
+    "",
+  ];
+  for (let i = 1; out.length < lines; i++) {
+    out.push(i % 3 === 0
+      ? `Line ${i}: notes about ${stem} and the report totals.`
+      : `السطر ${i}: ملاحظات حول ${stem} وأرقام التقرير والمحاضرة.`);
+  }
+  return out.join("\n") + "\n";
+}
+
+/** A 1600×1000 SVG stand-in for an image (the real app serves the file via athrix-preview). */
+function placeholderImage(name: string): string {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">' +
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#93293A"/>' +
+    '<stop offset="1" stop-color="#E0D2BE"/></linearGradient></defs><rect width="1600" height="1000" fill="url(#g)"/>' +
+    '<circle cx="1180" cy="330" r="150" fill="#F5EFE6" opacity=".7"/>' +
+    '<path d="M0 1000 520 470l330 300 250-200 500 430Z" fill="#4A0F1A" opacity=".55"/>' +
+    `<text x="80" y="140" font-family="sans-serif" font-size="64" fill="#FBF8F3">${name.replace(/[<&>]/g, "")}</text></svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function previewBody(it: Omit<ResultItem, "highlights">, maxChars: number): PreviewBody {
+  const path = `${it.parent}\\${it.name}`;
+  if (it.isDir) {
+    const children = (index ?? []).filter((e) => e.item.parent === path).map((e) => e.item);
+    children.sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name));
+    return {
+      kind: "folder", childCount: children.length,
+      children: children.slice(0, 200).map((c) => ({ name: c.name, isDir: c.isDir })),
+    };
+  }
+  const stem = it.ext ? it.name.slice(0, -(it.ext.length + 1)) : it.name;
+  const cut = (text: string) => ({ text: text.slice(0, maxChars), truncated: text.length > maxChars });
+  if (IMAGES[it.ext]) return { kind: "image", src: placeholderImage(it.name), mime: IMAGES[it.ext] };
+  if (it.ext === "pdf") return { kind: "unsupported", reason: "pdf", message: "PDF preview is not available yet" };
+  const language = CODE_LANGUAGES[it.ext];
+  if (language) {
+    return { kind: "code", ...cut(SAMPLE_CODE[language](stem).join("\n") + "\n"), encoding: "UTF-8", language };
+  }
+  if (DOCUMENTS.has(it.ext)) {
+    const body = [
+      stem,
+      "مقدمة: يتناول هذا المستند نتائج التَّقْرِير الربعي ويعرض الأرقام الرئيسة.",
+      "The document summarizes the quarterly report and its main figures.",
+      ...Array.from({ length: 40 }, (_, i) => `الفقرة ${i + 1}: تفاصيل إضافية حول ${stem} — paragraph ${i + 1}.`),
+    ].join("\n");
+    return { kind: "document", ...cut(body), format: it.ext, title: stem, author: "سارة أحمد" };
+  }
+  if (["md", "txt", "csv"].includes(it.ext)) {
+    const big = it.ext === "txt";
+    return { kind: "text", ...cut(sampleText(stem, big ? 400 : 60)), encoding: big ? "windows-1256" : "UTF-8" };
+  }
+  return { kind: "unsupported", reason: "format", message: `no preview for .${it.ext || "?"} files` };
+}
+
 /** Dispatches one command. Rejections carry an English string, like Tauri commands. */
 export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs<C> | undefined): Promise<CommandResult<C>> {
   const args = (rawArgs ?? {}) as Record<string, unknown>;
@@ -630,6 +756,25 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
     case "reveal_entry":
       console.info("[mock] reveal_entry", findEntry(args.id as number));
       break;
+    case "preview_entry": {
+      const requestId = args.requestId as number;
+      latestPreview = Math.max(latestPreview, requestId);
+      const it = findEntry(args.id as number);
+      await sleep(20 + (it.id % 7) * 15);
+      if (requestId < latestPreview) {
+        result = { requestId, cancelled: true, preview: null } satisfies PreviewResponse;
+        break;
+      }
+      const { name, isDir, size, modified, ext } = it;
+      result = {
+        requestId, cancelled: false,
+        preview: {
+          entry: { name, path: `${it.parent}\\${name}`, isDir, size, modified, ext },
+          body: previewBody(it, (args.maxChars as number | undefined) ?? 65536),
+        },
+      } satisfies PreviewResponse;
+      break;
+    }
     case "entry_path": {
       const it = findEntry(args.id as number);
       result = `${it.parent}\\${it.name}`;

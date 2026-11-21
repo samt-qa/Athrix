@@ -15,7 +15,8 @@
 //! - ODT, ODS, ODP (OpenDocument);
 //! - EPUB 2/3, in reading (spine) order;
 //! - EML (RFC 5322 / MIME mail);
-//! - PDF, only with the `pdf` cargo feature (pure Rust, off by default).
+//! - PDF, only with the `pdf` cargo feature (pure Rust, off by default),
+//!   and safely only out of process: see below.
 //!
 //! # Safety model
 //!
@@ -26,6 +27,12 @@
 //! [`ExtractError`], never a panic. As a second line of defence, each parser
 //! runs under [`std::panic::catch_unwind`], and a panic that escapes a parser
 //! (a bug) is reported as [`ExtractError::Corrupt`].
+//!
+//! That guard cannot catch a stack overflow, memory exhaustion or a parser
+//! that never returns. [`WorkerPool`] runs extraction in the
+//! `athrix-extract-worker` process instead, with a per-file timeout, a
+//! heap cap and automatic restarts; [`WorkerPool::extract_isolated`] sends
+//! PDFs there and keeps the other formats in-process. See [`worker`].
 //!
 //! # Output
 //!
@@ -46,6 +53,7 @@ mod ooxml;
 mod pdf;
 mod sink;
 mod text;
+pub mod worker;
 mod xml;
 
 #[cfg(test)]
@@ -58,6 +66,7 @@ use std::path::Path;
 
 pub use error::ExtractError;
 pub use text::{TEXT_EXTENSIONS, TEXT_FILE_NAMES};
+pub use worker::{WorkerConfig, WorkerPool, WorkerStats};
 
 use sink::Sink;
 

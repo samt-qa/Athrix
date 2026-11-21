@@ -9,6 +9,8 @@ mod formats;
 mod fuzz;
 #[cfg(feature = "pdf")]
 mod pdf;
+#[cfg(feature = "pdf")]
+mod pdf_fixtures;
 mod perf;
 
 /// Property-test case count: `PROPTEST_CASES` when set, else `default`.

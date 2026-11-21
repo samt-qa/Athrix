@@ -133,6 +133,140 @@ pub struct SearchSuggestion {
     pub count: usize,
 }
 
+/// Response of the `preview_entry` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewResponse {
+    /// Echo of the request's `requestId`.
+    pub request_id: u64,
+    /// Set when a newer preview request cancelled this one (`preview` is then `None`).
+    pub cancelled: bool,
+    /// The preview; `None` only when cancelled.
+    pub preview: Option<Preview>,
+}
+
+/// A preview of one entry: its header and a body that depends on what the entry is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preview {
+    /// Name, path and metadata for the pane's header.
+    pub entry: PreviewEntry,
+    /// What to show.
+    pub body: PreviewBody,
+}
+
+/// Header of a preview (from the index; the path is built on the Rust side).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewEntry {
+    /// Original name as on disk.
+    pub name: String,
+    /// Full path.
+    pub path: String,
+    /// The entry is a folder.
+    pub is_dir: bool,
+    /// Size in bytes; `None` for folders.
+    pub size: Option<u64>,
+    /// Last modification, Unix seconds.
+    pub modified: Option<i64>,
+    /// Lowercase extension without the dot, `""` if none.
+    pub ext: String,
+}
+
+/// The body of a [`Preview`], tagged by `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PreviewBody {
+    /// Plain text (prose, Markdown, logs, CSV...).
+    Text {
+        /// The first `maxChars` characters, line endings normalized to `\n`.
+        text: String,
+        /// More text exists than was returned.
+        truncated: bool,
+        /// Detected encoding (WHATWG name, such as `"UTF-8"` or `"windows-1256"`).
+        encoding: Option<String>,
+    },
+    /// Source code or structured config, with a language hint for coloring.
+    Code {
+        /// As for [`PreviewBody::Text`].
+        text: String,
+        /// As for [`PreviewBody::Text`].
+        truncated: bool,
+        /// As for [`PreviewBody::Text`].
+        encoding: Option<String>,
+        /// Language hint from the extension (`"rust"`, `"python"`, `"json"`...).
+        language: String,
+    },
+    /// Text extracted from a document (DOCX, XLSX, PPTX, ODF, EPUB, HTML, EML).
+    Document {
+        /// Paragraphs separated by `\n`.
+        text: String,
+        /// More text exists than was returned.
+        truncated: bool,
+        /// Format name (`"docx"`, `"epub"`, `"html"`...).
+        format: String,
+        /// Document title, if stored.
+        title: Option<String>,
+        /// Author, if stored.
+        author: Option<String>,
+    },
+    /// An image, served by the `athrix-preview` URI scheme (never as bytes over IPC).
+    Image {
+        /// URL for `<img src>`, valid for this preview only.
+        src: String,
+        /// MIME type it is served as.
+        mime: String,
+    },
+    /// A folder: its children from the index.
+    Folder {
+        /// Number of children (files and folders, not recursive).
+        child_count: usize,
+        /// The first children, folders first, then by name.
+        children: Vec<PreviewChild>,
+    },
+    /// Nothing to show inside the app; the UI offers "Open".
+    Unsupported {
+        /// Why: `pdf`, `format`, `tooLarge`, `encrypted`, `corrupt`, `missing`, `unreadable`.
+        reason: UnsupportedReason,
+        /// English detail.
+        message: String,
+    },
+}
+
+/// One child of a folder preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewChild {
+    /// Name as on disk.
+    pub name: String,
+    /// The child is a folder.
+    pub is_dir: bool,
+}
+
+/// Why a file has no in-app preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnsupportedReason {
+    /// PDF: waits for the isolated PDF worker.
+    Pdf,
+    /// Unknown or binary format.
+    Format,
+    /// Over the preview size limits.
+    TooLarge,
+    /// Password-protected or DRM-encrypted.
+    Encrypted,
+    /// Malformed document.
+    Corrupt,
+    /// The file is gone from the disk.
+    Missing,
+    /// Reading failed (permissions, locked file...).
+    Unreadable,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

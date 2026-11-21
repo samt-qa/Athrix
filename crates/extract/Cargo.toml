@@ -18,11 +18,19 @@ chardetng.workspace = true
 pdf-extract = { workspace = true, optional = true }
 unicode-normalization = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
+# Counting global allocator for the worker binary's heap cap (pure Rust).
+cap.workspace = true
 
 [features]
 # Pure-Rust PDF text extraction (pdf-extract + lopdf). Off by default: see
 # the `pdf` module docs for why.
 pdf = ["dep:pdf-extract", "dep:unicode-normalization", "dep:flate2"]
+
+# The out-of-process extraction worker (see `worker` module docs). Always
+# built; it extracts PDFs only when built with `--features pdf`.
+[[bin]]
+name = "athrix-extract-worker"
+path = "src/bin/athrix-extract-worker.rs"
 
 [dev-dependencies]
 proptest = "1.11.0"

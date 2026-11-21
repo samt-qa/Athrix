@@ -64,6 +64,12 @@
 //!   and is fuzzed with `proptest`. A typical query parses in a few microseconds.
 //! - Zero runtime dependencies and fast compile times.
 //!
+//! # Planning
+//!
+//! [`plan()`] splits a parsed query between the name index and the content index
+//! (`content:` / `محتوى:`), and defines which cross-source combinations are supported; see
+//! the [`plan`](mod@plan) module.
+//!
 //! # Purity
 //!
 //! The parser does not read the clock or the file system. Relative dates stay as
@@ -73,6 +79,7 @@ pub mod ast;
 pub mod error;
 mod lexicon;
 mod parser;
+pub mod plan;
 mod values;
 
 pub use ast::{
@@ -81,6 +88,9 @@ pub use ast::{
 };
 pub use error::{ParseError, ParseErrorKind};
 pub use parser::{MAX_DEPTH, parse};
+pub use plan::{
+    ContentClause, ContentQuery, PlanError, PlanErrorKind, PlanOptions, SearchPlan, plan,
+};
 
 impl std::str::FromStr for Query {
     type Err = ParseError;

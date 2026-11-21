@@ -90,6 +90,40 @@ export interface IndexRoots {
   roots: string[];
 }
 
+/** Header of a preview: name, full path and metadata of the entry. */
+export interface PreviewEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number | null;
+  modified: number | null;
+  ext: string;
+}
+
+export type UnsupportedReason = "pdf" | "format" | "tooLarge" | "encrypted" | "corrupt" | "missing" | "unreadable";
+
+/** What the preview pane shows, by `kind`. Text is cut at `maxChars` (`truncated`). */
+export type PreviewBody =
+  | { kind: "text"; text: string; truncated: boolean; encoding: string | null }
+  | { kind: "code"; text: string; truncated: boolean; encoding: string | null; language: string }
+  | { kind: "document"; text: string; truncated: boolean; format: string; title: string | null; author: string | null }
+  /** `src`: an `athrix-preview` URL valid for this preview only (never a file path). */
+  | { kind: "image"; src: string; mime: string }
+  | { kind: "folder"; childCount: number; children: { name: string; isDir: boolean }[] }
+  | { kind: "unsupported"; reason: UnsupportedReason; message: string };
+
+export interface Preview {
+  entry: PreviewEntry;
+  body: PreviewBody;
+}
+
+export interface PreviewResponse {
+  requestId: number;
+  /** A newer preview request cancelled this one (`preview` is then null). */
+  cancelled: boolean;
+  preview: Preview | null;
+}
+
 export interface AppInfo {
   name: string;
   version: string;
@@ -109,6 +143,8 @@ export interface Commands {
   open_entry: [{ id: number }, void];
   reveal_entry: [{ id: number }, void];
   entry_path: [{ id: number }, string];
+  /** `maxChars`: text characters to return (default 65536). Each call cancels the previous one. */
+  preview_entry: [{ id: number; requestId: number; maxChars?: number }, PreviewResponse];
 }
 export type CommandName = keyof Commands;
 export type CommandArgs<C extends CommandName> = Commands[C][0];
@@ -152,10 +188,12 @@ export const api = {
   openEntry: (id: number) => call("open_entry", { id }),
   revealEntry: (id: number) => call("reveal_entry", { id }),
   entryPath: (id: number) => call("entry_path", { id }),
+  previewEntry: (id: number, requestId: number, maxChars?: number) =>
+    call("preview_entry", maxChars === undefined ? { id, requestId } : { id, requestId, maxChars }),
 };
 
 /**
- * What `open_entry` / `reveal_entry` / `entry_path` reject with when the id comes from an older
+ * What `open_entry` / `reveal_entry` / `entry_path` / `preview_entry` reject with when the id comes from an older
  * index generation (a re-index ran since the search). The UI should search again.
  */
 export const STALE_ID_ERROR = "this result is out of date; search again";

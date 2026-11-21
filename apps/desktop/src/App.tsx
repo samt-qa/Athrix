@@ -1,5 +1,5 @@
 import { batch, createEffect, createMemo, createResource, createSignal, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
-import { t } from "./i18n";
+import { locale, localeDir, t } from "./i18n";
 import {
   api, errorMessage, isStaleIdError, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
 } from "./lib/api";
@@ -14,6 +14,8 @@ import HintBar from "./components/HintBar";
 import StatusBar from "./components/StatusBar";
 import ScopeSelect from "./components/ScopeSelect";
 import IndexSettings from "./components/IndexSettings";
+import PreviewPane, { type PreviewHandle } from "./components/PreviewPane";
+import { readSetting, writeSetting } from "./lib/storage";
 import { effectiveScope, setScope, storedScope } from "./lib/scope";
 import { fitWindowTo, hideWindow, onWindowFocus, type WindowMode } from "./lib/window";
 
@@ -25,6 +27,14 @@ const LIMIT = (() => {
 
 const LIST_ID = "results";
 const ERROR_ID = "query-error";
+const PREVIEW_ID = "preview";
+
+/** Preview pane width: remembered, clamped to what the window leaves (design §9.2: 360–520). */
+const PREVIEW_MIN = 280;
+const PREVIEW_MAX = 900;
+const PREVIEW_DEFAULT = 440;
+/** Room the search panel keeps next to the pane. */
+const PANEL_MIN = 360;
 
 /**
  * The search UI. `mode` "main": the full window (top bar, panel, status bar). `mode` "quick": the
@@ -124,6 +134,25 @@ export default function App(props: { mode: WindowMode }) {
   const queryError = () => response()?.error ?? null;
   const current = () => items()[selected()];
 
+  // ---- preview pane (main window only, design §9.2): open state and width are remembered ----
+  const [previewOpen, setPreviewOpen] = createSignal(!quick && readSetting("previewOpen") === "1");
+  const storedWidth = Number(readSetting("previewWidth"));
+  const [previewWidth, setPreviewWidth] = createSignal(
+    Number.isFinite(storedWidth) && storedWidth >= PREVIEW_MIN ? Math.min(storedWidth, PREVIEW_MAX) : PREVIEW_DEFAULT,
+  );
+  let previewPane: PreviewHandle | undefined;
+  let mainEl: HTMLElement | undefined;
+  function setPreview(open: boolean) {
+    setPreviewOpen(open);
+    writeSetting("previewOpen", open ? "1" : "0");
+  }
+  function closePreview() {
+    setPreview(false);
+    input.focus();
+  }
+  /** The arrow key pointing at the pane: it sits at the inline end (right in LTR, left in RTL). */
+  const towardPane = () => (localeDir(locale()) === "rtl" ? "ArrowLeft" : "ArrowRight");
+
   // Relative times ("3 minutes ago") refresh every minute.
   const [now, setNow] = createSignal(Date.now());
   const clock = setInterval(() => setNow(Date.now()), 60_000);
@@ -218,6 +247,16 @@ export default function App(props: { mode: WindowMode }) {
       case "ArrowUp": move(selected() - 1); break;
       case "PageDown": move(selected() + page); break;
       case "PageUp": move(selected() - page); break;
+      case "ArrowLeft":
+      case "ArrowRight": {
+        // The arrow toward the pane toggles it, only with the caret at the end of the text
+        // (where the key would do nothing), so it never steals caret movement.
+        const el = e.currentTarget as HTMLInputElement;
+        if (quick || e.key !== towardPane() || e.shiftKey || ctrl || e.altKey) return;
+        if (el.selectionStart !== el.selectionEnd || el.selectionEnd !== el.value.length || !current()) return;
+        setPreview(!previewOpen());
+        break;
+      }
       case "Home":
       case "End":
         // Shift+Home/End keeps its text-selection meaning in the input.
@@ -269,6 +308,82 @@ export default function App(props: { mode: WindowMode }) {
     setText(q);
     input.focus();
     input.setSelectionRange(q.length, q.length);
+  }
+
+  // F3 / Shift+F3: next / previous match in the preview. Space on the pane (not in a field or
+  // on a button) closes it, like Quick Look. Main window only.
+  if (!quick) {
+    const onGlobalKey = (e: KeyboardEvent) => {
+      if (e.isComposing || !previewOpen()) return;
+      if (e.key === "F3") {
+        e.preventDefault(); // also keeps WebView2's find bar closed
+        if (e.shiftKey) previewPane?.prevMatch();
+        else previewPane?.nextMatch();
+        return;
+      }
+      const target = e.target as HTMLElement | null;
+      const typing = target?.closest("input, textarea, select, button, [contenteditable]");
+      if (e.code === "Space" && !e.ctrlKey && !e.altKey && !e.metaKey && !typing && target?.closest(`#${PREVIEW_ID}`)) {
+        e.preventDefault();
+        closePreview();
+      }
+    };
+    document.addEventListener("keydown", onGlobalKey);
+    onCleanup(() => document.removeEventListener("keydown", onGlobalKey));
+  }
+
+  // ---- splitter between the results and the pane ----
+  const maxPreviewWidth = () => {
+    const w = mainEl?.clientWidth ?? 1200;
+    return Math.max(PREVIEW_MIN, Math.min(PREVIEW_MAX, w - PANEL_MIN - 64));
+  };
+  const clampWidth = (w: number) => Math.round(Math.max(PREVIEW_MIN, Math.min(maxPreviewWidth(), w)));
+  function resizeTo(w: number, save = false) {
+    setPreviewWidth(clampWidth(w));
+    if (save) writeSetting("previewWidth", String(previewWidth()));
+  }
+  function onSplitterDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const handle = e.currentTarget as HTMLElement;
+    const pane = document.getElementById(PREVIEW_ID);
+    if (!pane) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const rtl = localeDir(locale()) === "rtl";
+    // The pane's outer edge stays put; its width follows the pointer.
+    const rect = pane.getBoundingClientRect();
+    const onMove = (ev: PointerEvent) => resizeTo(rtl ? ev.clientX - rect.left : rect.right - ev.clientX);
+    const onUp = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+      handle.removeEventListener("pointercancel", onUp);
+      resizeTo(previewWidth(), true);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
+  }
+  function onSplitterKey(e: KeyboardEvent) {
+    const grow = localeDir(locale()) === "rtl" ? "ArrowRight" : "ArrowLeft";
+    const stepPx = e.shiftKey ? 64 : 16;
+    let w: number;
+    switch (e.key) {
+      case "ArrowLeft":
+      case "ArrowRight":
+        w = previewWidth() + (e.key === grow ? stepPx : -stepPx);
+        break;
+      case "Home": w = PREVIEW_MIN; break;
+      case "End": w = maxPreviewWidth(); break;
+      default: return;
+    }
+    e.preventDefault();
+    resizeTo(w, true);
+  }
+  // Keep the remembered width inside the window when it shrinks.
+  if (!quick) {
+    const onResize = () => previewOpen() && setPreviewWidth((w) => clampWidth(w));
+    window.addEventListener("resize", onResize);
+    onCleanup(() => window.removeEventListener("resize", onResize));
   }
 
   const indexing = () => index()?.state === "indexing";
@@ -355,7 +470,7 @@ export default function App(props: { mode: WindowMode }) {
       <Show when={quick}>
         <p class="quick-notice" role="status">{notice()}</p>
       </Show>
-      <HintBar quick={quick} />
+      <HintBar quick={quick} previewKey={towardPane() === "ArrowLeft" ? "←" : "→"} />
     </section>
   );
 
@@ -389,11 +504,51 @@ export default function App(props: { mode: WindowMode }) {
             </bdi>
           )}
         </Show>
+        <button type="button" class="drives-btn" aria-pressed={previewOpen()}
+          aria-controls={previewOpen() ? PREVIEW_ID : undefined}
+          title={t(previewOpen() ? "preview.hide" : "preview.show")}
+          onMouseDown={(e) => e.preventDefault()} onClick={() => setPreview(!previewOpen())}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3.5" y="4.5" width="17" height="15" rx="2" /><path d="M14 4.5v15" />
+          </svg>
+          {t("hints.preview")}
+        </button>
         <IndexSettings onError={(message) => showNotice(t("drives.failed", { message }))} />
         <SettingsControls />
       </header>
 
-      <main class="main">{panel}</main>
+      <main ref={mainEl} class="main" classList={{ "with-preview": previewOpen() }}>
+        {panel}
+        <Show when={previewOpen()}>
+          <div
+            class="splitter"
+            role="separator"
+            tabIndex={0}
+            aria-orientation="vertical"
+            aria-controls={PREVIEW_ID}
+            aria-label={t("preview.resize")}
+            aria-valuemin={PREVIEW_MIN}
+            aria-valuemax={maxPreviewWidth()}
+            aria-valuenow={previewWidth()}
+            onPointerDown={onSplitterDown}
+            onKeyDown={onSplitterKey}
+            onDblClick={() => resizeTo(PREVIEW_DEFAULT, true)}
+          />
+          <div class="preview-slot" style={{ "inline-size": `${previewWidth()}px` }}>
+            <PreviewPane
+              id={PREVIEW_ID}
+              ref={(h) => (previewPane = h)}
+              item={current()}
+              query={text()}
+              onOpen={() => void open(selected())}
+              onReveal={() => void open(selected(), true)}
+              onClose={closePreview}
+              onStale={searchAgain}
+            />
+          </div>
+        </Show>
+      </main>
 
       <StatusBar index={index()} response={notReady() ? null : response()} notice={notice()} mock={usingMock} onRetry={retryIndexing} />
     </div>

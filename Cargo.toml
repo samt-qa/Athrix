@@ -52,6 +52,14 @@ chardetng = "1"
 pdf-extract = "=0.10.0"
 unicode-normalization = "0.1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# athrix-extract worker binary: counting global allocator for its heap cap (pure Rust, no deps).
+cap = "0.1.2"
+# athrix-daemon: CPU load for auto-pause (same 0.36 the desktop app already builds; 0.37+ needs newer Rust)
+sysinfo = { version = "0.36", default-features = false }
+# athrix-daemon: AC/battery state without `unsafe` in our code. 0.11+ needs Rust 1.89.
+starship-battery = "0.10.2"
+# athrix-daemon: lower worker-thread priority through a safe API (MSRV 1.85)
+thread-priority = "3.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

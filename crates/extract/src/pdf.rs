@@ -10,9 +10,16 @@
 //!   and would abort under `panic = "abort"`.
 //! - Deeply self-referencing content (forms drawing themselves) can recurse
 //!   without bound inside `pdf-extract`, which no guard can catch.
-//! - `lopdf` inflates object streams at load time with no size limit. This
-//!   module bounds every `FlateDecode` stream before text extraction, but
-//!   not the object streams `lopdf` expands while loading.
+//! - `lopdf` inflates object streams (`/Type /ObjStm`) at load time with no
+//!   size limit. This module hooks `lopdf`'s load filter to inflate each
+//!   object stream with a cap first (`load_bounded`) and bounds every other
+//!   `FlateDecode` stream before text extraction. Residual gap: `lopdf`
+//!   ignores the load filter for encrypted documents, whose object streams
+//!   are still expanded unbounded while loading and decrypting.
+//!
+//! The safe way to run this code on untrusted files is out of process, in
+//! the `athrix-extract-worker` binary through [`crate::WorkerPool`]: a
+//! panic, stack overflow or memory blow-up there kills only the worker.
 //!
 //! Arabic: PDF producers draw Arabic glyphs in visual order (left to
 //! right on the page) and often map them to presentation forms
@@ -21,9 +28,13 @@
 //! logical order glyph by glyph (so a lam-alef ligature keeps its inner
 //! order), and presentation forms are mapped to base letters with NFKC.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Read;
 
-use pdf_extract::{Document, MediaBox, Object, OutputDev, OutputError, Transform};
+use pdf_extract::{
+    Document, MediaBox, Object, ObjectId, OutputDev, OutputError, Reader, Stream, Transform,
+};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::sink::Sink;
@@ -38,8 +49,7 @@ pub(crate) fn extract(
     if crate::find(&bytes[..bytes.len().min(1024)], b"%PDF-").is_none() {
         return Err(ExtractError::Corrupt("pdf: no %PDF header".into()));
     }
-    let mut doc =
-        Document::load_mem(bytes).map_err(|e| ExtractError::Corrupt(format!("pdf: {e}")))?;
+    let mut doc = load_bounded(bytes, limits)?;
     if doc.is_encrypted() && doc.decrypt("").is_err() {
         return Err(ExtractError::Encrypted);
     }
@@ -56,6 +66,145 @@ pub(crate) fn extract(
         Ok(()) => Ok(()),
         Err(_) if dev.sink.is_full() => Ok(()),
         Err(e) => Err(ExtractError::Corrupt(format!("pdf: {e}"))),
+    }
+}
+
+/// Budget for the object streams of the document being loaded on this
+/// thread. `lopdf`'s load filter is a plain `fn`, so it reaches the limits
+/// through this thread-local.
+struct ObjStmBudget {
+    /// Largest inflated size of one object stream.
+    cap: u64,
+    /// Inflated bytes left for all object streams of the document.
+    remaining: u64,
+    /// Why an object stream was refused, if one was.
+    refused: Option<ExtractError>,
+}
+
+thread_local! {
+    static OBJSTM_BUDGET: RefCell<Option<ObjStmBudget>> = const { RefCell::new(None) };
+}
+
+/// [`Document::load_mem`] with every object stream inflated under a cap
+/// before `lopdf` expands it.
+fn load_bounded(bytes: &[u8], limits: &Limits) -> Result<Document, ExtractError> {
+    OBJSTM_BUDGET.with(|b| {
+        *b.borrow_mut() = Some(ObjStmBudget {
+            cap: limits.max_entry_bytes,
+            remaining: limits.max_total_bytes,
+            refused: None,
+        });
+    });
+    let reader = Reader {
+        buffer: bytes,
+        document: Document::new(),
+        encryption_state: None,
+        raw_objects: BTreeMap::new(),
+    };
+    let result = reader.read(Some(objstm_filter));
+    let budget = OBJSTM_BUDGET.with(|b| b.borrow_mut().take());
+    if let Some(err) = budget.and_then(|b| b.refused) {
+        return Err(err);
+    }
+    result.map_err(|e| ExtractError::Corrupt(format!("pdf: {e}")))
+}
+
+/// `lopdf` load filter: drops (and records) an object stream that would
+/// inflate past the budget, before `lopdf` decompresses it. Returning
+/// `None` drops the object.
+///
+/// `lopdf` calls the filter on every top-level object, ignoring the
+/// returned value, and on every object unpacked from an object stream,
+/// keeping the returned value. Streams are always top-level (the PDF
+/// specification forbids them inside object streams), so a stream gets a
+/// cheap placeholder back instead of a copy.
+fn objstm_filter(id: ObjectId, object: &mut Object) -> Option<(ObjectId, Object)> {
+    match object {
+        Object::Stream(stream) => {
+            if stream.dict.has_type(b"ObjStm") && !objstm_allowed(stream) {
+                return None;
+            }
+            Some((id, Object::Null))
+        }
+        other => Some((id, other.clone())),
+    }
+}
+
+/// Charges an object stream against the thread's budget.
+fn objstm_allowed(stream: &Stream) -> bool {
+    OBJSTM_BUDGET.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Without a budget (the filter ran on another thread, e.g. if
+        // `lopdf`'s `rayon` feature were enabled), fall back to the default
+        // per-stream cap.
+        let mut fallback = ObjStmBudget {
+            cap: Limits::default().max_entry_bytes,
+            remaining: Limits::default().max_total_bytes,
+            refused: None,
+        };
+        let budget = slot.as_mut().unwrap_or(&mut fallback);
+        if budget.refused.is_some() {
+            return false;
+        }
+        let cap = budget.cap.min(budget.remaining);
+        let size = match filter_names(stream).as_slice() {
+            [] => stream.content.len() as u64,
+            [name] if name == b"FlateDecode" => inflated_size(&stream.content, cap),
+            _ => {
+                budget.refused = Some(ExtractError::Unsupported(
+                    "pdf object stream with a filter other than FlateDecode".into(),
+                ));
+                return false;
+            }
+        };
+        if size > cap {
+            budget.refused = Some(ExtractError::TooLarge(format!(
+                "pdf object stream inflates past {cap} bytes"
+            )));
+            return false;
+        }
+        budget.remaining -= size;
+        true
+    })
+}
+
+/// The `/Filter` names of a stream (a name or an array of names).
+fn filter_names(stream: &Stream) -> Vec<Vec<u8>> {
+    match stream.dict.get(b"Filter") {
+        Ok(Object::Name(n)) => vec![n.clone()],
+        Ok(Object::Array(a)) => a
+            .iter()
+            .map(|f| match f {
+                Object::Name(n) => n.clone(),
+                _ => Vec::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Inflated size of zlib `data`, reading at most `cap + 1` bytes (so a
+/// result above `cap` means "too large"). Corrupt data counts as what
+/// inflated before the error.
+fn inflated_size(data: &[u8], cap: u64) -> u64 {
+    let mut decoder = flate2::read::ZlibDecoder::new(data).take(cap.saturating_add(1));
+    let mut sink = CountingSink(0);
+    let _ = std::io::copy(&mut decoder, &mut sink);
+    sink.0
+}
+
+/// A writer that only counts bytes, so a partial copy still reports its
+/// size.
+struct CountingSink(u64);
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

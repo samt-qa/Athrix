@@ -2,6 +2,8 @@
 // Run: `npm run check:query` (Node >= 22.6, type stripping). Not imported by the app.
 import { applyCompletion, complete, type Completion } from "./autocomplete.ts";
 import { filterName, kindOf, namedDate, normalizeWord, tokenize, type Token } from "./queryLang.ts";
+import { findMatches, queryTerms } from "./textMatch.ts";
+import { highlightSyntax } from "./syntax.ts";
 
 declare const process: { exit(code: number): never };
 
@@ -117,6 +119,32 @@ eq("path: no suggestions", at("path:"), null);
   const t5 = "ex report";
   const c5 = complete(t5, 2, "en")!;
   eq("replace whole word", applyCompletion(t5, c5, c5.items[0]).text, "ext: report");
+}
+
+// ---- preview: query words and Arabic-tolerant matches (task 4.9) ----
+{
+  eq("terms: words, phrase, content:, not negated or filters", queryTerms('تقرير "Annual Plan" -draft ext:pdf content:ميزانية !x'),
+    ["annual plan", "ميزانية", "تقرير"]);
+  eq("terms: wildcard splits", queryTerms("rep*rt"), ["rep", "rt"]);
+  eq("terms: normalized (hamza, harakat)", queryTerms("أُصول"), ["اصول"]);
+  const text = "مقدمة: التَّقْرِيرُ السنوي\nReport and REPORT";
+  const m = findMatches(text, queryTerms("تقرير report"));
+  eq("matches cover diacritics", m.map(([s, e]) => text.slice(s, e)), ["تَّقْرِيرُ", "Report", "REPORT"]);
+  eq("matches: digits", findMatches("رقم ١٢٣", queryTerms("123")).length, 1);
+  eq("matches: none without terms", findMatches(text, []), []);
+  eq("matches: limit", findMatches("aaaa", ["a"], 2).length, 2);
+}
+
+// ---- preview: syntax coloring ----
+{
+  const src = 'fn main() { let s = "x // y"; } // done\n/* c */ 42';
+  const spans = highlightSyntax(src, "rust").map((x) => `${x.cls}:${src.slice(x.start, x.end)}`);
+  eq("rust spans", spans, ["kw:fn", "kw:let", 'str:"x // y"', "com:// done", "com:/* c */", "num:42"]);
+  const py = 'def f():\n    """doc\n    more"""\n    return 0x1F # hex';
+  eq("python spans", highlightSyntax(py, "python").map((x) => `${x.cls}:${py.slice(x.start, x.end)}`),
+    ["kw:def", 'str:"""doc\n    more"""', "kw:return", "num:0x1F", "com:# hex"]);
+  eq("sql is caseless", highlightSyntax("SELECT 1", "sql").map((x) => x.cls), ["kw", "num"]);
+  eq("identifiers with digits are not numbers", highlightSyntax("x1 = 2", "c").map((x) => x.cls), ["num"]);
 }
 
 if (failures) {

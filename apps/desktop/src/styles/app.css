@@ -451,3 +451,172 @@ html.quick, html.quick body, html.quick #root { block-size: auto; }
   color: var(--accent); font-size: 12px;
 }
 .quick-notice:not(:empty) { padding-block: 6px; border-block-start: 1px solid var(--border); }
+
+/* ---- Preview pane (design §9.2 / §10 PreviewPane): at the inline end of the main window ---- */
+.main.with-preview { justify-content: stretch; padding-inline: 16px; }
+.main.with-preview > .panel { flex: 1 1 auto; inline-size: auto; min-inline-size: 0; max-inline-size: none; }
+/* The top-bar toggle's glyph shows the pane on the inline-end side. */
+:root[dir="rtl"] .drives-btn[aria-pressed] svg { transform: scaleX(-1); }
+.drives-btn[aria-pressed="true"] { background: var(--accent-subtle); color: var(--accent); border-color: var(--border-strong); }
+
+.splitter {
+  flex: none; position: relative;
+  inline-size: 12px; margin-block: 24px;
+  cursor: col-resize; touch-action: none;
+  border-radius: var(--radius-sm);
+}
+.splitter::after {
+  content: ""; position: absolute; inset-block: 0; inset-inline-start: 5px; inline-size: 2px;
+  border-radius: 1px; background: transparent;
+  transition: background-color var(--motion-fast) var(--ease-out-soft);
+}
+.splitter:hover::after, .splitter:active::after { background: var(--border-strong); }
+.splitter:focus-visible { outline: none; }
+.splitter:focus-visible::after { background: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+@media (forced-colors: active) {
+  .splitter::after { background: CanvasText; }
+}
+
+.preview-slot { flex: none; min-inline-size: 0; max-inline-size: calc(100% - 372px); display: flex; max-block-size: 760px; }
+.preview {
+  flex: 1; min-inline-size: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: pv-in var(--motion-base) var(--ease-out-soft);
+}
+@keyframes pv-in { from { opacity: 0; transform: translateX(8px); } }
+:root[dir="rtl"] .preview { animation-name: pv-in-rtl; }
+@keyframes pv-in-rtl { from { opacity: 0; transform: translateX(-8px); } }
+
+.pv-head {
+  flex: none;
+  display: flex; align-items: flex-start; gap: 10px;
+  padding-block: 14px 12px; padding-inline: 16px;
+  border-block-end: 1px solid var(--border);
+}
+.pv-head > .type-badge { flex: none; margin-block-start: 2px; }
+.pv-title { flex: 1; min-inline-size: 0; display: flex; flex-direction: column; gap: 2px; }
+.pv-name {
+  margin: 0; font: 600 16px/24px var(--font-ui); color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pv-path {
+  display: block; font-size: 12px; line-height: 18px; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pv-actions { flex: none; display: flex; align-items: center; gap: 4px; }
+.btn-ghost {
+  block-size: 28px; padding-inline: 10px;
+  border: 0; border-radius: var(--radius-md);
+  background: transparent; color: var(--text-secondary);
+  font: 500 12px/1 var(--font-ui); cursor: pointer; white-space: nowrap;
+}
+.btn-ghost:hover { background: var(--bg-row-hover); color: var(--text-primary); }
+.icon-btn {
+  display: inline-grid; place-items: center;
+  inline-size: 28px; block-size: 28px;
+  border: 0; border-radius: var(--radius-md);
+  background: transparent; color: var(--text-secondary); cursor: pointer;
+}
+.icon-btn:hover:not(:disabled) { background: var(--bg-row-hover); color: var(--text-primary); }
+.icon-btn:disabled { opacity: .4; cursor: default; }
+.btn-ghost:focus-visible, .icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
+
+.pv-matchbar {
+  flex: none;
+  display: flex; align-items: center; gap: 2px;
+  padding-block: 4px; padding-inline: 16px 10px;
+  border-block-end: 1px solid var(--border);
+  background: var(--bg-surface);
+  font-size: 12px; color: var(--text-secondary);
+}
+.pv-matchcount { margin-inline-end: auto; font-variant-numeric: tabular-nums; }
+
+.pv-body {
+  flex: 1; min-block-size: 0;
+  overflow: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+  transition: opacity var(--motion-fast) var(--ease-out-soft);
+}
+.pv-body:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.pv-body.pv-stale { opacity: .55; }
+.pv-note { margin: 0; padding: 32px 20px; text-align: center; color: var(--text-secondary); }
+.pv-note[role="alert"] { color: var(--danger); }
+.pv-subtle { margin: 0; padding-block: 10px 4px; padding-inline: 16px; color: var(--text-secondary); font-size: 12px; }
+
+/* Text and code: a gutter of line numbers + one row per line. */
+.pv-code {
+  display: table; min-inline-size: 100%;
+  padding-block: 8px;
+  font: 400 12.5px/20px var(--font-mono);
+  color: var(--text-primary);
+  tab-size: 4;
+}
+.pv-line { display: table-row; }
+.pv-ln {
+  display: table-cell; inline-size: 1%;
+  padding-inline: 12px 10px;
+  text-align: end; color: var(--text-muted); user-select: none;
+  font-variant-numeric: tabular-nums;
+  border-inline-end: 1px solid var(--border);
+}
+.pv-text { display: table-cell; padding-inline: 12px 16px; white-space: pre; }
+/* Prose (plain text): wraps; Arabic needs the UI font (the mono font has no Arabic glyphs). */
+.pv-prose { display: block; font: 400 13px/1.7 var(--font-ui); }
+.pv-prose .pv-line { display: grid; grid-template-columns: var(--gutter, 4ch) minmax(0, 1fr); }
+.pv-prose .pv-ln { display: block; inline-size: auto; font: 400 12px/22px var(--font-mono); }
+.pv-prose .pv-text { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Code lines are LTR, but Arabic in strings and comments needs a font that has it. */
+.pv-code:not(.pv-prose) .pv-text { font-family: var(--font-mono), "IBM Plex Sans Arabic", var(--font-ui); }
+.syn-kw { color: var(--code-keyword); }
+.syn-str { color: var(--code-string); }
+.syn-num { color: var(--code-number); }
+.syn-com { color: var(--code-comment); font-style: italic; }
+.pv-body mark.match.current { outline: 2px solid var(--accent); outline-offset: 0; }
+@media (forced-colors: active) {
+  .pv-body mark.match.current { outline-color: Highlight; }
+}
+
+/* Documents: paragraphs, each in its own direction. */
+.pv-doc { padding-block: 12px; padding-inline: 20px; font-size: 14px; line-height: 1.75; color: var(--text-primary); }
+.pv-doc p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.pv-truncated {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  margin: 0; padding-block: 10px; padding-inline: 16px;
+  border-block-start: 1px dashed var(--border); color: var(--text-secondary); font-size: 12px;
+}
+
+.pv-image { display: grid; place-items: center; min-block-size: 100%; padding: 16px; background: var(--bg-sunken); }
+.pv-image img { display: block; max-inline-size: 100%; max-block-size: 100%; object-fit: contain; border-radius: var(--radius-sm); box-shadow: var(--shadow-sm); }
+
+.pv-folder { margin: 0; padding-block: 4px 12px; padding-inline: 8px; list-style: none; }
+.pv-folder li {
+  display: flex; align-items: center; gap: 10px; min-inline-size: 0;
+  padding-block: 4px; padding-inline: 8px; border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text-primary); white-space: nowrap;
+}
+.pv-folder li .type-badge { flex: none; }
+.pv-folder li bdi { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.pv-unsupported {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  padding: 40px 24px; text-align: center; color: var(--text-secondary);
+}
+.pv-unsupported .type-badge { inline-size: 40px; block-size: 40px; border-radius: var(--radius-md); }
+.pv-unsupported .type-badge svg { inline-size: 24px; block-size: 24px; }
+.pv-unsupported p { margin: 0; max-inline-size: 36ch; }
+
+.pv-meta {
+  flex: none; margin: 0;
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 16px;
+  padding-block: 10px 12px; padding-inline: 16px;
+  border-block-start: 1px solid var(--border);
+  background: var(--bg-surface);
+  font-size: 12px; line-height: 18px;
+}
+.pv-meta dt { color: var(--text-muted); }
+.pv-meta dd { margin: 0; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
