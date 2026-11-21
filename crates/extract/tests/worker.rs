@@ -131,7 +131,11 @@ fn memory_cap_kills_the_worker() {
         keep: false,
     });
     assert!(
-        matches!(&r, Err(ExtractError::WorkerCrashed(m)) if m.contains("memory allocation")),
+        // The worker's last stderr line differs between Rust versions ("memory allocation of N
+        // bytes failed" vs. only a location line), so match the decoded abort status, which
+        // always mentions the memory cap, or the allocation message.
+        matches!(&r, Err(ExtractError::WorkerCrashed(m))
+            if m.contains("memory allocation") || m.contains("memory cap")),
         "{r:?}"
     );
     pool.extract_bytes(Kind::Text, b"ok", &Limits::default())
