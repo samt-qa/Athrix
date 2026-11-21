@@ -1,0 +1,15 @@
+[package]
+name = "athrix-text-ar"
+description = "Arabic text layer for Athrix on top of nass: normalization, light stemming, keyboard-layout correction."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+nass.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "athrix-extract"
+description = "Text extraction from documents (PDF, Office, EPUB, OCR...)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+athrix-core.workspace = true
+
+[lints]
+workspace = true

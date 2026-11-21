@@ -1,0 +1,20 @@
+[package]
+name = "athrix-cli"
+description = "Athrix command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "athrix"
+path = "src/main.rs"
+
+[dependencies]
+athrix-core.workspace = true
+athrix-text-ar.workspace = true
+
+[lints]
+workspace = true

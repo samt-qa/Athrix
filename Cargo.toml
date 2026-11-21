@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Samt Software"]
+repository = "https://github.com/samt-qa/Athrix"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+athrix-core = { path = "crates/core" }
+athrix-fs-index = { path = "crates/fs-index" }
+athrix-query = { path = "crates/query" }
+athrix-text-ar = { path = "crates/text-ar" }
+athrix-extract = { path = "crates/extract" }
+athrix-content-index = { path = "crates/content-index" }
+athrix-semantic = { path = "crates/semantic" }
+athrix-ranking = { path = "crates/ranking" }
+athrix-store = { path = "crates/store" }
+
+# External
+nass = "0.4"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+debug = true
