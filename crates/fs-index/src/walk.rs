@@ -57,9 +57,9 @@ impl WalkOptions {
     }
 }
 
-/// Compiled exclusion rules, shared with the walker threads.
+/// Compiled exclusion rules, shared with the walker threads (and the live watcher).
 #[derive(Debug)]
-struct Exclusions {
+pub(crate) struct Exclusions {
     names: GlobSet,
     paths: GlobSet,
     /// Normalized (see [`prefix_key`]) path prefixes.
@@ -101,7 +101,7 @@ impl Exclusions {
         })
     }
 
-    fn excludes(&self, path: &Path, name: &std::ffi::OsStr) -> bool {
+    pub(crate) fn excludes(&self, path: &Path, name: &std::ffi::OsStr) -> bool {
         if !self.names.is_empty() && self.names.is_match(name) {
             return true;
         }
@@ -151,6 +151,115 @@ pub fn walk(opts: &WalkOptions) -> Result<FileIndex> {
     Ok(builder.finish())
 }
 
+/// The roots and exclusion rules of a [`WalkOptions`], compiled once and shared by the live
+/// watcher ([`crate::watch`]) and the live index ([`crate::live`]) so that a path changed after
+/// the walk is judged exactly like the walk judged it.
+#[derive(Debug)]
+pub(crate) struct Scope {
+    /// Each root with its [`path_key`].
+    pub(crate) roots: Vec<(PathBuf, String)>,
+    exclusions: Arc<Exclusions>,
+    pub(crate) follow_links: bool,
+}
+
+impl Scope {
+    pub(crate) fn new(opts: &WalkOptions) -> Result<Self> {
+        Ok(Scope {
+            roots: opts
+                .roots
+                .iter()
+                .map(|r| (r.clone(), path_key(r)))
+                .collect(),
+            exclusions: Arc::new(Exclusions::new(opts)?),
+            follow_links: opts.follow_links,
+        })
+    }
+
+    /// The index of the (innermost) root that contains `path`, or `None` if it is outside every
+    /// root. A root contains itself.
+    pub(crate) fn root_of(&self, key: &str) -> Option<usize> {
+        self.roots
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, root))| key_has_prefix(key, root))
+            .max_by_key(|(_, (_, root))| root.len())
+            .map(|(i, _)| i)
+    }
+
+    /// True if `path` (with key `key`) is inside a root and neither it nor any of its ancestors
+    /// below that root is excluded. Roots themselves are never excluded, as in [`walk`].
+    pub(crate) fn admits(&self, path: &Path, key: &str) -> bool {
+        let Some(root) = self.root_of(key) else {
+            return false;
+        };
+        let rest = &key[self.roots[root].1.len()..];
+        let depth = rest.bytes().filter(|&b| b == b'/').count();
+        path.ancestors().take(depth).all(|a| match a.file_name() {
+            Some(name) => !self.exclusions.excludes(a, name),
+            None => true,
+        })
+    }
+
+    /// True if `key` is exactly one of the roots.
+    pub(crate) fn is_root(&self, key: &str) -> bool {
+        self.roots.iter().any(|(_, r)| r == key)
+    }
+
+    /// Walks the subtree at `dir` (which must be in scope) with the same rules as [`walk`]. The
+    /// returned index has `dir` as its only root, named by its full path.
+    pub(crate) fn walk_subtree(&self, dir: &Path) -> FileIndex {
+        let mut builder = IndexBuilder::new();
+        walk_root(dir, self.follow_links, &self.exclusions, &mut builder);
+        builder.finish()
+    }
+
+    /// Reads the metadata of `path` the way the walker records it.
+    pub(crate) fn read_meta(&self, path: &Path) -> std::io::Result<EntryMeta> {
+        let md = if self.follow_links {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        }?;
+        Ok(meta_from(&md))
+    }
+}
+
+/// Comparable form of a path for the live layer: `/` separators, no trailing separator, and
+/// case-folded per character on Windows (the file system there is case-insensitive).
+pub(crate) fn path_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push('/'),
+            c if cfg!(windows) => out.extend(c.to_lowercase()),
+            c => out.push(c),
+        }
+    }
+    while out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// True if `key` equals `prefix` or lies below it.
+pub(crate) fn key_has_prefix(key: &str, prefix: &str) -> bool {
+    key.starts_with(prefix) && (key.len() == prefix.len() || key.as_bytes()[prefix.len()] == b'/')
+}
+
+fn meta_from(md: &std::fs::Metadata) -> EntryMeta {
+    EntryMeta {
+        is_dir: md.is_dir(),
+        is_symlink: md.file_type().is_symlink(),
+        size: if md.is_dir() { 0 } else { md.len() },
+        modified: md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_secs()).ok()),
+    }
+}
+
 fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
     let md = if follow_links {
         std::fs::metadata(path)
@@ -158,16 +267,7 @@ fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
         std::fs::symlink_metadata(path)
     };
     match md {
-        Ok(md) => Some(EntryMeta {
-            is_dir: md.is_dir(),
-            is_symlink: md.file_type().is_symlink(),
-            size: if md.is_dir() { 0 } else { md.len() },
-            modified: md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_secs()).ok()),
-        }),
+        Ok(md) => Some(meta_from(&md)),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
             None

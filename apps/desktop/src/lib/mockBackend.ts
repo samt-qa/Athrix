@@ -6,7 +6,8 @@
 // The fake index is deterministic (seeded PRNG): the same names, folders and sizes on every load.
 // Test switches (URL query string): `?mockEntries=N` (default 4000), `?mockIndexError`.
 import type {
-  CommandArgs, CommandName, CommandResult, IndexStatus, QueryError, Range16, ResultItem, SearchResponse,
+  CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, QueryError, Range16, ResultItem, SearchResponse,
+  Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
 
@@ -14,6 +15,16 @@ const params = new URLSearchParams(window.location.search);
 const ENTRY_COUNT = clampInt(Number(params.get("mockEntries") ?? 4000), 10, 200_000);
 const INDEX_DELAY_MS = 1200;
 const HOME = "C:\\Users\\Sara";
+/** Some folders live on a second drive so the search scope can be tried out. */
+const DATA = "D:\\Data";
+const ON_D = /^(Archive|Videos|Projects)\b/;
+const baseOf = (folder: string) => (ON_D.test(folder) ? DATA : HOME);
+const VOLUMES: Volume[] = [
+  { path: "C:\\", name: "C:", label: "Windows", kind: "fixed" },
+  { path: "D:\\", name: "D:", label: "Data", kind: "fixed" },
+  { path: "E:\\", name: "E:", label: "USB", kind: "removable" },
+];
+const WHOLE_COMPUTER = VOLUMES.filter((v) => v.kind === "fixed").map((v) => v.path);
 
 function clampInt(n: number, min: number, max: number) {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : min;
@@ -115,7 +126,7 @@ function buildIndex(count: number): MockEntry[] {
       if (seen.has(rel)) continue;
       seen.add(rel);
       push({
-        name: parts[i], parent: [HOME, ...parts.slice(0, i)].join("\\"), isDir: true, size: null,
+        name: parts[i], parent: [baseOf(f), ...parts.slice(0, i)].join("\\"), isDir: true, size: null,
         modified: nowSec - Math.floor(rnd() * 400 * 86400), ext: "",
       });
     }
@@ -137,7 +148,7 @@ function buildIndex(count: number): MockEntry[] {
     // Spread modification times from minutes to years ago (skewed towards recent).
     const age = Math.floor(Math.pow(rnd(), 3) * 3 * 365 * 86400) + 30;
     push({
-      name: `${stem}.${ext}`, parent: `${HOME}\\${pick(FOLDERS)}`, isDir: false,
+      name: `${stem}.${ext}`, parent: ((f) => `${baseOf(f)}\\${f}`)(pick(FOLDERS)), isDir: false,
       size: Math.max(1, Math.floor(SIZE_SCALE[cat] * Math.pow(rnd() * 2, 3))),
       modified: nowSec - age, ext,
     });
@@ -357,9 +368,21 @@ export function onIndexStatus(handler: (s: IndexStatus) => void): () => void {
   return () => listeners.delete(handler);
 }
 
+/** The indexed-roots setting (`null` = whole computer), kept for the page's lifetime. */
+let chosenRoots: string[] | null = null;
+const resolvedRoots = () => chosenRoots ?? WHOLE_COMPUTER;
+
+/** Comparable path: "/" separators, no trailing "/", lower case. */
+const pathKey = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+const under = (path: string, root: string) => {
+  const k = pathKey(path);
+  const r = pathKey(root);
+  return k === r || k.startsWith(`${r}/`);
+};
+
 function startIndexing(roots?: string[]) {
   if (status.state === "indexing") return;
-  const r = roots?.length ? roots : [HOME];
+  const r = roots?.length ? roots : resolvedRoots();
   setStatus({ state: "indexing", entries: 0, roots: r, elapsedMs: null, error: null });
   const t0 = performance.now();
   setTimeout(() => {
@@ -367,14 +390,14 @@ function startIndexing(roots?: string[]) {
       setStatus({ ...status, state: "error", error: "access denied: C:\\Users\\Sara (mock)" });
       return;
     }
-    index = buildIndex(ENTRY_COUNT);
+    index = buildIndex(ENTRY_COUNT).filter((e) => r.some((root) => under(e.item.parent, root)));
     setStatus({
       state: "ready", entries: index.length, roots: r, elapsedMs: Math.round(performance.now() - t0), error: null,
     });
   }, INDEX_DELAY_MS);
 }
 
-function search(query: string, limit: number, requestId: number): SearchResponse {
+function search(query: string, limit: number, requestId: number, scope: string | null): SearchResponse {
   const t0 = performance.now();
   const done = (items: ResultItem[], truncated: boolean, error: QueryError | null = null): SearchResponse => ({
     requestId, items, truncated, error, cancelled: false, elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
@@ -394,6 +417,7 @@ function search(query: string, limit: number, requestId: number): SearchResponse
   const hits: { e: MockEntry; score: number; highlights: Range16[] }[] = [];
   for (const e of index) {
     const it = e.item;
+    if (scope && !under(`${it.parent}\\${it.name}`, scope)) continue;
     if (p.kinds && !kindMatches(p.kinds, it)) continue;
     if (p.exts && !p.exts.includes(it.ext)) continue;
     if (p.size && !sizeMatches(p.size, it.size)) continue;
@@ -448,6 +472,27 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
     case "start_indexing":
       startIndexing(args.roots as string[] | undefined);
       break;
+    case "list_volumes":
+      await sleep(80);
+      result = VOLUMES.map((v) => ({ ...v }));
+      break;
+    case "get_index_roots":
+      result = { wholeComputer: chosenRoots === null, roots: resolvedRoots() } satisfies IndexRoots;
+      break;
+    case "set_index_roots": {
+      const roots = args.roots as string[] | null;
+      if (roots !== null && roots.length === 0) throw "choose at least one drive or folder to index";
+      chosenRoots = roots;
+      const next = resolvedRoots();
+      const same = next.length === status.roots.length && next.every((x, i) => pathKey(x) === pathKey(status.roots[i]));
+      if (!same) {
+        // Like the Rust queue (latest wins), simplified: restart once the running walk ends.
+        if (status.state === "indexing") setTimeout(() => startIndexing(resolvedRoots()), INDEX_DELAY_MS + 50);
+        else startIndexing(next);
+      }
+      result = { wholeComputer: roots === null, roots: next } satisfies IndexRoots;
+      break;
+    }
     case "search": {
       const requestId = args.requestId as number;
       latestRequest = Math.max(latestRequest, requestId);
@@ -459,7 +504,11 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       if (requestId < latestRequest) {
         result = { requestId, items: [], truncated: false, elapsedMs: 0, error: null, cancelled: true };
       } else {
-        result = search(query, args.limit as number, requestId);
+        const scope = ((args.scope as string | null | undefined) ?? "").trim();
+        if (scope && !/^([a-z]:([\\/].*)?|[\\/].*)$/i.test(scope)) {
+          throw `invalid search scope: "${scope}" is not an absolute path or a drive like D:`;
+        }
+        result = search(query, args.limit as number, requestId, scope || null);
       }
       break;
     }

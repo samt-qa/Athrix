@@ -17,6 +17,7 @@ crc32fast = "1.5.5"
 globset = "0.4.18"
 jwalk = "0.8.1"
 memchr = "2.7.4"
+notify.workspace = true
 rayon = "1.10.0"
 tracing.workspace = true
 
@@ -31,6 +32,10 @@ harness = false
 
 [[bench]]
 name = "snapshot"
+harness = false
+
+[[bench]]
+name = "live"
 harness = false
 
 [lints]

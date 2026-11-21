@@ -22,10 +22,15 @@ athrix-fs-index.workspace = true
 athrix-query.workspace = true
 athrix-text-ar.workspace = true
 nass.workspace = true
-tauri.workspace = true
+tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-opener.workspace = true
+tauri-plugin-global-shortcut.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Volume listing for the drive picker (mount point, label, removable): a safe wrapper over
+# GetVolumeInformationW / GetDriveTypeW (the crate denies `unsafe`). Only the `disk` feature.
+# 0.36 is the last line building on Rust 1.85 (0.37+ needs 1.88).
+sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
 tracing.workspace = true
 
 [dev-dependencies]

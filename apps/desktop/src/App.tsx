@@ -12,6 +12,10 @@ import ResultList, { optionId, type ResultListHandle } from "./components/Result
 import { EmptyState, NoResults, NotReady } from "./components/EmptyState";
 import HintBar from "./components/HintBar";
 import StatusBar from "./components/StatusBar";
+import ScopeSelect from "./components/ScopeSelect";
+import IndexSettings from "./components/IndexSettings";
+import { effectiveScope, setScope, storedScope } from "./lib/scope";
+import { fitWindowTo, hideWindow, onWindowFocus, type WindowMode } from "./lib/window";
 
 /** Results per query (contract `limit`). Dev-only override for scroll testing: `?limit=5000`. */
 const LIMIT = (() => {
@@ -22,7 +26,15 @@ const LIMIT = (() => {
 const LIST_ID = "results";
 const ERROR_ID = "query-error";
 
-export default function App() {
+/**
+ * The search UI. `mode` "main": the full window (top bar, panel, status bar). `mode` "quick": the
+ * quick-search popup (design §9.1): only the panel, inside a transparent frame that the window
+ * fits to. In the popup, Esc on an empty field hides it (the first Esc clears the text), and
+ * opening a result (Enter, Ctrl+Enter, double-click) hides it; it also hides when it loses focus
+ * (Rust side). Each time it is shown the field is focused with its text selected.
+ */
+export default function App(props: { mode: WindowMode }) {
+  const quick = props.mode === "quick";
   let input!: HTMLInputElement;
   let list: ResultListHandle | undefined;
 
@@ -62,11 +74,15 @@ export default function App() {
   const [failure, setFailure] = createSignal<string | null>(null);
   const [selected, setSelected] = createSignal(0);
   const sent = createMemo(() => composeQuery(text(), chip()));
+  // Where to search: "" = whole computer, else one indexed root. A remembered drive that is no
+  // longer indexed falls back to the whole computer.
+  const roots = () => index()?.roots ?? [];
+  const scope = createMemo(() => effectiveScope(storedScope(), index()?.roots));
 
   // Whole numbers: Rust reads requestId as u64. Seeded from the clock so ids keep increasing
   // across a webview reload (or HMR) while the backend stays alive.
   let lastRequest = Date.now();
-  async function runSearch(query: string) {
+  async function runSearch(query: string, where: string) {
     const requestId = ++lastRequest;
     if (!query.trim()) {
       batch(() => {
@@ -77,7 +93,7 @@ export default function App() {
       return;
     }
     try {
-      const r = await api.search(query, LIMIT, requestId);
+      const r = await api.search(query, LIMIT, requestId, where || null);
       // Drop anything older than the latest request, and cancelled ones.
       if (r.requestId !== lastRequest || requestId !== lastRequest || r.cancelled) return;
       batch(() => {
@@ -95,8 +111,9 @@ export default function App() {
     }
   }
   // No debounce: a search takes a few ms, and stale responses are dropped by requestId.
-  // Re-runs when the index becomes ready, so a query typed during indexing fills in.
-  createEffect(on([sent, () => index()?.state], ([q]) => void runSearch(q)));
+  // Re-runs when the index becomes ready, so a query typed during indexing fills in, and when
+  // the scope changes.
+  createEffect(on([sent, () => index()?.state, scope], ([q, , where]) => void runSearch(q, where)));
 
   const items = () => response()?.items ?? [];
   const queryError = () => response()?.error ?? null;
@@ -129,6 +146,8 @@ export default function App() {
         await api.openEntry(it.id);
         showNotice(t("notice.opening", { name: it.name }));
       }
+      // The popup's job is done; on failure it stays open to show the notice.
+      if (quick) hideWindow();
     } catch (err) {
       showNotice(t("notice.actionFailed", { message: errorMessage(err) }));
     }
@@ -197,8 +216,10 @@ export default function App() {
         void open(selected(), ctrl);
         break;
       case "Escape":
-        if (!text()) return;
-        setText("");
+        // First Esc clears the query; Esc on an empty field closes the popup.
+        if (text()) setText("");
+        else if (quick) hideWindow();
+        else return;
         break;
       default:
         // (`key` only as a fallback for synthetic events that carry no `code`.)
@@ -240,6 +261,104 @@ export default function App() {
   const indexing = () => index()?.state === "indexing";
   const notReady = () => index()?.state !== "ready";
 
+  // ---- quick-search popup ----
+  let frame: HTMLDivElement | undefined;
+  if (quick) {
+    onMount(() => {
+      if (frame) onCleanup(fitWindowTo(frame));
+    });
+    // Shown again (global shortcut, tray): ready to type over the previous query.
+    onCleanup(
+      onWindowFocus(() => {
+        input.focus();
+        input.select();
+      }),
+    );
+  }
+
+  const panel = (
+    <section class="panel" classList={{ "quick-panel": quick }} aria-label={t("search.region")}>
+      <SearchField
+        ref={(el) => (input = el)}
+        value={text()}
+        onInput={setText}
+        onKeyDown={onKeyDown}
+        errorSpan={errorSpan()}
+        listId={LIST_ID}
+        expanded={items().length > 0}
+        activeDescendant={activeDescendant()}
+        describedBy={queryError() || failure() ? ERROR_ID : undefined}
+        addon={<ScopeSelect roots={roots()} value={scope()} onChange={setScope} />}
+      />
+      <div class="progress" classList={{ active: indexing() }} aria-hidden="true" />
+      <FilterChips value={chip()} onChange={setChip} />
+      <QueryErrorBar
+        id={ERROR_ID}
+        text={text()}
+        error={queryError()}
+        failure={failure()}
+        onApplySuggestion={useSuggestion}
+      />
+
+      {/* In the popup the area is as tall as its rows (--rows), so the window grows with them. */}
+      <div class="results-area" style={quick ? { "--rows": String(items().length) } : undefined}>
+        <Switch>
+          <Match when={!text().trim()}>
+            <EmptyState onExample={setQuery} />
+          </Match>
+          <Match when={queryError() || failure()}>{null}</Match>
+          <Match when={notReady() && !items().length}>
+            <NotReady failed={index()?.state === "error"} />
+          </Match>
+          <Match when={response() && !items().length}>
+            <NoResults
+              query={text().trim()}
+              filtered={chip() !== "all"}
+              onClearFilter={() => setChip("all")}
+              scoped={scope() !== ""}
+              onClearScope={() => setScope("")}
+            />
+          </Match>
+        </Switch>
+        {/* Always mounted so aria-controls points at a real listbox. */}
+        <ResultList
+          ref={(h) => (list = h)}
+          id={LIST_ID}
+          label={t("search.resultsLabel")}
+          items={items()}
+          selected={selected()}
+          now={now()}
+          onSelect={setSelected}
+          onOpen={(i) => {
+            setSelected(i);
+            void open(i);
+          }}
+        />
+      </div>
+
+      {/* The popup has no status bar: notices (copied, failures) show here instead. */}
+      <Show when={quick}>
+        <p class="quick-notice" role="status">{notice()}</p>
+      </Show>
+      <HintBar quick={quick} />
+    </section>
+  );
+
+  if (quick) {
+    return (
+      <div
+        ref={frame}
+        class="quick-frame"
+        // A click on the transparent margin around the panel counts as a click outside.
+        onMouseDown={(e) => {
+          if (e.target === e.currentTarget) hideWindow();
+        }}
+      >
+        {panel}
+      </div>
+    );
+  }
+
   return (
     <div class="shell">
       <header class="topbar">
@@ -255,64 +374,11 @@ export default function App() {
             </bdi>
           )}
         </Show>
+        <IndexSettings onError={(message) => showNotice(t("drives.failed", { message }))} />
         <SettingsControls />
       </header>
 
-      <main class="main">
-        <section class="panel" aria-label={t("search.region")}>
-          <SearchField
-            ref={(el) => (input = el)}
-            value={text()}
-            onInput={setText}
-            onKeyDown={onKeyDown}
-            errorSpan={errorSpan()}
-            listId={LIST_ID}
-            expanded={items().length > 0}
-            activeDescendant={activeDescendant()}
-            describedBy={queryError() || failure() ? ERROR_ID : undefined}
-          />
-          <div class="progress" classList={{ active: indexing() }} aria-hidden="true" />
-          <FilterChips value={chip()} onChange={setChip} />
-          <QueryErrorBar
-            id={ERROR_ID}
-            text={text()}
-            error={queryError()}
-            failure={failure()}
-            onApplySuggestion={useSuggestion}
-          />
-
-          <div class="results-area">
-            <Switch>
-              <Match when={!text().trim()}>
-                <EmptyState onExample={setQuery} />
-              </Match>
-              <Match when={queryError() || failure()}>{null}</Match>
-              <Match when={notReady() && !items().length}>
-                <NotReady failed={index()?.state === "error"} />
-              </Match>
-              <Match when={response() && !items().length}>
-                <NoResults query={text().trim()} filtered={chip() !== "all"} onClearFilter={() => setChip("all")} />
-              </Match>
-            </Switch>
-            {/* Always mounted so aria-controls points at a real listbox. */}
-            <ResultList
-              ref={(h) => (list = h)}
-              id={LIST_ID}
-              label={t("search.resultsLabel")}
-              items={items()}
-              selected={selected()}
-              now={now()}
-              onSelect={setSelected}
-              onOpen={(i) => {
-                setSelected(i);
-                void open(i);
-              }}
-            />
-          </div>
-
-          <HintBar />
-        </section>
-      </main>
+      <main class="main">{panel}</main>
 
       <StatusBar index={index()} response={notReady() ? null : response()} notice={notice()} mock={usingMock} onRetry={retryIndexing} />
     </div>

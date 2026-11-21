@@ -35,16 +35,30 @@ export function EmptyState(props: { onExample: (query: string) => void }) {
 }
 
 /** A query with no matches (design §9.3 "no results"). */
-export function NoResults(props: { query: string; filtered: boolean; onClearFilter: () => void }) {
+export function NoResults(props: {
+  query: string;
+  filtered: boolean;
+  onClearFilter: () => void;
+  /** Searching one drive only: offer the whole computer. */
+  scoped?: boolean;
+  onClearScope?: () => void;
+}) {
   return (
     <div class="state">
       <h2 class="state-title">{t("noResults.title", { query: `⁨${props.query}⁩` /* bidi-isolated */ })}</h2>
       <p class="state-body">{t("noResults.hint")}</p>
-      <Show when={props.filtered}>
-        <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={props.onClearFilter}>
-          {t("noResults.allTypes")}
-        </button>
-      </Show>
+      <div class="state-actions">
+        <Show when={props.filtered}>
+          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={props.onClearFilter}>
+            {t("noResults.allTypes")}
+          </button>
+        </Show>
+        <Show when={props.scoped}>
+          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onClearScope?.()}>
+            {t("noResults.wholeComputer")}
+          </button>
+        </Show>
+      </div>
     </div>
   );
 }

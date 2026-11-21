@@ -1,7 +1,7 @@
 import { t } from "../i18n";
 
-/** Keyboard shortcut hints at the bottom of the panel (design §9.1). */
-export default function HintBar() {
+/** Keyboard shortcut hints at the bottom of the panel (design §9.1). In the quick-search popup Esc also closes it. */
+export default function HintBar(props: { quick?: boolean }) {
   const ctrl = () => t("keys.ctrl");
   return (
     <ul class="hints" aria-label={t("hints.label")}>
@@ -9,7 +9,7 @@ export default function HintBar() {
       <li><kbd>↵</kbd> {t("hints.open")}</li>
       <li><bdi dir="ltr"><kbd>{ctrl()}</kbd>+<kbd>↵</kbd></bdi> {t("hints.reveal")}</li>
       <li><bdi dir="ltr"><kbd>{ctrl()}</kbd>+<kbd>C</kbd></bdi> {t("hints.copy")}</li>
-      <li><kbd>{t("keys.esc")}</kbd> {t("hints.clear")}</li>
+      <li><kbd>{t("keys.esc")}</kbd> {t(props.quick ? "hints.clearClose" : "hints.clear")}</li>
     </ul>
   );
 }

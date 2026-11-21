@@ -1,5 +1,5 @@
 import { createSignal } from "solid-js";
-import { readSetting, writeSetting } from "./storage";
+import { onSettingChange, readSetting, writeSetting } from "./storage";
 
 export const THEMES = ["system", "light", "dark"] as const;
 export type Theme = (typeof THEMES)[number];
@@ -16,6 +16,12 @@ function applyTheme(theme: Theme) {
 const saved = readSetting("theme");
 const [theme, setThemeSignal] = createSignal<Theme>(isTheme(saved) ? saved : "system");
 applyTheme(theme()); // at import time, before the first render
+// Follow a theme switch made in the other window (main window ⇄ quick-search popup).
+onSettingChange("theme", (v) => {
+  if (!isTheme(v)) return;
+  setThemeSignal(v);
+  applyTheme(v);
+});
 
 export { theme };
 

@@ -13,6 +13,8 @@ type Props = {
   expanded: boolean;
   activeDescendant: string | undefined;
   describedBy: string | undefined;
+  /** Shown at the inline end of the bar, outside the input's label (e.g. the scope selector). */
+  addon?: JSX.Element;
 };
 
 /**
@@ -41,42 +43,45 @@ export default function SearchField(props: Props) {
   };
 
   return (
-    <label class="search">
-      <SearchIcon />
-      <div class="search-field">
-        <Show when={span()}>
-          {(s) => (
-            <div ref={mirror} class="search-mirror" dir="auto" aria-hidden="true">
-              {s().before}<span class="search-error-span">{s().bad}</span>{s().after}
-            </div>
-          )}
-        </Show>
-        <input
-          ref={(el) => {
-            input = el;
-            props.ref(el);
-          }}
-          dir="auto"
-          autofocus
-          spellcheck={false}
-          autocomplete="off"
-          role="combobox"
-          aria-label={t("search.inputLabel")}
-          aria-autocomplete="list"
-          aria-controls={props.listId}
-          aria-expanded={props.expanded}
-          aria-activedescendant={props.activeDescendant}
-          aria-invalid={props.errorSpan ? true : undefined}
-          aria-describedby={props.describedBy}
-          placeholder={t("search.placeholder")}
-          value={props.value}
-          onInput={(e) => props.onInput(e.currentTarget.value)}
-          onKeyDown={props.onKeyDown}
-          onScroll={sync}
-          onSelect={sync}
-          onKeyUp={sync}
-        />
-      </div>
-    </label>
+    <div class="search">
+      <label class="search-main">
+        <SearchIcon />
+        <div class="search-field">
+          <Show when={span()}>
+            {(s) => (
+              <div ref={mirror} class="search-mirror" dir="auto" aria-hidden="true">
+                {s().before}<span class="search-error-span">{s().bad}</span>{s().after}
+              </div>
+            )}
+          </Show>
+          <input
+            ref={(el) => {
+              input = el;
+              props.ref(el);
+            }}
+            dir="auto"
+            autofocus
+            spellcheck={false}
+            autocomplete="off"
+            role="combobox"
+            aria-label={t("search.inputLabel")}
+            aria-autocomplete="list"
+            aria-controls={props.listId}
+            aria-expanded={props.expanded}
+            aria-activedescendant={props.activeDescendant}
+            aria-invalid={props.errorSpan ? true : undefined}
+            aria-describedby={props.describedBy}
+            placeholder={t("search.placeholder")}
+            value={props.value}
+            onInput={(e) => props.onInput(e.currentTarget.value)}
+            onKeyDown={props.onKeyDown}
+            onScroll={sync}
+            onSelect={sync}
+            onKeyUp={sync}
+          />
+        </div>
+      </label>
+      {props.addon}
+    </div>
   );
 }

@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::indexing::Indexer;
+use crate::roots::RootsSetting;
 
-/// Everything the commands share: the indexer and the cancel flag of the latest search.
+/// Everything the commands share: the indexer, the indexed-roots setting and the cancel flag
+/// of the latest search.
 #[derive(Debug, Default)]
 pub struct AppState {
     /// The name index and its background indexing.
     pub indexer: Arc<Indexer>,
+    /// Which folders to index (persisted in the app data folder).
+    pub roots: RootsSetting,
     /// Cancel flag of the most recent `search` request.
     search_cancel: Mutex<Arc<AtomicBool>>,
 }

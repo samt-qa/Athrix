@@ -16,3 +16,13 @@ export function writeSetting(key: string, value: string): void {
     // Ignore: the setting just won't survive a restart.
   }
 }
+
+/**
+ * Calls `handler` when another window of the app (main window or quick-search popup) changes
+ * `key`. Same-origin windows share local storage; the `storage` event only fires in the others.
+ */
+export function onSettingChange(key: string, handler: (value: string | null) => void): void {
+  window.addEventListener("storage", (e) => {
+    if (e.key === PREFIX + key) handler(e.newValue);
+  });
+}

@@ -13,7 +13,7 @@ pub enum IndexState {
     Idle,
     /// A walk is running in the background.
     Indexing,
-    /// The last walk finished; searches use its result.
+    /// The last walk finished, or a snapshot was loaded; searches use that index.
     Ready,
     /// The last walk failed (see [`IndexStatus::error`]).
     Error,
@@ -25,7 +25,8 @@ pub enum IndexState {
 pub struct IndexStatus {
     /// Current state.
     pub state: IndexState,
-    /// Entries in the index searches currently use (0 until the first walk finishes).
+    /// Entries in the index searches currently use (0 until the first walk finishes or a
+    /// snapshot is loaded).
     pub entries: u64,
     /// The roots being indexed (or last indexed).
     pub roots: Vec<String>,
@@ -51,8 +52,10 @@ impl Default for IndexStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultItem {
-    /// Entry id, used by `open_entry` / `reveal_entry` / `entry_path`.
-    pub id: u32,
+    /// Result id, used by `open_entry` / `reveal_entry` / `entry_path`: the index generation
+    /// and the entry, `generation << 32 | entry`, always below 2^53 (see
+    /// [`crate::results::encode_id`]). Ids from an older index are rejected, never reused.
+    pub id: u64,
     /// Original name as on disk.
     pub name: String,
     /// Full path of the parent folder (`""` for a root).

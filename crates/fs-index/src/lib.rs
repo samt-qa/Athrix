@@ -13,16 +13,23 @@
 //! # Ok::<(), athrix_core::Error>(())
 //! ```
 //!
-//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): snapshots, live watching,
-//! NTFS MFT/USN, path matching and ranking.
+//! To keep the index current after the walk, wrap it in a [`LiveIndex`] and feed it the
+//! batches of a [`Watcher`] (see [`live`] for the design and the id rules, and [`watch`] for
+//! the debouncing).
+//!
+//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): NTFS MFT/USN and ranking.
 
 mod exec;
 mod index;
+pub mod live;
 mod search;
 mod snapshot;
 mod walk;
+pub mod watch;
 
 pub use exec::kind_extensions;
 pub use index::{EntryId, EntryMeta, FileIndex, IndexBuilder};
+pub use live::{ApplyStats, Change, IndexSnapshot, LiveIndex};
 pub use search::{Query, QueryError};
 pub use walk::{WalkOptions, walk};
+pub use watch::{WatchBatch, WatchConfig, Watcher};

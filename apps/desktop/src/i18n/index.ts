@@ -1,7 +1,7 @@
 import { createSignal } from "solid-js";
 import ar from "./ar.json";
 import en from "./en.json";
-import { readSetting, writeSetting } from "../lib/storage";
+import { onSettingChange, readSetting, writeSetting } from "../lib/storage";
 
 /** Arabic is the source of truth: every key must exist in ar.json. */
 export type MessageKey = keyof typeof ar;
@@ -28,6 +28,12 @@ function applyLocale(l: Locale) {
 const saved = readSetting("locale");
 const [locale, setLocaleSignal] = createSignal<Locale>(isLocale(saved) ? saved : DEFAULT_LOCALE);
 applyLocale(locale()); // at import time, before the first render
+// Follow a language switch made in the other window (main window ⇄ quick-search popup).
+onSettingChange("locale", (v) => {
+  if (!isLocale(v)) return;
+  setLocaleSignal(v);
+  applyLocale(v);
+});
 
 export { locale };
 

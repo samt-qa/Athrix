@@ -4,16 +4,26 @@
 //! - [`model`]: the JSON types of the contract;
 //! - [`indexing`]: background indexing and the shared index;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
-//! - [`results`]: running a search and building result rows;
+//! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
+//! - [`roots`]: which drives / folders are indexed, persisted for the next start;
+//! - [`volumes`]: the drives of this computer;
 //! - [`state`]: state shared by the commands;
-//! - [`commands`]: the Tauri commands themselves.
+//! - [`commands`]: the Tauri commands themselves;
+//! - [`popup`]: the quick-search popup window and hide-to-tray of the main window;
+//! - [`shortcut`]: the global shortcut that toggles the popup;
+//! - [`tray`]: the system-tray icon and its menu.
 
 pub mod commands;
 pub mod indexing;
 pub mod model;
+pub mod popup;
 pub mod query;
 pub mod results;
+pub mod roots;
+pub mod shortcut;
 pub mod state;
+pub mod tray;
+pub mod volumes;
 
 use serde::Serialize;
 
@@ -38,22 +48,36 @@ fn normalize_preview(text: &str) -> String {
     athrix_text_ar::normalize_name(text)
 }
 
-/// Builds and runs the Tauri app. Indexing of the user's home folder starts right away.
+/// Builds and runs the Tauri app. Indexing of the chosen drives (by default every fixed drive)
+/// starts right away.
+///
+/// The app lives in the tray: closing the main window hides it, and only Quit in the tray menu
+/// exits. The quick-search popup opens with [`shortcut::QUICK_SEARCH_SHORTCUT`] or a tray click.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     athrix_core::logging::init("info");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(state::AppState::default())
+        .manage(popup::PopupState::default())
         .setup(|app| {
             commands::start_default_indexing(app.handle());
+            shortcut::register(app.handle());
+            if let Err(err) = tray::create(app.handle()) {
+                tracing::warn!("couldn't create the tray icon: {err}");
+            }
             Ok(())
         })
+        .on_window_event(popup::on_window_event)
         .invoke_handler(tauri::generate_handler![
             app_info,
             normalize_preview,
             commands::index_status,
             commands::start_indexing,
+            commands::list_volumes,
+            commands::get_index_roots,
+            commands::set_index_roots,
             commands::search,
             commands::open_entry,
             commands::reveal_entry,

@@ -2,6 +2,7 @@ import { Match, Show, Switch } from "solid-js";
 import { locale, t, tPlural } from "../i18n";
 import type { IndexStatus, SearchResponse } from "../lib/api";
 import { formatCount, intlLocale } from "../lib/format";
+import { rootName } from "../lib/scope";
 
 type Props = {
   index: IndexStatus | null;
@@ -52,6 +53,13 @@ export default function StatusBar(props: Props) {
           </Match>
         </Switch>
       </span>
+      <Show when={props.index?.roots.length ? props.index.roots : null}>
+        {(roots) => (
+          <span class="index-roots" title={roots().join("\n")}>
+            {t("index.rootsLabel")} <bdi dir="ltr">{roots().map(rootName).join(", ")}</bdi>
+          </span>
+        )}
+      </Show>
       <Show when={props.mock}>
         <span class="mock-badge" title={t("index.mockTitle")}>{t("index.mock")}</span>
       </Show>

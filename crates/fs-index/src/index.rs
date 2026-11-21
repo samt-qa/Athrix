@@ -188,6 +188,22 @@ impl IndexBuilder {
     /// # Panics
     /// If `parent` is not an existing id, or beyond `u32::MAX - 1` entries / 4 GiB of names.
     pub fn push(&mut self, parent: Option<EntryId>, name: &str, meta: EntryMeta) -> EntryId {
+        let mut buf = std::mem::take(&mut self.buf);
+        athrix_text_ar::normalize_name_into(name, &mut buf);
+        let id = self.push_normalized(parent, name, &buf, meta);
+        self.buf = buf;
+        id
+    }
+
+    /// Like [`IndexBuilder::push`], with `normalized` already computed by
+    /// [`athrix_text_ar::normalize_name_into`] (copying entries between indexes, live updates).
+    pub(crate) fn push_normalized(
+        &mut self,
+        parent: Option<EntryId>,
+        name: &str,
+        normalized: &str,
+        meta: EntryMeta,
+    ) -> EntryId {
         let id = u32::try_from(self.index.len()).expect("too many entries");
         assert!(id != NO_PARENT, "too many entries");
         let parent = match parent {
@@ -197,10 +213,9 @@ impl IndexBuilder {
             }
             None => NO_PARENT,
         };
-        athrix_text_ar::normalize_name_into(name, &mut self.buf);
         let ix = &mut self.index;
         ix.names.push(name);
-        ix.normalized.push(&self.buf);
+        ix.normalized.push(normalized);
         ix.parents.push(parent);
         ix.flags
             .push((u8::from(meta.is_dir) * FLAG_DIR) | (u8::from(meta.is_symlink) * FLAG_SYMLINK));

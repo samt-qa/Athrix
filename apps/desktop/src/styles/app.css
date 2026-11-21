@@ -73,8 +73,15 @@ body {
   block-size: 64px; padding-inline: 20px;
   border-block-end: 1px solid var(--border);
 }
+.search-main {
+  flex: 1; min-inline-size: 0; block-size: 100%;
+  display: flex; align-items: center; gap: 12px;
+}
 .search svg { flex: none; color: var(--text-muted); }
-.search:focus-within svg { color: var(--accent); }
+.search-main:focus-within svg { color: var(--accent); }
+/* Scope selector (whole computer / one drive) at the inline end of the search bar. */
+.scope-select { flex: none; }
+.scope-select .segmented-btn { padding-inline: 10px; white-space: nowrap; }
 .search-field { position: relative; flex: 1; min-inline-size: 0; block-size: 100%; }
 .search input, .search-mirror {
   position: absolute; inset: 0;
@@ -258,6 +265,54 @@ mark.match {
   background: transparent; color: var(--text-primary); font: 500 13px/1 var(--font-ui); cursor: pointer;
 }
 .btn-secondary:hover { background: var(--bg-row-hover); }
+.btn-primary {
+  block-size: 32px; padding-inline: 14px;
+  border: 1px solid var(--accent); border-radius: var(--radius-md);
+  background: var(--accent); color: var(--text-on-accent); font: 500 13px/1 var(--font-ui); cursor: pointer;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn-primary:disabled { opacity: .5; cursor: default; }
+.btn-primary:focus-visible, .btn-secondary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
+.state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.state-actions:empty { display: none; }
+
+/* ---- Indexed drives (top bar button + panel) ---- */
+.drives { position: relative; }
+.drives-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  block-size: 34px; padding-inline: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  background: var(--bg-surface); color: var(--text-secondary);
+  font: 500 12px/1 var(--font-ui); cursor: pointer;
+  transition: background-color var(--motion-fast) var(--ease-out-soft), color var(--motion-fast) var(--ease-out-soft);
+}
+.drives-btn:hover, .drives-btn[aria-expanded="true"] { background: var(--bg-row-hover); color: var(--text-primary); }
+.drives-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
+.drives-panel {
+  position: absolute; z-index: 10; inset-block-start: calc(100% + 8px); inset-inline-end: 0;
+  inline-size: min(340px, calc(100vw - 32px));
+  padding: 14px 16px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  animation: drives-in var(--motion-enter) var(--ease-enter);
+}
+@keyframes drives-in { from { opacity: 0; transform: translateY(-4px); } }
+.drives-title { margin: 0 0 8px; font: 600 14px/1.4 var(--font-display); color: var(--text-primary); }
+.drives-list { margin: 4px 0 0; padding: 0; list-style: none; border-block-start: 1px solid var(--border); }
+.drives-row {
+  display: flex; align-items: center; gap: 10px;
+  padding-block: 6px; cursor: pointer; color: var(--text-primary);
+}
+.drives-row input { margin: 0; accent-color: var(--accent); inline-size: 16px; block-size: 16px; }
+.drives-row.disabled { cursor: default; color: var(--text-secondary); }
+.drives-whole { font-weight: 500; }
+.drives-name { font: 500 13px/1.4 var(--font-mono); min-inline-size: 2.5em; }
+.drives-detail { color: var(--text-secondary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drives-note { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
+.drives-note[role="alert"] { color: var(--danger); }
+.drives-actions { display: flex; justify-content: flex-end; gap: 8px; margin-block-start: 12px; }
+.drives-actions .btn-secondary { margin-block-start: 0; }
 
 /* ---- Hint bar ---- */
 .hints {
@@ -301,3 +356,34 @@ kbd {
 .status-end { margin-inline-start: auto; display: inline-flex; align-items: center; gap: 12px; }
 .notice { color: var(--accent); }
 .elapsed { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.index-roots { color: var(--text-muted); }
+
+/* ---- Quick-search popup (design §9.1) ----
+   A frameless, transparent window sized to .quick-frame (see lib/window.ts): the rounded panel
+   plus a margin for its shadow. Margins must match MAX_LOGICAL_HEIGHT in src-tauri/src/popup.rs
+   and the window size in tauri.conf.json (720 + 2 × 28 = 776 wide; 24 + 520 + 52 tall at most). */
+html.quick, html.quick body { background: transparent; overflow: hidden; }
+html.quick, html.quick body, html.quick #root { block-size: auto; }
+.quick-frame {
+  inline-size: 776px;
+  margin-inline: auto;
+  padding-block: 24px 52px; padding-inline: 28px;
+}
+.quick-panel {
+  inline-size: 720px;
+  max-block-size: 520px;
+}
+/* The list is absolutely positioned, so give the area the height of its rows; the panel's
+   max height then shrinks it and the list scrolls. Empty / no-results states size themselves. */
+.quick-panel .results-area {
+  flex: 0 1 auto;
+  block-size: calc(var(--rows, 0) * 44px);
+}
+.quick-panel .results-area:has(> .state) { block-size: auto; }
+.quick-panel .state { padding-block: 24px; }
+.quick-notice {
+  flex: none; margin: 0;
+  padding-inline: 16px;
+  color: var(--accent); font-size: 12px;
+}
+.quick-notice:not(:empty) { padding-block: 6px; border-block-start: 1px solid var(--border); }

@@ -57,6 +57,27 @@ export interface SearchResponse {
   cancelled: boolean;
 }
 
+export type VolumeKind = "fixed" | "removable" | "network" | "unknown";
+
+/** A drive of this computer (`list_volumes`). */
+export interface Volume {
+  /** Root folder, e.g. "C:\\" or "/media/usb". */
+  path: string;
+  /** Short name: "C:" on Windows, the path elsewhere. */
+  name: string;
+  /** Volume label ("Data"), if any. */
+  label: string | null;
+  kind: VolumeKind;
+}
+
+/** The indexed-roots setting (`get_index_roots` / `set_index_roots`). */
+export interface IndexRoots {
+  /** "Whole computer": every fixed drive, re-resolved at each start. */
+  wholeComputer: boolean;
+  /** The folders indexed under that choice now. */
+  roots: string[];
+}
+
 export interface AppInfo {
   name: string;
   version: string;
@@ -67,7 +88,12 @@ export interface Commands {
   app_info: [undefined, AppInfo];
   index_status: [undefined, IndexStatus];
   start_indexing: [{ roots?: string[] }, void];
-  search: [{ query: string; limit: number; requestId: number }, SearchResponse];
+  list_volumes: [undefined, Volume[]];
+  get_index_roots: [undefined, IndexRoots];
+  /** `roots: null` = whole computer. */
+  set_index_roots: [{ roots: string[] | null }, IndexRoots];
+  /** `scope`: a root from `IndexStatus.roots` (e.g. "D:\\") to search only there; null = everywhere. */
+  search: [{ query: string; limit: number; requestId: number; scope: string | null }, SearchResponse];
   open_entry: [{ id: number }, void];
   reveal_entry: [{ id: number }, void];
   entry_path: [{ id: number }, string];
@@ -106,7 +132,11 @@ export const api = {
   appInfo: () => call("app_info"),
   indexStatus: () => call("index_status"),
   startIndexing: (roots?: string[]) => call("start_indexing", roots ? { roots } : {}),
-  search: (query: string, limit: number, requestId: number) => call("search", { query, limit, requestId }),
+  listVolumes: () => call("list_volumes"),
+  getIndexRoots: () => call("get_index_roots"),
+  setIndexRoots: (roots: string[] | null) => call("set_index_roots", { roots }),
+  search: (query: string, limit: number, requestId: number, scope: string | null = null) =>
+    call("search", { query, limit, requestId, scope }),
   openEntry: (id: number) => call("open_entry", { id }),
   revealEntry: (id: number) => call("reveal_entry", { id }),
   entryPath: (id: number) => call("entry_path", { id }),

@@ -409,6 +409,19 @@ impl FileIndex {
     /// results are found. `cancel` is polled regularly; when it becomes `true` the search
     /// returns [`Error::Cancelled`], so the UI can drop a query superseded by a newer keystroke.
     pub fn search(&self, query: &Query, limit: usize, cancel: &AtomicBool) -> Result<Vec<EntryId>> {
+        self.search_masked(query, limit, cancel, None)
+    }
+
+    /// [`FileIndex::search`] that skips every id whose bit is set in `mask` (bit `id % 64` of
+    /// word `id / 64`; missing words count as clear). Used by the live layer for removed base
+    /// entries and for the delta's ancestor copies.
+    pub(crate) fn search_masked(
+        &self,
+        query: &Query,
+        limit: usize,
+        cancel: &AtomicBool,
+        mask: Option<&[u64]>,
+    ) -> Result<Vec<EntryId>> {
         let n = self.len();
         let mut out = Vec::new();
         if limit == 0 {
@@ -430,7 +443,10 @@ impl FileIndex {
             let last = (first + wave).min(chunks);
             let parts: Vec<Option<Vec<EntryId>>> = (first..last)
                 .into_par_iter()
-                .map(|c| self.scan(c * CHUNK, ((c + 1) * CHUNK).min(n), query, limit, cancel))
+                .map(|c| {
+                    let end = ((c + 1) * CHUNK).min(n);
+                    self.scan(c * CHUNK, end, query, limit, cancel, mask)
+                })
                 .collect();
             for part in parts {
                 out.extend(part.ok_or(Error::Cancelled)?);
@@ -466,6 +482,7 @@ impl FileIndex {
         query: &Query,
         limit: usize,
         cancel: &AtomicBool,
+        mask: Option<&[u64]>,
     ) -> Option<Vec<EntryId>> {
         let arena = &self.normalized;
         let text = arena.text.as_str();
@@ -489,7 +506,7 @@ impl FileIndex {
                 Plan::Names(terms) => terms.iter().all(|t| t.matches(name)),
                 Plan::Tree(node) => node.eval(&Entry { ix: self, id, name }, &mut scratch),
             };
-            if hit {
+            if hit && !mask.is_some_and(|m| bit_is_set(m, id)) {
                 hits.push(id);
                 if hits.len() >= limit {
                     break;
@@ -499,6 +516,14 @@ impl FileIndex {
         }
         Some(hits)
     }
+}
+
+/// Bit `id` of a bitset stored as `u64` words; ids beyond the words are clear.
+#[inline]
+pub(crate) fn bit_is_set(words: &[u64], id: EntryId) -> bool {
+    words
+        .get(id as usize / 64)
+        .is_some_and(|w| w & (1 << (id % 64)) != 0)
 }
 
 #[cfg(test)]

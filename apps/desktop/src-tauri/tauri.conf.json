@@ -12,12 +12,31 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Athrix",
         "width": 1100,
         "height": 720,
         "minWidth": 640,
         "minHeight": 420,
         "center": true
+      },
+      {
+        "label": "quick",
+        "title": "Athrix",
+        "url": "index.html",
+        "width": 776,
+        "height": 596,
+        "center": true,
+        "visible": false,
+        "focus": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false
       }
     ],
     "security": {

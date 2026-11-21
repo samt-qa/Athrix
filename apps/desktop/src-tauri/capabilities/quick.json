@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "quick-search",
+  "description": "Extra window permissions for the quick-search popup: it sizes itself to its content and hides itself (Esc, after opening a result).",
+  "windows": ["quick"],
+  "permissions": [
+    "core:window:allow-set-size",
+    "core:window:allow-hide"
+  ]
+}
