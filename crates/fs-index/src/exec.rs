@@ -14,10 +14,20 @@
 //! | `infolder:x` (`مجلد:`) | Like `parent:`, for any ancestor folder (the entry is somewhere under it). |
 //! | `case:Word` | Case-sensitive substring of the **original** name (no normalization). |
 //! | `ww:word` | `word` (normalized) appears in the name as whole words, bounded by the name's start/end or a separator. |
+//! | `fuzzy:word` | Fuzzy match of `word` on the normalized name: substring, acronym (`mrs` → `Monthly Report Summary`), typos (`reprot` → `report`) or subsequence (`rprt` → `report`); see `fuzzy.rs`. Results are ranked best first. |
+//! | `fuzzy:` alone | A switch: every plain word of the query (not quoted, no wildcards or `^`/`$` anchors, not a filter value) is matched like `fuzzy:word`, so `fuzzy: rprt 2026` = `fuzzy:rprt fuzzy:2026`. Cannot be negated. |
 //!
-//! Rejected with [`QueryError::Unsupported`]: `content:`, `sem:`/`~`, `regex:`, `fuzzy:`,
-//! `dupe:`, `similar:`, `tag:`, `dc:`, `da:` (the index stores only the modification time),
-//! and `case:`/`ww:` written without a value (as global switches).
+//! Rejected with [`QueryError::Unsupported`]: `content:`, `sem:`/`~` (`~` is the semantic
+//! prefix, not fuzzy), `regex:`, `dupe:`, `similar:`, `tag:`, `dc:`, `da:` (the index stores
+//! only the modification time), `case:`/`ww:` written without a value (as global switches),
+//! and a negated `fuzzy:` switch.
+//!
+//! # Ranking
+//!
+//! A query with a fuzzy term outside a NOT is *ranked*: every match gets a score (an AND adds
+//! its children's scores, an OR takes its best matching child, other nodes score 0) and results
+//! come back best first, ties in index order. A ranked search scans the whole index (no early
+//! stop at `limit`). Queries without fuzzy terms keep index order and the early stop.
 //!
 //! # Paths
 //!
@@ -45,6 +55,7 @@ use std::collections::HashMap;
 
 use memchr::memmem;
 
+use crate::fuzzy::{FuzzyBuf, FuzzyMatcher};
 use crate::index::{EntryId, FileIndex};
 use crate::search::{
     NameMatcher, QueryError, Segment, compile_glob, compile_phrase, compile_term, glob_match,
@@ -111,6 +122,8 @@ pub(crate) enum Node {
     CaseSensitive(Box<memmem::Finder<'static>>),
     /// `ww:` whole-word occurrence in the normalized name.
     WholeWord(Box<memmem::Finder<'static>>),
+    /// `fuzzy:` (or a word under the `fuzzy:` switch) on the normalized name.
+    Fuzzy(Box<FuzzyMatcher>),
     /// `ext:` lower-cased extensions.
     Ext(Box<[Box<str>]>),
     /// `type:` sorted union of the kinds' extensions, plus whether folders match.
@@ -153,6 +166,7 @@ pub(crate) fn compile(e: &Expr, clock: &Clock) -> Result<Node, QueryError> {
         clock: *clock,
         buf: String::new(),
         slots: 0,
+        fuzzy_all: fuzzy_switch(e, false)?,
     };
     compile_expr(e, &mut cx)
 }
@@ -162,10 +176,57 @@ struct Compiler {
     buf: String,
     /// Memo slots handed out to `parent:`/`infolder:` nodes.
     slots: usize,
+    /// A `fuzzy:` switch is present: plain words become fuzzy terms.
+    fuzzy_all: bool,
+}
+
+/// True if `e` contains a valueless `fuzzy:` switch; an error if one is negated.
+fn fuzzy_switch(e: &Expr, negated: bool) -> Result<bool, QueryError> {
+    Ok(match &e.kind {
+        ExprKind::Filter(f) if f.name == FilterName::Fuzzy && f.value == FilterValue::None => {
+            if negated {
+                return Err(unsupported(
+                    f,
+                    e,
+                    "`fuzzy:` as a switch cannot be negated; remove the `!`/`-`",
+                ));
+            }
+            true
+        }
+        ExprKind::Term(_) | ExprKind::Filter(_) => false,
+        ExprKind::Not(x) => fuzzy_switch(x, true)?,
+        ExprKind::Group(x) => fuzzy_switch(x, negated)?,
+        ExprKind::And(xs) | ExprKind::Or(xs) => {
+            let mut any = false;
+            for x in xs {
+                any |= fuzzy_switch(x, negated)?;
+            }
+            any
+        }
+    })
+}
+
+/// A fuzzy node for `text`, or `Const(true)` if it normalizes to nothing.
+fn fuzzy_node(text: &str, buf: &mut String) -> Node {
+    athrix_text_ar::normalize_name_into(text, buf);
+    if buf.is_empty() {
+        Node::Const(true)
+    } else {
+        Node::Fuzzy(Box::new(FuzzyMatcher::new(buf)))
+    }
 }
 
 fn compile_expr(e: &Expr, cx: &mut Compiler) -> Result<Node, QueryError> {
     Ok(match &e.kind {
+        ExprKind::Term(t)
+            if cx.fuzzy_all
+                && !t.quoted
+                && !is_wildcard(&t.text)
+                && !t.text.starts_with('^')
+                && !t.text.ends_with('$') =>
+        {
+            fuzzy_node(&t.text, &mut cx.buf)
+        }
         ExprKind::Term(t) => {
             let m = if t.quoted {
                 compile_phrase(&t.text, &mut cx.buf)
@@ -305,6 +366,9 @@ fn compile_filter(f: &Filter, e: &Expr, cx: &mut Compiler) -> Result<Node, Query
                 Node::WholeWord(finder(buf))
             }
         }
+        (FilterName::Fuzzy, FilterValue::Text(t)) => fuzzy_node(t, buf),
+        // The switch itself (see `fuzzy_switch`) matches everything.
+        (FilterName::Fuzzy, FilterValue::None) => Node::Const(true),
         (FilterName::Case | FilterName::WholeWord, FilterValue::None) => {
             return Err(unsupported(
                 f,
@@ -319,13 +383,14 @@ fn compile_filter(f: &Filter, e: &Expr, cx: &mut Compiler) -> Result<Node, Query
         (FilterName::Ext | FilterName::Type | FilterName::Size, _)
         | (FilterName::DateModified | FilterName::Path, _)
         | (FilterName::Parent | FilterName::InFolder, _)
-        | (FilterName::Case | FilterName::WholeWord, _) => return Err(bad_value()),
+        | (FilterName::Case | FilterName::WholeWord | FilterName::Fuzzy, _) => {
+            return Err(bad_value());
+        }
         (FilterName::DateCreated, _) => return Err(not_yet("creation date")),
         (FilterName::DateAccessed, _) => return Err(not_yet("access date")),
         (FilterName::Content, _) => return Err(not_yet("file contents")),
         (FilterName::Semantic, _) => return Err(not_yet("semantic search")),
         (FilterName::Regex, _) => return Err(not_yet("regular expressions")),
-        (FilterName::Fuzzy, _) => return Err(not_yet("fuzzy matching")),
         (FilterName::Dupe, _) => return Err(not_yet("duplicates")),
         (FilterName::Similar, _) => return Err(not_yet("similar files")),
         (FilterName::Tag, _) => return Err(not_yet("tags")),
@@ -475,6 +540,8 @@ pub(crate) struct Scratch {
     memo: Vec<Option<bool>>,
     /// Per `infolder:` slot: directory -> "this directory or an ancestor matches".
     dir_memo: Vec<HashMap<EntryId, bool>>,
+    /// Buffers of the fuzzy matcher.
+    fuzzy: FuzzyBuf,
 }
 
 impl Scratch {
@@ -643,6 +710,7 @@ impl Node {
             Node::Const(_) => 0,
             Node::Name(_) | Node::CaseSensitive(_) | Node::WholeWord(_) => 1,
             Node::Ext(_) | Node::Kind { .. } | Node::Size { .. } | Node::Modified { .. } => 2,
+            Node::Fuzzy(_) => 3,
             Node::Path(_) | Node::Parent(..) | Node::InFolder(..) => 5,
             Node::Not(x) => x.cost(),
             Node::And(xs) | Node::Or(xs) => xs.iter().map(Node::cost).max().unwrap_or(0),
@@ -655,6 +723,7 @@ impl Node {
             Node::Name(m) => m.matches(e.name),
             Node::CaseSensitive(f) => f.find(e.ix.name(e.id).as_bytes()).is_some(),
             Node::WholeWord(f) => find_words(e.name, f, None),
+            Node::Fuzzy(m) => m.score(e.name, e.ix.name(e.id), &mut s.fuzzy).is_some(),
             Node::Ext(exts) => {
                 if e.ix.meta(e.id).is_dir {
                     return false;
@@ -701,6 +770,46 @@ impl Node {
             Node::Not(x) => !x.eval(e, s),
             Node::And(xs) => xs.iter().all(|x| x.eval(e, s)),
             Node::Or(xs) => xs.iter().any(|x| x.eval(e, s)),
+        }
+    }
+
+    /// True if the node has a fuzzy term outside a NOT (its results are ranked).
+    pub(crate) fn is_ranked(&self) -> bool {
+        match self {
+            Node::Fuzzy(_) => true,
+            Node::And(xs) | Node::Or(xs) => xs.iter().any(Node::is_ranked),
+            _ => false,
+        }
+    }
+
+    /// The score of an entry that matches (see the module docs, "Ranking"). Only meaningful
+    /// when [`Node::eval`] returned true for the entry.
+    pub(crate) fn score(&self, e: &Entry<'_>, s: &mut Scratch) -> u32 {
+        match self {
+            Node::Fuzzy(m) => m.score(e.name, e.ix.name(e.id), &mut s.fuzzy).unwrap_or(0),
+            Node::And(xs) => xs
+                .iter()
+                .filter(|x| x.is_ranked())
+                .fold(0u32, |acc, x| acc.saturating_add(x.score(e, s))),
+            Node::Or(xs) => {
+                let mut best = 0;
+                for x in xs.iter().filter(|x| x.is_ranked()) {
+                    if x.eval(e, s) {
+                        best = best.max(x.score(e, s));
+                    }
+                }
+                best
+            }
+            _ => 0,
+        }
+    }
+
+    /// Calls `f` with every fuzzy matcher outside a NOT.
+    pub(crate) fn for_each_fuzzy(&self, f: &mut impl FnMut(&FuzzyMatcher)) {
+        match self {
+            Node::Fuzzy(m) => f(m),
+            Node::And(xs) | Node::Or(xs) => xs.iter().for_each(|x| x.for_each_fuzzy(f)),
+            _ => {}
         }
     }
 }

@@ -373,7 +373,7 @@ fn unsupported_filters_are_typed_errors() {
         ("sem:rental contract", FilterName::Semantic),
         ("~rental contract", FilterName::Semantic),
         ("regex:^a.*b$", FilterName::Regex),
-        ("fuzzy:reprot", FilterName::Fuzzy),
+        ("!fuzzy: report", FilterName::Fuzzy),
         ("dupe:", FilterName::Dupe),
         ("similar:a.jpg", FilterName::Similar),
         ("tag:work", FilterName::Tag),
@@ -399,4 +399,143 @@ fn system_clock_parse_works() {
     let q = Query::parse("dm:today | ext:rs").unwrap();
     let hits = ix.search(&q, 10, &AtomicBool::new(false)).unwrap();
     assert!(hits.iter().any(|&id| ix.name(id) == "main.rs"));
+}
+
+/// A flat index of files under one root, for the fuzzy tests.
+fn flat(names: &[&str]) -> FileIndex {
+    let mut b = IndexBuilder::new();
+    let root = b.push(None, "/r", dir());
+    for n in names {
+        b.push(Some(root), n, file(1, None));
+    }
+    b.finish()
+}
+
+fn ranked(ix: &FileIndex, text: &str, limit: usize) -> Vec<String> {
+    let q = compile(text);
+    assert!(q.is_ranked(), "{text}");
+    ix.search(&q, limit, &AtomicBool::new(false))
+        .unwrap()
+        .into_iter()
+        .map(|id| ix.name(id).to_owned())
+        .collect()
+}
+
+#[test]
+fn fuzzy_terms_are_ranked_best_first() {
+    let ix = flat(&[
+        "rxpxrxt.txt",
+        "Monthly Report Summary.pdf",
+        "my report.pdf",
+        "report.pdf",
+        "unrelated.doc",
+        "reprot draft.docx",
+        "report 2026.pdf",
+    ]);
+    assert_eq!(
+        ranked(&ix, "fuzzy:report", usize::MAX),
+        [
+            "report.pdf",
+            "report 2026.pdf",
+            "my report.pdf",
+            "Monthly Report Summary.pdf",
+            "reprot draft.docx",
+        ]
+    );
+    // Limit keeps the best ones.
+    assert_eq!(
+        ranked(&ix, "fuzzy:report", 2),
+        ["report.pdf", "report 2026.pdf"]
+    );
+    assert_eq!(
+        ranked(&ix, "fuzzy:rprt", usize::MAX),
+        [
+            "report.pdf",
+            "my report.pdf",
+            "report 2026.pdf",
+            "reprot draft.docx",
+            "Monthly Report Summary.pdf",
+            "rxpxrxt.txt",
+        ]
+    );
+    assert_eq!(
+        ranked(&ix, "fuzzy:mrs", usize::MAX),
+        ["Monthly Report Summary.pdf"]
+    );
+    // Combined with filters: plain filters do not change the order.
+    assert_eq!(
+        ranked(&ix, "fuzzy:rprt ext:pdf !my", usize::MAX),
+        [
+            "report.pdf",
+            "report 2026.pdf",
+            "Monthly Report Summary.pdf"
+        ]
+    );
+    // Unranked queries keep index order.
+    assert!(!compile("report").is_ranked());
+    assert!(!compile("!fuzzy:report").is_ranked());
+}
+
+#[test]
+fn fuzzy_switch_makes_plain_words_fuzzy() {
+    let ix = flat(&[
+        "تقرير المبيعات السنوي.xlsx",
+        "تقرير_2026.pdf",
+        "MyTravelReport.docx",
+        "notes.txt",
+    ]);
+    assert_eq!(
+        ranked(&ix, "fuzzy: تمس", 10),
+        ["تقرير المبيعات السنوي.xlsx"]
+    );
+    assert_eq!(
+        ranked(&ix, "تمس fuzzy:", 10),
+        ["تقرير المبيعات السنوي.xlsx"]
+    );
+    assert_eq!(ranked(&ix, "fuzzy: mtr", 10), ["MyTravelReport.docx"]);
+    // Two fuzzy words are ANDed.
+    assert_eq!(ranked(&ix, "fuzzy: تقرر 2026", 10), ["تقرير_2026.pdf"]);
+    // Quoted phrases and anchored words stay exact.
+    let quoted = compile("fuzzy: \"mtr\" ^my");
+    assert!(!quoted.is_ranked());
+    assert!(
+        ix.search(&quoted, 10, &AtomicBool::new(false))
+            .unwrap()
+            .is_empty()
+    );
+    // `fuzzy:` alone matches everything.
+    assert_eq!(
+        ix.search(&compile("fuzzy:"), 10, &AtomicBool::new(false))
+            .unwrap()
+            .len(),
+        ix.len()
+    );
+}
+
+#[test]
+fn fuzzy_scores_and_highlights() {
+    let ix = flat(&["report.pdf", "Monthly Report Summary.pdf", "notes.txt"]);
+    let q = compile("fuzzy:mrs | fuzzy:report");
+    let score = |name: &str| {
+        let id = (0..ix.len() as EntryId)
+            .find(|&i| ix.name(i) == name)
+            .unwrap();
+        ix.score(&q, id)
+    };
+    assert!(score("report.pdf") > score("Monthly Report Summary.pdf"));
+    assert_eq!(score("notes.txt"), None);
+    let lit = |name: &str| -> Vec<String> {
+        q.fuzzy_highlights(name)
+            .into_iter()
+            .map(|r| name[r].to_owned())
+            .collect()
+    };
+    // Both terms match: the acronym initials and the substring, merged.
+    assert_eq!(lit("Monthly Report Summary.pdf"), ["M", "Report", "S"]);
+    assert_eq!(lit("report.pdf"), ["report"]);
+    assert!(lit("notes.txt").is_empty());
+    assert!(compile("report").fuzzy_highlights("report.pdf").is_empty());
+    // An unranked query scores every match 0.
+    let plain = compile("report");
+    assert_eq!(ix.score(&plain, 1), Some(0));
 }

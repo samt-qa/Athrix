@@ -10,7 +10,7 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::indexing::{LiveIndex, SnapshotStore, StatusListener};
+use crate::indexing::{IndexView, Indexer, SnapshotStore, StatusListener};
 use crate::model::{IndexState, IndexStatus, QueryError, ResultItem, SearchResponse};
 use crate::query::compile_query;
 use crate::results::{SearchFailure, SearchScope, decode_id, run_search};
@@ -21,13 +21,15 @@ use crate::roots::{
 use crate::state::AppState;
 use crate::volumes::{self, Volume};
 
-/// Error returned for a result id from an index that is no longer current.
+/// Error returned for a result id from an index view that is no longer kept (see
+/// [`crate::indexing::RECENT_VIEWS`]).
 pub const STALE_ID_ERROR: &str = "this result is out of date; search again";
 
 /// Folder under the app data dir holding the index snapshot.
 pub const SNAPSHOT_DIR: &str = "index";
 
-/// Event carrying an [`IndexStatus`] on every indexing state change.
+/// Event carrying an [`IndexStatus`] on every indexing state change, and (at most once per
+/// [`crate::indexing::LIVE_STATUS_INTERVAL`]) when watched changes alter the entry count.
 pub const STATUS_EVENT: &str = "index://status";
 
 /// Upper bound for `search`'s `limit`, whatever the UI asks.
@@ -231,7 +233,7 @@ enum SearchOutcome {
 
 /// The blocking part of `search`: parse, run, build items.
 fn execute_search(
-    index: Option<Arc<LiveIndex>>,
+    index: Option<Arc<IndexView>>,
     text: &str,
     limit: usize,
     scope: Option<&SearchScope>,
@@ -263,7 +265,7 @@ fn execute_search(
 /// Opens the entry with the system's default program.
 #[tauri::command]
 pub async fn open_entry(app: AppHandle, state: State<'_, AppState>, id: u64) -> Result<(), String> {
-    let path = resolve(state.indexer.index(), id)?;
+    let path = resolve(&state.indexer, id)?;
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))
@@ -276,7 +278,7 @@ pub async fn reveal_entry(
     state: State<'_, AppState>,
     id: u64,
 ) -> Result<(), String> {
-    let path = resolve(state.indexer.index(), id)?;
+    let path = resolve(&state.indexer, id)?;
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("cannot reveal {}: {e}", path.display()))
@@ -285,19 +287,22 @@ pub async fn reveal_entry(
 /// The entry's full path, for copying to the clipboard.
 #[tauri::command]
 pub fn entry_path(state: State<'_, AppState>, id: u64) -> Result<String, String> {
-    resolve(state.indexer.index(), id).map(|p| p.to_string_lossy().into_owned())
+    resolve(&state.indexer, id).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Resolves a result id to its path on the Rust side (the UI never sends paths). An id from
-/// an older index generation is rejected with [`STALE_ID_ERROR`], never resolved against the
-/// current index.
-fn resolve(index: Option<Arc<LiveIndex>>, id: u64) -> Result<PathBuf, String> {
-    let index = index.ok_or_else(|| "the index is not ready yet".to_owned())?;
-    let (generation, entry) = decode_id(id).ok_or_else(|| format!("invalid result id {id}"))?;
-    if generation != index.generation() || (entry as usize) >= index.len() {
-        return Err(STALE_ID_ERROR.to_owned());
+/// Resolves a result id to its path on the Rust side (the UI never sends paths), with the
+/// view of the id's generation (the current one or one of the few before it, see
+/// [`crate::indexing::RECENT_VIEWS`]). An id whose view is gone is rejected with
+/// [`STALE_ID_ERROR`], never resolved against another view.
+fn resolve(indexer: &Indexer, id: u64) -> Result<PathBuf, String> {
+    if indexer.index().is_none() {
+        return Err("the index is not ready yet".to_owned());
     }
-    Ok(index.path(entry))
+    let (generation, entry) = decode_id(id).ok_or_else(|| format!("invalid result id {id}"))?;
+    match indexer.view(generation) {
+        Some(view) if view.has_entry(entry) => Ok(view.path(entry)),
+        _ => Err(STALE_ID_ERROR.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -306,12 +311,8 @@ mod tests {
     use crate::results::encode_id;
     use athrix_fs_index::{EntryMeta, FileIndex, IndexBuilder};
 
-    fn sample() -> Arc<LiveIndex> {
-        sample_gen(3)
-    }
-
-    fn sample_gen(generation: u32) -> Arc<LiveIndex> {
-        Arc::new(LiveIndex::new(generation, sample_index()))
+    fn sample() -> Arc<IndexView> {
+        Arc::new(IndexView::from_index(3, sample_index()))
     }
 
     fn sample_index() -> FileIndex {
@@ -326,6 +327,16 @@ mod tests {
         );
         b.push(Some(root), "فاتورة ١٢٣.pdf", EntryMeta::default());
         b.finish()
+    }
+
+    /// An indexer whose current view (generation 1) is the sample index.
+    fn indexer() -> Arc<Indexer> {
+        let indexer = Arc::new(Indexer::new());
+        let view = indexer
+            .install(sample_index(), &[PathBuf::from("/data")])
+            .unwrap();
+        assert_eq!(view.generation(), 1);
+        indexer
     }
 
     #[test]
@@ -372,44 +383,36 @@ mod tests {
 
     #[test]
     fn resolve_accepts_current_ids_and_rejects_stale_ones() {
-        let ix = sample();
+        assert!(
+            resolve(&Indexer::new(), 0)
+                .unwrap_err()
+                .contains("not ready")
+        );
+        let ix = indexer();
         let expected: PathBuf = ["/data", "فاتورة ١٢٣.pdf"].iter().collect();
-        assert_eq!(
-            resolve(Some(Arc::clone(&ix)), encode_id(3, 1)).unwrap(),
-            expected
-        );
-        // Same entry number, older generation: rejected, not resolved to another file.
-        assert_eq!(
-            resolve(Some(Arc::clone(&ix)), encode_id(2, 1)).unwrap_err(),
-            STALE_ID_ERROR
-        );
+        assert_eq!(resolve(&ix, encode_id(1, 1)).unwrap(), expected);
+        // Same entry number, unknown generation: rejected, not resolved to another file.
+        assert_eq!(resolve(&ix, encode_id(2, 1)).unwrap_err(), STALE_ID_ERROR);
         // A raw entry index (generation 0) from before generations is stale too.
-        assert_eq!(
-            resolve(Some(Arc::clone(&ix)), 1).unwrap_err(),
-            STALE_ID_ERROR
-        );
+        assert_eq!(resolve(&ix, 1).unwrap_err(), STALE_ID_ERROR);
         // Current generation, entry out of range.
-        assert_eq!(
-            resolve(Some(Arc::clone(&ix)), encode_id(3, 2)).unwrap_err(),
-            STALE_ID_ERROR
-        );
-        assert!(resolve(Some(ix), u64::MAX).unwrap_err().contains("invalid"));
-        assert!(resolve(None, 0).unwrap_err().contains("not ready"));
+        assert_eq!(resolve(&ix, encode_id(1, 2)).unwrap_err(), STALE_ID_ERROR);
+        assert!(resolve(&ix, u64::MAX).unwrap_err().contains("invalid"));
     }
 
     #[test]
     fn an_id_from_a_search_is_rejected_after_a_reindex() {
+        let ix = indexer();
         let no = AtomicBool::new(false);
-        let SearchOutcome::Hits { items, .. } =
-            execute_search(Some(sample_gen(1)), "فاتورة", 10, None, &no)
+        let SearchOutcome::Hits { items, .. } = execute_search(ix.index(), "فاتورة", 10, None, &no)
         else {
             panic!("expected hits");
         };
         let id = items[0].id;
-        assert!(resolve(Some(sample_gen(1)), id).is_ok());
-        assert_eq!(
-            resolve(Some(sample_gen(2)), id).unwrap_err(),
-            STALE_ID_ERROR
-        );
+        assert!(resolve(&ix, id).is_ok());
+        // A new walk (new base) makes every earlier id stale.
+        ix.install(sample_index(), &[PathBuf::from("/data")])
+            .unwrap();
+        assert_eq!(resolve(&ix, id).unwrap_err(), STALE_ID_ERROR);
     }
 }

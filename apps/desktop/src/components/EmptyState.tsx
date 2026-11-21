@@ -3,8 +3,12 @@ import { t, type MessageKey } from "../i18n";
 
 const EXAMPLES = [1, 2, 3, 4] as const;
 
-/** No query yet (design §9.3 "empty state"): a friendly line plus clickable example queries. */
-export function EmptyState(props: { onExample: (query: string) => void }) {
+/**
+ * No query yet (design §9.3 "empty state"): a friendly line plus clickable example queries.
+ * `compact` (the quick-search popup): a single hint line, so the popup stays small.
+ */
+export function EmptyState(props: { onExample: (query: string) => void; compact?: boolean }) {
+  if (props.compact) return <p class="state-hint">{t("empty.quickHint")}</p>;
   return (
     <div class="state">
       <svg class="state-art" width="56" height="56" viewBox="0 0 56 56" fill="none" stroke="currentColor"

@@ -23,6 +23,11 @@
 //! | `regex:` `case:` `ww:` `fuzzy:` | match modes (`case:` etc. may stand alone as a switch) |
 //! | `dupe:` `similar:` `tag:` | duplicates, similar files, tags |
 //!
+//! `fuzzy:word` is a typo/acronym-tolerant name match (`fuzzy:rprt`, `fuzzy:mrs` for
+//! "Monthly Report Summary"); `fuzzy:` alone is a switch that makes every plain word fuzzy.
+//! Note that `~` is the **semantic** prefix (like `sem:`), not fuzzy. The parser only records
+//! these; the name index (`athrix-fs-index`) gives them meaning.
+//!
 //! Precedence: NOT binds tightest, then AND, then OR, so `a b | c` is `(a AND b) OR c`.
 //! (Note: Everything itself binds OR tighter than AND; Athrix follows the conventional order.)
 //!

@@ -67,8 +67,9 @@ body {
 }
 
 /* ---- SearchBar ---- */
+/* Wraps the bar and its suggestions list (which drops over the content below it). */
+.search-wrap { flex: none; position: relative; z-index: 2; }
 .search {
-  flex: none;
   display: flex; align-items: center; gap: 12px;
   block-size: 64px; padding-inline: 20px;
   border-block-end: 1px solid var(--border);
@@ -83,30 +84,78 @@ body {
 .scope-select { flex: none; }
 .scope-select .segmented-btn { padding-inline: 10px; white-space: nowrap; }
 .search-field { position: relative; flex: 1; min-inline-size: 0; block-size: 100%; }
+/* The input and the highlight layer must lay text out identically: same box, font and spacing. */
 .search input, .search-mirror {
   position: absolute; inset: 0;
   inline-size: 100%; block-size: 100%;
-  margin: 0; padding: 0;
+  margin: 0; padding: 0; border: 0;
   font: 400 18px/64px var(--font-ui);
   letter-spacing: normal; word-spacing: normal;
+  font-kerning: normal; font-variant-ligatures: normal;
 }
+/* The input keeps caret, selection and IME; its own text is transparent over the colored layer. */
 .search input {
-  border: 0; outline: 0; background: transparent;
-  color: var(--text-primary);
+  outline: 0; background: transparent;
+  color: transparent; caret-color: var(--text-primary);
 }
 .search input::placeholder { color: var(--text-muted); }
-/* Repeats the query with invisible text so the error span can be underlined in place. */
-.search-mirror {
+.search input::selection {
   color: transparent;
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+/* During an IME composition the input paints its own text (with the IME's underline). */
+.search-field.composing input { color: var(--text-primary); }
+.search-field.composing .search-mirror { visibility: hidden; }
+/* Highlight layer: the query again, split into colored spans; scrolled with the input. */
+.search-mirror {
+  color: var(--text-primary);
   white-space: pre; overflow: hidden;
-  pointer-events: none;
+  pointer-events: none; user-select: none;
   scrollbar-width: none;
 }
-.search-error-span {
+/* Token colors: color only (no weight or spacing), so glyphs keep the input's exact positions. */
+.tok-filter { color: var(--accent); }
+.tok-value { color: var(--info); }
+.tok-op { color: var(--warning); }
+.tok-wildcard { color: var(--warning); }
+.tok-phrase { color: var(--success); }
+.tok-error {
+  color: var(--danger);
   text-decoration: underline wavy var(--danger);
   text-decoration-thickness: 1.5px;
   text-underline-offset: 6px;
   text-decoration-skip-ink: none;
+}
+@media (forced-colors: active) {
+  /* System colors replace ours: show the input's own text and drop the layer. */
+  .search input { color: FieldText; }
+  .search-mirror { display: none; }
+}
+
+/* Autocomplete listbox under the field (starts under the text, after the search icon). */
+.suggest {
+  position: absolute; inset-block-start: calc(100% - 6px);
+  inset-inline-start: 44px;
+  min-inline-size: 280px; max-inline-size: min(460px, calc(100% - 64px));
+  max-block-size: 320px; overflow-y: auto;
+  margin: 0; padding: 4px; list-style: none;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+}
+.suggest-item {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+  padding-block: 6px; padding-inline: 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer; user-select: none;
+}
+.suggest-item[aria-selected="true"] { background: var(--bg-row-selected); }
+/* UI font, not mono: the mono font has no Arabic glyphs and its fallback spaces Arabic letters apart. */
+.suggest-label { font: 500 14px/20px var(--font-ui); white-space: nowrap; }
+.suggest-detail { font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (forced-colors: active) {
+  .suggest-item[aria-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
 }
 
 /* ProgressLine: 2px under the search bar, animated while indexing. */
@@ -273,6 +322,11 @@ mark.match {
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-primary:disabled { opacity: .5; cursor: default; }
 .btn-primary:focus-visible, .btn-secondary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
+/* The popup's compact empty state: one hint line. */
+.state-hint {
+  margin: 0; padding-block: 10px; padding-inline: 20px;
+  font-size: 13px; color: var(--text-secondary);
+}
 .state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
 .state-actions:empty { display: none; }
 
@@ -379,7 +433,14 @@ html.quick, html.quick body, html.quick #root { block-size: auto; }
   flex: 0 1 auto;
   block-size: calc(var(--rows, 0) * 44px);
 }
-.quick-panel .results-area:has(> .state) { block-size: auto; }
+.quick-panel .results-area:has(> .state, > .state-hint) { block-size: auto; }
+/* In the popup the suggestions push the content down instead of overlapping it: the window
+   grows to fit (an overlay would be clipped by the window when the panel is short). */
+.quick-panel .suggest {
+  position: static; margin-block: 6px; margin-inline: 16px;
+  max-inline-size: none; max-block-size: 240px;
+  box-shadow: none;
+}
 .quick-panel .state { padding-block: 24px; }
 .quick-notice {
   flex: none; margin: 0;

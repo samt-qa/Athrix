@@ -136,7 +136,9 @@ type State = ((), EntryMeta);
 /// Walks every root in `opts` in parallel and builds the name index.
 ///
 /// Entries that cannot be read (permission denied, vanished mid-walk, broken metadata) are
-/// skipped or kept without metadata, with a `tracing` warning; they never fail the walk.
+/// skipped or kept without metadata; they never fail the walk. Access-denied errors are
+/// expected on whole-drive walks (system folders), so they are logged at `debug` only; other
+/// errors at `warn`. One `info` line at the end reports how many folders could not be listed.
 /// A root that cannot be read is skipped the same way. Symlinks and junctions are indexed as
 /// entries but not followed unless [`WalkOptions::follow_links`] is set.
 ///
@@ -145,10 +147,26 @@ type State = ((), EntryMeta);
 pub fn walk(opts: &WalkOptions) -> Result<FileIndex> {
     let exclusions = Arc::new(Exclusions::new(opts)?);
     let mut builder = IndexBuilder::new();
+    let mut skipped = Skipped::default();
     for root in &opts.roots {
-        walk_root(root, opts.follow_links, &exclusions, &mut builder);
+        walk_root(
+            root,
+            opts.follow_links,
+            &exclusions,
+            &mut builder,
+            &mut skipped,
+        );
     }
-    Ok(builder.finish())
+    let index = builder.finish();
+    tracing::info!(
+        entries = index.len(),
+        skipped_folders = skipped.folders,
+        access_denied = skipped.access_denied,
+        "walk finished; {} folder(s) could not be listed ({} access denied)",
+        skipped.folders,
+        skipped.access_denied,
+    );
+    Ok(index)
 }
 
 /// The roots and exclusion rules of a [`WalkOptions`], compiled once and shared by the live
@@ -209,7 +227,21 @@ impl Scope {
     /// returned index has `dir` as its only root, named by its full path.
     pub(crate) fn walk_subtree(&self, dir: &Path) -> FileIndex {
         let mut builder = IndexBuilder::new();
-        walk_root(dir, self.follow_links, &self.exclusions, &mut builder);
+        let mut skipped = Skipped::default();
+        walk_root(
+            dir,
+            self.follow_links,
+            &self.exclusions,
+            &mut builder,
+            &mut skipped,
+        );
+        if skipped.folders > 0 {
+            tracing::debug!(
+                dir = %dir.display(),
+                skipped_folders = skipped.folders,
+                "subtree walk could not list some folders"
+            );
+        }
         builder.finish()
     }
 
@@ -269,9 +301,37 @@ fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
     match md {
         Ok(md) => Some(meta_from(&md)),
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
+            if is_access_denied(&e) {
+                tracing::debug!(path = %path.display(), error = %e, "cannot read metadata");
+            } else {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
+            }
             None
         }
+    }
+}
+
+/// Folders a walk could not list.
+#[derive(Debug, Default, Clone, Copy)]
+struct Skipped {
+    /// All folders whose children could not be read.
+    folders: usize,
+    /// Of those, the ones refused with "access denied".
+    access_denied: usize,
+}
+
+/// True for "access denied" / "permission denied", which whole-drive walks hit by the hundred
+/// (System Volume Information, other users' profiles...) and which are not worth a warning.
+fn is_access_denied(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Logs a jwalk error: `debug` for access denied, `warn` otherwise.
+fn log_entry_error(e: &jwalk::Error) {
+    if e.io_error().is_some_and(is_access_denied) {
+        tracing::debug!(error = %e, "skipping unreadable entry");
+    } else {
+        tracing::warn!(error = %e, "skipping unreadable entry");
     }
 }
 
@@ -280,6 +340,7 @@ fn walk_root(
     follow_links: bool,
     exclusions: &Arc<Exclusions>,
     builder: &mut IndexBuilder,
+    skipped: &mut Skipped,
 ) {
     let ex = Arc::clone(exclusions);
     let walker = WalkDirGeneric::<State>::new(root)
@@ -311,7 +372,7 @@ fn walk_root(
                     true
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "skipping unreadable entry");
+                    log_entry_error(e);
                     false
                 }
             });
@@ -324,12 +385,18 @@ fn walk_root(
         let entry = match item {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "skipping unreadable entry");
+                log_entry_error(&e);
                 continue;
             }
         };
         if let Some(err) = &entry.read_children_error {
-            tracing::warn!(path = %entry.path().display(), error = %err, "cannot list folder");
+            skipped.folders += 1;
+            if err.io_error().is_some_and(is_access_denied) {
+                skipped.access_denied += 1;
+                tracing::debug!(path = %entry.path().display(), error = %err, "cannot list folder");
+            } else {
+                tracing::warn!(path = %entry.path().display(), error = %err, "cannot list folder");
+            }
         }
         let depth = entry.depth;
         let id = if depth == 0 {

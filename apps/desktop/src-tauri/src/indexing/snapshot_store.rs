@@ -1,8 +1,8 @@
 //! Where the name-index snapshot lives on disk and which roots it covers (task 1.4).
 //!
 //! The store is a folder (in the app, `<app_data>/index`) holding two files:
-//! - `names.snap`: the [`FileIndex`] written by [`FileIndex::save`] (atomic, versioned,
-//!   CRC-checked);
+//! - `names.snap`: the live entries of an [`IndexSnapshot`], written by
+//!   [`IndexSnapshot::save`] in the [`FileIndex::save`] format (atomic, versioned, CRC-checked);
 //! - `names.roots.json`: a sidecar `{"version":1,"roots":[...]}` listing the walked roots.
 //!
 //! A snapshot is only used when the sidecar's roots equal the requested roots exactly (same
@@ -14,7 +14,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use athrix_fs_index::FileIndex;
+use athrix_fs_index::{FileIndex, IndexSnapshot};
 use serde::{Deserialize, Serialize};
 
 /// File name of the index snapshot inside the store folder.
@@ -94,8 +94,9 @@ impl SnapshotStore {
         }
     }
 
-    /// Saves `index` as the snapshot of `roots`. Errors are returned for logging only.
-    pub fn save(&self, index: &FileIndex, roots: &[PathBuf]) -> Result<(), String> {
+    /// Saves the live entries of `snapshot` (base and changes since) as the snapshot of
+    /// `roots`. Errors are returned for logging only.
+    pub fn save(&self, snapshot: &IndexSnapshot, roots: &[PathBuf]) -> Result<(), String> {
         fs::create_dir_all(&self.dir)
             .map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
         let roots_path = self.roots_path();
@@ -104,7 +105,7 @@ impl SnapshotStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot remove {}: {e}", roots_path.display())),
         }
-        index
+        snapshot
             .save(&self.snapshot_path())
             .map_err(|e| e.to_string())?;
         let sidecar = Sidecar {
@@ -139,9 +140,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexing::IndexView;
     use athrix_fs_index::{EntryMeta, IndexBuilder};
 
-    fn sample() -> FileIndex {
+    fn sample() -> IndexView {
+        IndexView::from_index(0, sample_index())
+    }
+
+    fn sample_index() -> FileIndex {
         let mut b = IndexBuilder::new();
         let root = b.push(None, "/data", EntryMeta::default());
         b.push(Some(root), "ملف.txt", EntryMeta::default());

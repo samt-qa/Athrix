@@ -140,7 +140,8 @@ pub enum FilterName {
     Case,
     /// `ww:` whole-word match.
     WholeWord,
-    /// `fuzzy:` fuzzy match.
+    /// `fuzzy:` fuzzy match (typos, acronyms, subsequences); valueless = switch for the whole
+    /// query. Not to be confused with `~`, which is [`FilterName::Semantic`].
     Fuzzy,
     /// `dupe:` duplicates.
     Dupe,

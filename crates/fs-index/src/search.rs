@@ -25,7 +25,9 @@
 //! cannot answer are rejected at compile time with [`QueryError::Unsupported`] instead of
 //! silently matching everything.
 //!
-//! Results come back in index (walk) order; ranking/sorting is a later task.
+//! Results come back in index (walk) order, except for queries with fuzzy terms (`fuzzy:`),
+//! which come back best first (see [`Query::is_ranked`] and `fuzzy.rs`). General ranking of
+//! plain results is a later task.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,6 +124,8 @@ impl From<QueryError> for Error {
 #[derive(Debug, Clone)]
 pub struct Query {
     plan: Plan,
+    /// The plan has fuzzy terms: results are scored and sorted.
+    ranked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -192,12 +196,43 @@ impl Query {
             }
             other => Plan::Tree(other),
         };
-        Ok(Query { plan })
+        let ranked = matches!(&plan, Plan::Tree(n) if n.is_ranked());
+        Ok(Query { plan, ranked })
     }
 
     /// True if the query matches every entry (empty query, or only terms such as `*`).
     pub fn is_empty(&self) -> bool {
         matches!(self.plan, Plan::All)
+    }
+
+    /// True if the query has fuzzy terms (`fuzzy:word` or the `fuzzy:` switch) outside a NOT.
+    /// Its results are then ordered best first by [`FileIndex::score`] (ties in index order)
+    /// instead of index order, and a search scans the whole index before returning.
+    pub fn is_ranked(&self) -> bool {
+        self.ranked
+    }
+
+    /// Highlight ranges for the fuzzy terms of the query in an ORIGINAL (displayed) name:
+    /// byte ranges of `name`, sorted and merged, covering the characters each fuzzy term
+    /// matched (the substring, the acronym's initials, the subsequence's letters or the
+    /// typo-matched part). Plain terms are not included (highlight those with
+    /// [`athrix_text_ar::find_in_name`]). Meant for the rows on screen; empty if the query has
+    /// no fuzzy terms or none matches `name`.
+    pub fn fuzzy_highlights(&self, name: &str) -> Vec<std::ops::Range<usize>> {
+        let Plan::Tree(node) = &self.plan else {
+            return Vec::new();
+        };
+        let mut ranges = Vec::new();
+        node.for_each_fuzzy(&mut |m| ranges.extend(m.highlights(name)));
+        ranges.sort_unstable_by_key(|r| (r.start, r.end));
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
     }
 
     /// Evaluates the query against a name alone. `normalized_name` must already be passed
@@ -403,13 +438,123 @@ pub(crate) fn glob_match(hay: &str, segs: &[Segment]) -> bool {
 }
 
 impl FileIndex {
-    /// Runs `query` and returns up to `limit` matching ids in index order.
+    /// Runs `query` and returns up to `limit` matching ids in index order, or best first for a
+    /// ranked query ([`Query::is_ranked`]).
     ///
     /// The scan runs in parallel (rayon) in waves of chunks and stops early once `limit`
-    /// results are found. `cancel` is polled regularly; when it becomes `true` the search
-    /// returns [`Error::Cancelled`], so the UI can drop a query superseded by a newer keystroke.
+    /// results are found (a ranked query scans everything and keeps the best `limit`).
+    /// `cancel` is polled regularly; when it becomes `true` the search returns
+    /// [`Error::Cancelled`], so the UI can drop a query superseded by a newer keystroke.
     pub fn search(&self, query: &Query, limit: usize, cancel: &AtomicBool) -> Result<Vec<EntryId>> {
         self.search_masked(query, limit, cancel, None)
+    }
+
+    /// The rank score of entry `id` for `query`: `None` if it does not match, `Some(0)` for
+    /// any match of an unranked query; for a ranked query higher is better (the order
+    /// [`FileIndex::search`] returns). Lets callers that filter ids themselves (scoped
+    /// searches) sort the same way.
+    ///
+    /// # Panics
+    /// If `id` is out of range.
+    pub fn score(&self, query: &Query, id: EntryId) -> Option<u32> {
+        let name = self.normalized_name(id);
+        match &query.plan {
+            Plan::Tree(node) if query.ranked => {
+                let e = Entry { ix: self, id, name };
+                let mut s = Scratch::default();
+                node.eval(&e, &mut s).then(|| node.score(&e, &mut s))
+            }
+            _ => self.is_match(query, id).then_some(0),
+        }
+    }
+
+    /// Ranked search: up to `limit` `(score, id)` pairs, best first, ties by id.
+    pub(crate) fn search_scored_masked(
+        &self,
+        query: &Query,
+        limit: usize,
+        cancel: &AtomicBool,
+        mask: Option<&[u64]>,
+    ) -> Result<Vec<(u32, EntryId)>> {
+        let n = self.len();
+        let mut out: Vec<(u32, EntryId)> = Vec::new();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let Plan::Tree(node) = &query.plan else {
+            // Not ranked: every hit scores 0, in index order.
+            return Ok(self
+                .search_masked(query, limit, cancel, mask)?
+                .into_iter()
+                .map(|id| (0, id))
+                .collect());
+        };
+        if limit == 0 {
+            return Ok(out);
+        }
+        let chunks = n.div_ceil(CHUNK);
+        let wave = rayon::current_num_threads().max(1) * 4;
+        let mut first = 0;
+        while first < chunks {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let last = (first + wave).min(chunks);
+            let parts: Vec<Option<Vec<(u32, EntryId)>>> = (first..last)
+                .into_par_iter()
+                .map(|c| {
+                    let end = ((c + 1) * CHUNK).min(n);
+                    self.scan_scored(c * CHUNK, end, node, limit, cancel, mask)
+                })
+                .collect();
+            for part in parts {
+                out.extend(part.ok_or(Error::Cancelled)?);
+            }
+            keep_best(&mut out, limit);
+            first = last;
+        }
+        out.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
+        Ok(out)
+    }
+
+    /// Scans ids `start..end` for a ranked query, keeping the best `limit`; `None` if
+    /// cancelled.
+    fn scan_scored(
+        &self,
+        start: usize,
+        end: usize,
+        node: &Node,
+        limit: usize,
+        cancel: &AtomicBool,
+        mask: Option<&[u64]>,
+    ) -> Option<Vec<(u32, EntryId)>> {
+        let arena = &self.normalized;
+        let text = arena.text.as_str();
+        let mut hits = Vec::new();
+        let mut from = if start == 0 {
+            0
+        } else {
+            arena.ends[start - 1] as usize
+        };
+        let mut scratch = Scratch::default();
+        for (i, &to) in arena.ends[start..end].iter().enumerate() {
+            if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let to = to as usize;
+            let name = &text[from..to];
+            from = to;
+            let id = (start + i) as EntryId;
+            let e = Entry { ix: self, id, name };
+            if node.eval(&e, &mut scratch) && !mask.is_some_and(|m| bit_is_set(m, id)) {
+                hits.push((node.score(&e, &mut scratch), id));
+                if hits.len() >= limit.saturating_mul(2).max(1024) {
+                    keep_best(&mut hits, limit);
+                }
+            }
+        }
+        keep_best(&mut hits, limit);
+        Some(hits)
     }
 
     /// [`FileIndex::search`] that skips every id whose bit is set in `mask` (bit `id % 64` of
@@ -422,6 +567,13 @@ impl FileIndex {
         cancel: &AtomicBool,
         mask: Option<&[u64]>,
     ) -> Result<Vec<EntryId>> {
+        if query.ranked {
+            return Ok(self
+                .search_scored_masked(query, limit, cancel, mask)?
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect());
+        }
         let n = self.len();
         let mut out = Vec::new();
         if limit == 0 {
@@ -515,6 +667,15 @@ impl FileIndex {
             from = to;
         }
         Some(hits)
+    }
+}
+
+/// Keeps the `limit` best `(score, id)` pairs (highest score, then lowest id), unordered.
+pub(crate) fn keep_best(hits: &mut Vec<(u32, EntryId)>, limit: usize) {
+    if hits.len() > limit {
+        let key = |&(s, id): &(u32, EntryId)| (std::cmp::Reverse(s), id);
+        hits.select_nth_unstable_by_key(limit, key);
+        hits.truncate(limit);
     }
 }
 

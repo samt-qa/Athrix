@@ -2,7 +2,7 @@
 //!
 //! The UI ⇄ Rust contract is `docs/IPC-CONTRACT.md`. Modules:
 //! - [`model`]: the JSON types of the contract;
-//! - [`indexing`]: background indexing and the shared index;
+//! - [`indexing`]: background indexing, live updates from the file watcher and the shared index;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
 //! - [`roots`]: which drives / folders are indexed, persisted for the next start;
@@ -57,6 +57,12 @@ fn normalize_preview(text: &str) -> String {
 pub fn run() {
     athrix_core::logging::init("info");
     tauri::Builder::default()
+        // First, per the plugin's docs: a second launch exits right away and this instance
+        // shows its main window instead (no second tray icon, no failed shortcut).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tracing::info!("another launch of the app; showing the main window");
+            popup::show_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(state::AppState::default())

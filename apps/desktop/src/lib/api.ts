@@ -142,6 +142,17 @@ export const api = {
   entryPath: (id: number) => call("entry_path", { id }),
 };
 
+/**
+ * What `open_entry` / `reveal_entry` / `entry_path` reject with when the id comes from an older
+ * index generation (a re-index ran since the search). The UI should search again.
+ */
+export const STALE_ID_ERROR = "this result is out of date; search again";
+
+/** True for the stale-id rejection (matched loosely, in case the wording gains context). */
+export function isStaleIdError(err: unknown): boolean {
+  return errorMessage(err).toLowerCase().includes("out of date");
+}
+
 /** Normalizes whatever a rejected command carries into a message. */
 export function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;

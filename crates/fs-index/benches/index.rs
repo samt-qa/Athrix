@@ -144,6 +144,14 @@ const QUERIES: &[&str] = &[
     "report path:src",
     "infolder:مشروع",
     "path:zzqxv",
+    // Fuzzy terms (task 3.7): ranked, so every query scans the whole index.
+    "fuzzy:rprt",
+    "fuzzy:reprot",
+    "fuzzy:mrs",
+    "fuzzy:تقرر",
+    "fuzzy:managmnet",
+    "fuzzy:zzqxv",
+    "fuzzy: تقرير 2026",
 ];
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -199,7 +207,7 @@ fn print_summary(entries: &[Entry], ix: &FileIndex) {
             }
             times.sort();
             eprintln!(
-                "[fs-index] limit {:>5} {:<18} hits {:>7}  p50 {:>9.3?}  p95 {:>9.3?}  max {:>9.3?}",
+                "[fs-index] limit {:>5} {:<20} hits {:>7}  p50 {:>9.3?}  p95 {:>9.3?}  max {:>9.3?}",
                 if limit == usize::MAX {
                     "all".to_string()
                 } else {

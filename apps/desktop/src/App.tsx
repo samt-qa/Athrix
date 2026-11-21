@@ -1,7 +1,7 @@
 import { batch, createEffect, createMemo, createResource, createSignal, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
 import { t } from "./i18n";
 import {
-  api, errorMessage, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
+  api, errorMessage, isStaleIdError, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
 } from "./lib/api";
 import { applySuggestion, composeQuery, type ChipKind } from "./lib/query";
 import SettingsControls from "./components/SettingsControls";
@@ -149,8 +149,15 @@ export default function App(props: { mode: WindowMode }) {
       // The popup's job is done; on failure it stays open to show the notice.
       if (quick) hideWindow();
     } catch (err) {
-      showNotice(t("notice.actionFailed", { message: errorMessage(err) }));
+      if (isStaleIdError(err)) searchAgain();
+      else showNotice(t("notice.actionFailed", { message: errorMessage(err) }));
     }
+  }
+
+  /** The index was rebuilt since this search: its ids are void. Say so and refresh the results. */
+  function searchAgain() {
+    showNotice(t("notice.stale"));
+    void runSearch(sent(), scope());
   }
 
   async function copyPath() {
@@ -165,6 +172,7 @@ export default function App(props: { mode: WindowMode }) {
       }
       showNotice(t("notice.copied"));
     } catch (err) {
+      if (isStaleIdError(err)) return searchAgain();
       showNotice(t("notice.copyFailed", { message: errorMessage(err) }));
     }
   }
@@ -304,7 +312,7 @@ export default function App(props: { mode: WindowMode }) {
       <div class="results-area" style={quick ? { "--rows": String(items().length) } : undefined}>
         <Switch>
           <Match when={!text().trim()}>
-            <EmptyState onExample={setQuery} />
+            <EmptyState onExample={setQuery} compact={quick} />
           </Match>
           <Match when={queryError() || failure()}>{null}</Match>
           <Match when={notReady() && !items().length}>

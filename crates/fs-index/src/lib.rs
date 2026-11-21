@@ -17,9 +17,13 @@
 //! batches of a [`Watcher`] (see [`live`] for the design and the id rules, and [`watch`] for
 //! the debouncing).
 //!
-//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): NTFS MFT/USN and ranking.
+//! Fuzzy terms (`fuzzy:rprt`, or the `fuzzy:` switch for every word) also match acronyms and
+//! typos and are ranked best first; see [`Query::is_ranked`] and [`Query::fuzzy_highlights`].
+//!
+//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): NTFS MFT/USN and general ranking.
 
 mod exec;
+mod fuzzy;
 mod index;
 pub mod live;
 mod search;

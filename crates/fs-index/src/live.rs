@@ -217,11 +217,30 @@ impl IndexSnapshot {
     }
 
     /// Runs `query` and returns up to `limit` live ids: entries added or updated since the
-    /// base first (in path order), then base entries in index order. Same cancellation and
-    /// errors as [`FileIndex::search`].
+    /// base first (in path order), then base entries in index order. A ranked query
+    /// ([`Query::is_ranked`]) returns the best `limit` of both, best first (ties by id). Same
+    /// cancellation and errors as [`FileIndex::search`].
     pub fn search(&self, query: &Query, limit: usize, cancel: &AtomicBool) -> Result<Vec<EntryId>> {
         if limit == 0 {
             return Ok(Vec::new());
+        }
+        if query.is_ranked() {
+            let mut hits = Vec::new();
+            if self.delta_entries() > 0 {
+                let offset = self.base.len() as EntryId;
+                let delta = self.delta.index.search_scored_masked(
+                    query,
+                    limit,
+                    cancel,
+                    Some(self.delta.hidden.as_slice()),
+                )?;
+                hits.extend(delta.into_iter().map(|(s, d)| (s, d + offset)));
+            }
+            let mask = (self.dead_count > 0).then_some(self.dead.as_slice());
+            hits.extend(self.base.search_scored_masked(query, limit, cancel, mask)?);
+            hits.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
+            hits.truncate(limit);
+            return Ok(hits.into_iter().map(|(_, id)| id).collect());
         }
         let mut out = Vec::new();
         if self.delta_entries() > 0 {
@@ -252,6 +271,18 @@ impl IndexSnapshot {
         match self.loc(id) {
             Loc::Base(b) => self.base.is_match(query, b),
             Loc::Delta(d) => self.delta.index.is_match(query, d),
+        }
+    }
+
+    /// The rank score of `id` for `query`, as [`FileIndex::score`] (ignores whether it is
+    /// live).
+    ///
+    /// # Panics
+    /// If `id` is out of range.
+    pub fn score(&self, query: &Query, id: EntryId) -> Option<u32> {
+        match self.loc(id) {
+            Loc::Base(b) => self.base.score(query, b),
+            Loc::Delta(d) => self.delta.index.score(query, d),
         }
     }
 
@@ -1059,6 +1090,39 @@ mod tests {
         b.push(Some(r), "keep.md", file(40));
         let opts = WalkOptions::new([&root]).exclude_glob("node_modules");
         (LiveIndex::new(b.finish(), &opts).unwrap(), root)
+    }
+
+    #[test]
+    fn ranked_search_merges_delta_and_base_best_first() {
+        let (live, root) = synthetic();
+        let docs = root.join("Docs");
+        live.apply_changes(&[
+            Change::Upsert {
+                path: docs.join("my report.txt"),
+                meta: file(1),
+            },
+            Change::Upsert {
+                path: docs.join("report.md"),
+                meta: file(2),
+            },
+            Change::Remove {
+                path: docs.join("report.pdf"),
+            },
+        ]);
+        let snap = live.snapshot();
+        let q = Query::parse("fuzzy:report | fuzzy:notes").unwrap();
+        assert!(q.is_ranked());
+        let hits = snap
+            .search(&q, usize::MAX, &AtomicBool::new(false))
+            .unwrap();
+        let got: Vec<&str> = hits.iter().map(|&id| snap.name(id)).collect();
+        // Exact names (equal length: ties by id, so the base entry first), then the word-start
+        // substring; the removed base entry is gone.
+        assert_eq!(got, ["notes.txt", "report.md", "my report.txt"]);
+        let scores: Vec<u32> = hits.iter().map(|&id| snap.score(&q, id).unwrap()).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]));
+        let top = snap.search(&q, 1, &AtomicBool::new(false)).unwrap();
+        assert_eq!(snap.name(top[0]), "notes.txt");
     }
 
     #[test]

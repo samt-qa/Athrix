@@ -52,9 +52,11 @@ impl Default for IndexStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultItem {
-    /// Result id, used by `open_entry` / `reveal_entry` / `entry_path`: the index generation
-    /// and the entry, `generation << 32 | entry`, always below 2^53 (see
-    /// [`crate::results::encode_id`]). Ids from an older index are rejected, never reused.
+    /// Result id, used by `open_entry` / `reveal_entry` / `entry_path`: the generation of the
+    /// index view it came from and the entry, `generation << 32 | entry`, always below 2^53
+    /// (see [`crate::results::encode_id`]). It resolves only with that view, kept for the
+    /// last [`crate::indexing::RECENT_VIEWS`] publishes of the current base; older ids are
+    /// rejected, never resolved to another file.
     pub id: u64,
     /// Original name as on disk.
     pub name: String,

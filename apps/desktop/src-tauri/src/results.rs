@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use athrix_fs_index::{EntryId, FileIndex, Query};
+use athrix_fs_index::{EntryId, FileIndex, IndexSnapshot, Query};
 
-use crate::indexing::{GENERATION_MASK, IndexRoot, LiveIndex};
+use crate::indexing::{GENERATION_MASK, IndexView};
 use crate::model::ResultItem;
 use crate::query::{CompiledQuery, highlights};
 use crate::roots::{key_has_prefix, normalize_root, path_key};
@@ -75,11 +75,11 @@ impl SearchScope {
         &self.path
     }
 
-    /// How much of the walked root `root` lies in this scope.
-    fn coverage(&self, root: &IndexRoot) -> Coverage {
-        if key_has_prefix(&root.key, &self.key) {
+    /// How much of the root with key `root_key` lies in this scope.
+    fn coverage(&self, root_key: &str) -> Coverage {
+        if key_has_prefix(root_key, &self.key) {
             Coverage::Whole
-        } else if key_has_prefix(&self.key, &root.key) {
+        } else if key_has_prefix(&self.key, root_key) {
             Coverage::Part
         } else {
             Coverage::None
@@ -106,11 +106,12 @@ enum Coverage {
 /// Ids scanned per task by the scoped scan.
 const SCOPED_CHUNK: usize = 32 * 1024;
 
-/// Runs `query` and builds up to `limit` items, only from `scope` if one is given. Asks for
-/// `limit + 1` ids to learn whether the list is truncated. Returns [`SearchFailure::Cancelled`]
-/// if `cancel` is set before the items are built.
+/// Runs `query` against `view` and builds up to `limit` items, only from `scope` if one is
+/// given. Asks for `limit + 1` ids to learn whether the list is truncated. Returns
+/// [`SearchFailure::Cancelled`] if `cancel` is set before the items are built. The item ids
+/// carry the view's generation and resolve only with that view.
 pub fn run_search(
-    index: &LiveIndex,
+    view: &IndexView,
     query: &CompiledQuery,
     limit: usize,
     scope: Option<&SearchScope>,
@@ -118,8 +119,8 @@ pub fn run_search(
 ) -> Result<SearchHits, SearchFailure> {
     let want = limit.saturating_add(1);
     let mut ids = match scope {
-        None => full_search(index, &query.query, want, cancel)?,
-        Some(scope) => scoped_search(index, &query.query, want, scope, cancel)?,
+        None => full_search(view, &query.query, want, cancel)?,
+        Some(scope) => scoped_search(view, &query.query, want, scope, cancel)?,
     };
     let truncated = ids.len() > limit;
     ids.truncate(limit);
@@ -129,8 +130,8 @@ pub fn run_search(
             return Err(SearchFailure::Cancelled);
         }
         items.push(build_item(
-            index,
-            index.generation(),
+            view,
+            view.generation(),
             id,
             &query.highlight_terms,
         ));
@@ -139,7 +140,7 @@ pub fn run_search(
 }
 
 fn full_search(
-    index: &FileIndex,
+    index: &IndexSnapshot,
     query: &Query,
     limit: usize,
     cancel: &AtomicBool,
@@ -151,28 +152,40 @@ fn full_search(
     }
 }
 
-/// Up to `limit` matching ids under `scope`, in index order. A scope covering every root is a
-/// plain search; otherwise only the id blocks of the roots the scope touches are scanned, in
-/// parallel chunks, stopping once `limit` hits are found.
+/// Up to `limit` matching live ids under `scope`: entries added or updated since the base
+/// first (as in [`IndexSnapshot::search`]), then base entries in index order.
+///
+/// A scope covering every indexed root is a plain search. Otherwise:
+/// - the delta (small: compaction bounds it) is scanned entry by entry and filtered by path;
+/// - in the base, only the runs of the roots the scope touches are scanned, in parallel
+///   chunks, skipping removed entries (tombstones), stopping once `limit` hits are found.
 fn scoped_search(
-    index: &LiveIndex,
+    view: &IndexView,
     query: &Query,
     limit: usize,
     scope: &SearchScope,
     cancel: &AtomicBool,
 ) -> Result<Vec<EntryId>, SearchFailure> {
-    let covered: Vec<(&IndexRoot, Coverage)> = index
-        .roots()
-        .iter()
-        .map(|r| (r, scope.coverage(r)))
-        .filter(|(_, c)| *c != Coverage::None)
-        .collect();
-    if covered.len() == index.roots().len() && covered.iter().all(|(_, c)| *c == Coverage::Whole) {
-        return full_search(index, query, limit, cancel);
+    if !view.root_keys().is_empty()
+        && view
+            .root_keys()
+            .iter()
+            .all(|k| key_has_prefix(k, &scope.key))
+    {
+        return full_search(view, query, limit, cancel);
+    }
+    let mut out = scan_delta(view, query, limit, scope, cancel)?;
+    if out.len() >= limit {
+        return Ok(out);
     }
     let mut chunks: Vec<(usize, usize, Coverage)> = Vec::new();
-    for (root, coverage) in covered {
-        let (start, end) = (root.start as usize, (root.end as usize).min(index.len()));
+    let base_len = view.base().len();
+    for run in view.roots() {
+        let coverage = scope.coverage(&run.key);
+        if coverage == Coverage::None {
+            continue;
+        }
+        let (start, end) = (run.start as usize, (run.end as usize).min(base_len));
         let mut at = start;
         while at < end {
             let next = (at + SCOPED_CHUNK).min(end);
@@ -181,7 +194,9 @@ fn scoped_search(
         }
     }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
-    let mut out: Vec<EntryId> = Vec::new();
+    let want = limit - out.len();
+    let snapshot: &IndexSnapshot = view;
+    let mut base_hits: Vec<EntryId> = Vec::new();
     for wave in chunks.chunks(threads) {
         if cancel.load(Ordering::Relaxed) {
             return Err(SearchFailure::Cancelled);
@@ -191,7 +206,7 @@ fn scoped_search(
                 .iter()
                 .map(|&(start, end, coverage)| {
                     s.spawn(move || {
-                        scan_chunk(index, query, start, end, coverage, scope, limit, cancel)
+                        scan_chunk(snapshot, query, start, end, coverage, scope, want, cancel)
                     })
                 })
                 .collect();
@@ -201,9 +216,10 @@ fn scoped_search(
                 .collect()
         });
         for part in parts {
-            out.extend(part.ok_or(SearchFailure::Cancelled)?);
-            if out.len() >= limit {
-                out.truncate(limit);
+            base_hits.extend(part.ok_or(SearchFailure::Cancelled)?);
+            if base_hits.len() >= want {
+                base_hits.truncate(want);
+                out.extend(base_hits);
                 return Ok(out);
             }
         }
@@ -211,13 +227,45 @@ fn scoped_search(
     if cancel.load(Ordering::Relaxed) {
         return Err(SearchFailure::Cancelled);
     }
+    out.extend(base_hits);
     Ok(out)
 }
 
-/// Matching ids among `start..end` (at most `limit`); `None` if cancelled (or on a panic).
+/// Matching live delta entries (ids `base.len()..id_bound()`) under `scope`, at most `limit`.
+fn scan_delta(
+    index: &IndexSnapshot,
+    query: &Query,
+    limit: usize,
+    scope: &SearchScope,
+    cancel: &AtomicBool,
+) -> Result<Vec<EntryId>, SearchFailure> {
+    let mut out = Vec::new();
+    if index.delta_entries() == 0 {
+        return Ok(out);
+    }
+    for (n, id) in (index.base().len()..index.id_bound()).enumerate() {
+        if n % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err(SearchFailure::Cancelled);
+        }
+        let Ok(id) = EntryId::try_from(id) else {
+            break;
+        };
+        // `contains` masks the hidden anchor copies of base folders.
+        if index.contains(id) && index.is_match(query, id) && scope.contains(&index.path(id)) {
+            out.push(id);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Matching live base ids among `start..end` (at most `limit`); `None` if cancelled (or on
+/// a panic).
 #[allow(clippy::too_many_arguments)]
 fn scan_chunk(
-    index: &FileIndex,
+    index: &IndexSnapshot,
     query: &Query,
     start: usize,
     end: usize,
@@ -226,14 +274,16 @@ fn scan_chunk(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Option<Vec<EntryId>> {
+    let base: &FileIndex = index.base();
     let mut out = Vec::new();
     for (n, id) in (start..end).enumerate() {
         if n % 4096 == 0 && cancel.load(Ordering::Relaxed) {
             return None;
         }
         let id = EntryId::try_from(id).ok()?;
-        if index.is_match(query, id)
-            && (coverage == Coverage::Whole || scope.contains(&index.path(id)))
+        if base.is_match(query, id)
+            && index.contains(id)
+            && (coverage == Coverage::Whole || scope.contains(&base.path(id)))
         {
             out.push(id);
             if out.len() >= limit {
@@ -244,10 +294,10 @@ fn scan_chunk(
     Some(out)
 }
 
-/// Builds the UI row for `id` (which must be `< index.len()`) of an index of generation
+/// Builds the UI row for the live entry `id` of `index`, a snapshot of generation
 /// `generation`.
 pub fn build_item(
-    index: &FileIndex,
+    index: &IndexSnapshot,
     generation: u32,
     id: EntryId,
     highlight_terms: &[String],
@@ -281,8 +331,10 @@ pub fn build_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexing::walk_options;
     use crate::query::compile_query;
-    use athrix_fs_index::{EntryMeta, IndexBuilder};
+    use athrix_fs_index::{EntryMeta, IndexBuilder, LiveIndex, walk};
+    use std::fs;
     use std::path::PathBuf;
 
     fn dir() -> EntryMeta {
@@ -300,8 +352,8 @@ mod tests {
         }
     }
 
-    fn sample() -> LiveIndex {
-        LiveIndex::new(7, sample_index())
+    fn sample() -> IndexView {
+        IndexView::from_index(7, sample_index())
     }
 
     fn sample_index() -> FileIndex {
@@ -368,7 +420,7 @@ mod tests {
 
     /// Two walked roots like two drives: `C:\` (or `/c`) and `D:\` (or `/d`), each with a
     /// folder and two "report" files.
-    fn drives() -> (LiveIndex, [&'static str; 2]) {
+    fn drives() -> (IndexView, [&'static str; 2]) {
         let (c, d) = if cfg!(windows) {
             ("C:\\", "D:\\")
         } else {
@@ -381,10 +433,10 @@ mod tests {
             b.push(Some(work), "report.pdf", file(1));
             b.push(Some(root), "report.txt", file(2));
         }
-        (LiveIndex::new(1, b.finish()), [c, d])
+        (IndexView::from_index(1, b.finish()), [c, d])
     }
 
-    fn scoped(ix: &LiveIndex, text: &str, scope: &str, limit: usize) -> Vec<String> {
+    fn scoped(ix: &IndexView, text: &str, scope: &str, limit: usize) -> Vec<String> {
         let q = compile_query(text).unwrap();
         let scope = SearchScope::parse(Some(scope)).unwrap();
         let cancel = AtomicBool::new(false);
@@ -420,7 +472,7 @@ mod tests {
         assert!(under(c, &only_c), "{only_c:?}");
 
         // A folder inside a root: per-entry path check.
-        let work: PathBuf = [d, "work"].iter().collect();
+        let work: PathBuf = [d, "Work"].iter().collect();
         let in_work = scoped(&ix, "report", &work.to_string_lossy(), 10);
         assert_eq!(in_work.len(), 1, "{in_work:?}");
         assert!(in_work[0].ends_with("report.pdf"));
@@ -485,7 +537,7 @@ mod tests {
                 b.push(Some(root), &format!("f{i}.txt"), file(1));
             }
         }
-        let ix = LiveIndex::new(1, b.finish());
+        let ix = IndexView::from_index(1, b.finish());
         let q = compile_query("ext:txt").unwrap();
         let scope = SearchScope::parse(Some(d)).unwrap();
         let no = AtomicBool::new(false);
@@ -526,5 +578,84 @@ mod tests {
         assert_eq!(decode_id(u64::MAX), None);
         // The generation wraps within its width instead of leaking into unsafe bits.
         assert_eq!(encode_id(GENERATION_MASK + 1, 3), encode_id(0, 3));
+    }
+
+    /// Two walked folders standing in for two drives, then files created and deleted after
+    /// the walk (as the watcher would report them).
+    #[test]
+    fn scoped_search_sees_live_changes_on_the_right_root_only() {
+        let c = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        for dir in [&c, &d] {
+            fs::create_dir_all(dir.path().join("Work")).unwrap();
+            fs::write(dir.path().join("Work").join("report-old.txt"), b"x").unwrap();
+        }
+        // D first, so that after compaction its new entry is not adjacent to its run.
+        let roots = vec![d.path().to_path_buf(), c.path().to_path_buf()];
+        let opts = walk_options(&roots);
+        let live = LiveIndex::new(walk(&opts).unwrap(), &opts).unwrap();
+        let created = d.path().join("Work").join("report-fresh.txt");
+        fs::write(&created, b"x").unwrap();
+        let deleted = c.path().join("Work").join("report-old.txt");
+        fs::remove_file(&deleted).unwrap();
+        let stats = live.apply_paths(&[&created, &deleted]);
+        assert_eq!((stats.upserted, stats.removed), (1, 1), "{stats:?}");
+
+        let check = |view: &IndexView| {
+            let s = |p: &Path| p.to_string_lossy().into_owned();
+            let mut on_d = scoped(view, "report", &s(d.path()), 10);
+            on_d.sort();
+            let expected_d = {
+                let mut v = vec![
+                    s(&created),
+                    s(&d.path().join("Work").join("report-old.txt")),
+                ];
+                v.sort();
+                v
+            };
+            assert_eq!(
+                on_d, expected_d,
+                "created file found with its drive's scope"
+            );
+            assert_eq!(
+                scoped(view, "report", &s(&d.path().join("Work")), 10).len(),
+                2,
+                "and with a folder scope inside it"
+            );
+            assert!(
+                scoped(view, "fresh", &s(c.path()), 10).is_empty(),
+                "not with another drive's scope"
+            );
+            assert!(
+                scoped(view, "report", &s(c.path()), 10).is_empty(),
+                "the deleted file is gone"
+            );
+            assert!(scoped(view, "report", &s(&c.path().join("Work")), 10).is_empty());
+            assert_eq!(scoped(view, "report", "", 10).len(), 2);
+        };
+
+        let view = IndexView::new(2, live.snapshot(), &roots);
+        assert!(view.has_changes());
+        check(&view);
+        // The new file is a delta entry, listed first, and its id resolves in this view.
+        let q = compile_query("report").unwrap();
+        let scope = SearchScope::parse(Some(&d.path().to_string_lossy())).unwrap();
+        let hits = run_search(&view, &q, 10, scope.as_ref(), &AtomicBool::new(false)).unwrap();
+        let (generation, entry) = decode_id(hits.items[0].id).unwrap();
+        assert_eq!(generation, 2);
+        assert!(entry as usize >= view.base().len());
+        assert!(view.has_entry(entry));
+        assert_eq!(view.path(entry), created);
+        // Truncation counts delta and base hits together.
+        let one = run_search(&view, &q, 1, scope.as_ref(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(one.items.len(), 1);
+        assert!(one.truncated);
+
+        // After compaction the new entry sits after both roots' runs: still scoped right.
+        live.compact();
+        let view = IndexView::new(3, live.snapshot(), &roots);
+        assert!(!view.has_changes());
+        assert_eq!(view.roots().len(), 3, "{:?}", view.roots());
+        check(&view);
     }
 }

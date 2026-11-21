@@ -4,7 +4,9 @@
 // QueryError with kind/start/end/suggestion, and `index://status` events.
 //
 // The fake index is deterministic (seeded PRNG): the same names, folders and sizes on every load.
-// Test switches (URL query string): `?mockEntries=N` (default 4000), `?mockIndexError`.
+// Test switches (URL query string): `?mockEntries=N` (default 4000), `?mockIndexError`,
+// `?mockStale` (the first open / reveal / copy acts as if a re-index ran after the search:
+// it rejects with the stale-id error and the ids change, like the Rust side).
 import type {
   CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, QueryError, Range16, ResultItem, SearchResponse,
   Volume,
@@ -353,6 +355,19 @@ function sizeMatches(s: NonNullable<Parsed["size"]>, size: number | null): boole
 
 // ---------- state + commands ----------
 
+/** Must match STALE_ID_ERROR in src-tauri/src/commands.rs (and lib/api.ts). */
+const STALE_ID_ERROR = "this result is out of date; search again";
+/** Ids carry the index generation in their high bits, like Rust's `generation << 32 | item`. */
+const GEN_UNIT = 2 ** 32;
+let generation = 1;
+let staleOnce = params.has("mockStale");
+
+/** A new index generation: every id changes, so ids handed out before become stale. */
+function bumpGeneration(entries: MockEntry[]) {
+  generation++;
+  for (const e of entries) e.item = { ...e.item, id: generation * GEN_UNIT + (e.item.id % GEN_UNIT) };
+}
+
 let index: MockEntry[] | null = null;
 let status: IndexStatus = { state: "idle", entries: 0, roots: [], elapsedMs: null, error: null };
 const listeners = new Set<(s: IndexStatus) => void>();
@@ -391,6 +406,7 @@ function startIndexing(roots?: string[]) {
       return;
     }
     index = buildIndex(ENTRY_COUNT).filter((e) => r.some((root) => under(e.item.parent, root)));
+    bumpGeneration(index);
     setStatus({
       state: "ready", entries: index.length, roots: r, elapsedMs: Math.round(performance.now() - t0), error: null,
     });
@@ -451,8 +467,12 @@ function mergeRanges(r: Range16[]): Range16[] {
 }
 
 function findEntry(id: number) {
+  if (staleOnce && index) {
+    staleOnce = false;
+    bumpGeneration(index);
+  }
   const e = index?.find((x) => x.item.id === id);
-  if (!e) throw `no entry with id ${id}`;
+  if (!e) throw Math.floor(id / GEN_UNIT) !== generation ? STALE_ID_ERROR : `no entry with id ${id}`;
   return e.item;
 }
 
