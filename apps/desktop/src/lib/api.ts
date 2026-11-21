@@ -163,6 +163,51 @@ export interface AppInfo {
   version: string;
 }
 
+/** Result of `update_check` and payload of `app://update-available`. */
+export interface UpdateInfo {
+  available: boolean;
+  version?: string;
+  notes?: string;
+}
+
+export interface UpdateSettings {
+  /** Check once at start-up (default false; takes effect at the next start). */
+  autoUpdateCheck: boolean;
+}
+
+/** A past search (task 5.3). The backend merges repeats of the same query + scope (`count`). */
+export interface HistoryEntry {
+  id: number;
+  query: string;
+  /** The scope it ran in (a root like "D:\\"), null = everywhere. */
+  scope: string | null;
+  /** Last run, unix milliseconds. */
+  searchedAt: number;
+  /** Times it was run. */
+  count: number;
+}
+
+/** A search the user saved under a name. */
+export interface SavedSearch {
+  id: number;
+  name: string;
+  query: string;
+  scope: string | null;
+  /** Unix milliseconds. */
+  createdAt: number;
+}
+
+/** A favorite file or folder. Favorites are kept by path, so they outlive re-indexing. */
+export interface Favorite {
+  path: string;
+  name: string;
+  isDir: boolean;
+  /** Unix milliseconds. */
+  addedAt: number;
+  /** False when the path is gone (moved or deleted since). */
+  exists: boolean;
+}
+
 /** The command table of the contract: name -> [args, result]. */
 export interface Commands {
   app_info: [undefined, AppInfo];
@@ -186,6 +231,35 @@ export interface Commands {
   content_resume: [undefined, void];
   /** Persisted on the Rust side; disabled = state "disabled". */
   set_content_indexing: [{ enabled: boolean }, void];
+  // ---- history, saved searches, favorites (task 5.3) ----
+  /** Newest first. */
+  history_list: [{ limit?: number }, HistoryEntry[]];
+  /** Called on Enter / when a result is opened, never per keystroke; skipped when history is off. */
+  history_add: [{ query: string; scope: string | null }, void];
+  history_remove: [{ id: number }, void];
+  history_clear: [undefined, void];
+  saved_list: [undefined, SavedSearch[]];
+  saved_create: [{ name: string; query: string; scope: string | null }, SavedSearch];
+  saved_rename: [{ id: number; name: string }, SavedSearch];
+  saved_delete: [{ id: number }, void];
+  favorite_list: [undefined, Favorite[]];
+  /** `id`: a result id (EntryId) from the current search. */
+  favorite_add: [{ id: number }, Favorite];
+  favorite_remove: [{ path: string }, void];
+  favorite_open: [{ path: string }, void];
+  favorite_reveal: [{ path: string }, void];
+  /**
+   * The folder of a `--search-in` launch that came before the UI listened, or null. The first
+   * call also switches later folders to the `app://search-in` event (main window only).
+   */
+  take_pending_search_in: [undefined, string | null];
+  // ---- updates ----
+  /** Rejects with an English message (e.g. no network, private repository). */
+  update_check: [undefined, UpdateInfo];
+  /** Downloads and installs the update, then restarts the app. */
+  update_install: [undefined, void];
+  get_update_settings: [undefined, UpdateSettings];
+  set_update_settings: [{ settings: UpdateSettings }, UpdateSettings];
 }
 export type CommandName = keyof Commands;
 export type CommandArgs<C extends CommandName> = Commands[C][0];
@@ -193,6 +267,15 @@ export type CommandResult<C extends CommandName> = Commands[C][1];
 
 export const INDEX_STATUS_EVENT = "index://status";
 export const CONTENT_STATUS_EVENT = "content://status";
+/** "Search in Athrix" from the Explorer right-click menu on a folder: payload `{ path }`. */
+export const SEARCH_IN_EVENT = "app://search-in";
+
+/** An update was found by the start-up check (only when `autoUpdateCheck` is on). */
+export const UPDATE_AVAILABLE_EVENT = "app://update-available";
+
+export interface SearchInPayload {
+  path: string;
+}
 
 /** True when running against the in-browser mock instead of Rust. */
 export const usingMock = !isTauri();
@@ -223,6 +306,25 @@ export async function onContentStatus(handler: (status: ContentStatus) => void):
   return listen<ContentStatus>(CONTENT_STATUS_EVENT, (e) => handler(e.payload));
 }
 
+/**
+ * Subscribes to `app://search-in` (Explorer's "search in this folder"). Never fires outside Tauri;
+ * resolves to an unsubscribe function either way.
+ */
+export async function onSearchIn(handler: (payload: SearchInPayload) => void): Promise<() => void> {
+  if (usingMock) return () => {};
+  return listen<SearchInPayload>(SEARCH_IN_EVENT, (e) => {
+    if (e.payload && typeof e.payload.path === "string" && e.payload.path) handler(e.payload);
+  });
+}
+
+/** Subscribes to `app://update-available`; never fires outside Tauri. */
+export async function onUpdateAvailable(handler: (info: UpdateInfo) => void): Promise<() => void> {
+  if (usingMock) return () => {};
+  return listen<UpdateInfo>(UPDATE_AVAILABLE_EVENT, (e) => {
+    if (e.payload?.available) handler(e.payload);
+  });
+}
+
 // Thin named wrappers, one per command.
 export const api = {
   appInfo: () => call("app_info"),
@@ -242,6 +344,24 @@ export const api = {
   contentPause: () => call("content_pause"),
   contentResume: () => call("content_resume"),
   setContentIndexing: (enabled: boolean) => call("set_content_indexing", { enabled }),
+  historyList: (limit?: number) => call("history_list", limit === undefined ? {} : { limit }),
+  historyAdd: (query: string, scope: string | null) => call("history_add", { query, scope }),
+  historyRemove: (id: number) => call("history_remove", { id }),
+  historyClear: () => call("history_clear"),
+  savedList: () => call("saved_list"),
+  savedCreate: (name: string, query: string, scope: string | null) => call("saved_create", { name, query, scope }),
+  savedRename: (id: number, name: string) => call("saved_rename", { id, name }),
+  savedDelete: (id: number) => call("saved_delete", { id }),
+  favoriteList: () => call("favorite_list"),
+  favoriteAdd: (id: number) => call("favorite_add", { id }),
+  favoriteRemove: (path: string) => call("favorite_remove", { path }),
+  favoriteOpen: (path: string) => call("favorite_open", { path }),
+  favoriteReveal: (path: string) => call("favorite_reveal", { path }),
+  takePendingSearchIn: () => call("take_pending_search_in"),
+  updateCheck: () => call("update_check"),
+  updateInstall: () => call("update_install"),
+  getUpdateSettings: () => call("get_update_settings"),
+  setUpdateSettings: (settings: UpdateSettings) => call("set_update_settings", { settings }),
 };
 
 /**

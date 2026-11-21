@@ -1,12 +1,13 @@
 import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { locale, t, tPlural, type MessageKey } from "../i18n";
-import { api, errorMessage, onContentStatus, type ContentStatus } from "../lib/api";
+import { api, errorMessage, onContentStatus, type ContentPauseReason, type ContentStatus } from "../lib/api";
 import { formatCount } from "../lib/format";
-import { searchContent, setSearchContent } from "../lib/searchContent";
 
 type Props = {
   /** Called with a message when a command fails. */
   onError: (message: string) => void;
+  /** Opens Settings → Indexing (content indexing on/off and "search contents too" live there). */
+  onOpenSettings?: () => void;
 };
 
 const PANEL_ID = "content-panel";
@@ -16,6 +17,12 @@ function reasons(s: ContentStatus): string {
   const sep = locale() === "ar" ? "، " : ", ";
   const list = s.pausedBy.length ? s.pausedBy : ["user" as const];
   return list.map((r) => t(`content.reason.${r}` as MessageKey)).join(sep);
+}
+
+/** The reason that decides when a pause ends: the user's own pause wins (only they can lift it). */
+function pauseCause(s: ContentStatus): ContentPauseReason {
+  if (!s.pausedBy.length || s.pausedBy.includes("user")) return "user";
+  return s.pausedBy[0];
 }
 
 const showsProgress = (s: ContentStatus) => (s.state === "running" || s.state === "paused") && s.total > 0;
@@ -72,7 +79,6 @@ export default function ContentStatusControl(props: Props) {
   }
 
   const userPaused = () => status()?.state === "paused" && status()!.pausedBy.includes("user");
-  const enabled = () => status()?.state !== "disabled";
   const canPause = () => {
     const s = status()?.state;
     return s === "running" || s === "idle" || (s === "paused" && !userPaused());
@@ -155,10 +161,15 @@ export default function ContentStatusControl(props: Props) {
                     {t("content.runningDetail", { rate: formatCount(Math.round(s().docsPerSecond), locale()) })}
                   </Match>
                   <Match when={s().state === "error"}>
-                    {t("content.errorDetail", { message: s().error ?? "" })}
+                    {t("content.errorDetail", { message: `⁨${s().error ?? ""}⁩` })}
                   </Match>
+                  <Match when={s().state === "disabled"}>{t("content.disabledDetail")}</Match>
                 </Switch>
               </p>
+              {/* Paused: what happens next (it resumes by itself unless the user paused it). */}
+              <Show when={s().state === "paused"}>
+                <p class="content-line content-hint">{t(`content.pausedDetail.${pauseCause(s())}` as MessageKey)}</p>
+              </Show>
               <Show when={showsProgress(s())}>
                 <div
                   class="content-meter"
@@ -202,26 +213,16 @@ export default function ContentStatusControl(props: Props) {
                 </button>
               </div>
 
-              <div class="content-switches">
-                <label class="drives-row">
-                  <input
-                    type="checkbox"
-                    checked={enabled()}
-                    disabled={busy()}
-                    onChange={(e) => {
-                      const box = e.currentTarget;
-                      // On failure the box goes back to what the backend reports.
-                      void run(() => api.setContentIndexing(box.checked)).then(() => (box.checked = enabled()));
-                    }}
-                  />
-                  <span>{t("content.enable")}</span>
-                </label>
-                <label class="drives-row">
-                  <input type="checkbox" checked={searchContent()} onChange={(e) => setSearchContent(e.currentTarget.checked)} />
-                  <span>{t("content.searchToo")}</span>
-                </label>
-                <p class="drives-note">{t("content.searchTooHint")}</p>
-              </div>
+              <Show when={props.onOpenSettings}>
+                <div class="content-switches">
+                  <button type="button" class="btn-secondary" onClick={() => {
+                    close(false);
+                    props.onOpenSettings?.();
+                  }}>
+                    {t("content.moreSettings")}
+                  </button>
+                </div>
+              </Show>
             </div>
           </Show>
         </div>

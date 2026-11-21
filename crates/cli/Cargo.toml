@@ -16,6 +16,12 @@ path = "src/main.rs"
 athrix-core.workspace = true
 athrix-fs-index.workspace = true
 athrix-text-ar.workspace = true
+# `athrix bench` (docs/PERF-AUDIT.md)
+athrix-content-index.workspace = true
+athrix-extract.workspace = true
+athrix-query.workspace = true
+athrix-ranking.workspace = true
+sysinfo = { workspace = true, features = ["system"] }
 
 [lints]
 workspace = true

@@ -1,10 +1,9 @@
 import { batch, createEffect, createMemo, createResource, createSignal, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
 import { locale, localeDir, t } from "./i18n";
 import {
-  api, errorMessage, isStaleIdError, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
+  api, errorMessage, isStaleIdError, onIndexStatus, onSearchIn, onUpdateAvailable, usingMock, type UpdateInfo, type IndexStatus, type QueryError, type SearchResponse,
 } from "./lib/api";
 import { applySuggestion, composeQuery, suggestionInput, type ChipKind } from "./lib/query";
-import SettingsControls from "./components/SettingsControls";
 import SearchField from "./components/SearchField";
 import FilterChips from "./components/FilterChips";
 import QueryErrorBar from "./components/QueryErrorBar";
@@ -14,12 +13,18 @@ import HintBar from "./components/HintBar";
 import StatusBar from "./components/StatusBar";
 import ContentStatusControl from "./components/ContentStatusControl";
 import ScopeSelect from "./components/ScopeSelect";
-import IndexSettings from "./components/IndexSettings";
+import SettingsDialog, { type SettingsSection } from "./components/SettingsDialog";
+import Onboarding, { welcomeDone } from "./components/Onboarding";
+import LibraryPanel, { type LibraryHandle } from "./components/LibraryPanel";
+import PromptDialog from "./components/PromptDialog";
+import ContextMenu, { type MenuItem } from "./components/ContextMenu";
 import PreviewPane, { type PreviewHandle } from "./components/PreviewPane";
 import { readSetting, writeSetting } from "./lib/storage";
-import { effectiveScope, setScope, storedScope } from "./lib/scope";
+import { effectiveScope, rootKey, setScope, storedScope } from "./lib/scope";
+import { addFavorite, folderQuery, recordSearch, saveSearch } from "./lib/library";
 import { searchContent, setSearchContent } from "./lib/searchContent";
 import { fitWindowTo, hideWindow, onWindowFocus, type WindowMode } from "./lib/window";
+import "./styles/panels.css";
 
 /** Results per query (contract `limit`). Dev-only override for scroll testing: `?limit=5000`. */
 const LIMIT = (() => {
@@ -175,6 +180,7 @@ export default function App(props: { mode: WindowMode }) {
   async function open(i = selected(), reveal = false) {
     const it = items()[i];
     if (!it) return;
+    record();
     try {
       if (reveal) {
         await api.revealEntry(it.id);
@@ -189,6 +195,82 @@ export default function App(props: { mode: WindowMode }) {
       if (isStaleIdError(err)) searchAgain();
       else showNotice(t("notice.actionFailed", { message: errorMessage(err) }));
     }
+  }
+
+  // ---- history, saved searches, favorites (task 5.3) ----
+  let library: LibraryHandle | undefined;
+  const currentQuery = () => sent().trim();
+  /** Adds the current search to the history (Enter, or a result opened); never per keystroke. */
+  function record() {
+    void recordSearch(currentQuery(), scope() || null);
+  }
+
+  /** A past or saved search, run again: its text (chip reset) and the scope it ran in. */
+  function runFromLibrary(query: string, where: string | null) {
+    batch(() => {
+      setChip("all");
+      setScope(where ?? "");
+    });
+    setQuery(query);
+  }
+
+  const [savePrompt, setSavePrompt] = createSignal<{ query: string; scope: string | null } | null>(null);
+  /** "Save this search" (Ctrl+S): asks for a name in the main window; the popup saves it as is. */
+  function promptSave() {
+    const query = currentQuery();
+    if (!query) return;
+    const where = scope() || null;
+    if (quick) {
+      void saveSearch(query, query, where)
+        .then(() => showNotice(t("library.savedNotice", { name: query })))
+        .catch((err) => showNotice(t("library.actionFailed", { message: errorMessage(err) })));
+    } else {
+      setSavePrompt({ query, scope: where });
+    }
+  }
+
+  /** "Add to favorites" (Ctrl+D) on result `i`. */
+  async function favorite(i = selected()) {
+    const it = items()[i];
+    if (!it) return;
+    try {
+      const { already } = await addFavorite(it.id);
+      showNotice(t(already ? "library.alreadyFavorite" : "library.favorited", { name: it.name }));
+    } catch (err) {
+      if (isStaleIdError(err)) searchAgain();
+      else showNotice(t("library.actionFailed", { message: errorMessage(err) }));
+    }
+  }
+
+  // ---- context menu on a result (right click, Shift+F10, the Menu key) ----
+  const [menu, setMenu] = createSignal<{ x: number; y: number; index: number } | null>(null);
+  const menuItems = (i: number): MenuItem[] => [
+    { label: t("hints.open"), shortcut: "Enter", onSelect: () => void open(i) },
+    { label: t("hints.reveal"), shortcut: "Ctrl+Enter", onSelect: () => void open(i, true) },
+    { label: t("hints.copy"), shortcut: "Ctrl+C", onSelect: () => void copyPath() },
+    { label: t("library.addFavorite"), shortcut: "Ctrl+D", onSelect: () => void favorite(i) },
+  ];
+  function closeMenu() {
+    setMenu(null);
+    input.focus();
+  }
+  function onResultsContextMenu(e: MouseEvent) {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[role="option"]');
+    if (!row) return;
+    const i = items().findIndex((it) => optionId(LIST_ID, it) === row.id);
+    if (i < 0) return;
+    e.preventDefault();
+    setSelected(i);
+    setMenu({ x: e.clientX, y: e.clientY, index: i });
+  }
+  /** From the keyboard: under the selected row (or under the field when it is not drawn). */
+  function openMenuForSelected() {
+    const it = current();
+    if (!it) return;
+    const row = document.getElementById(optionId(LIST_ID, it));
+    const box = (row ?? input).getBoundingClientRect();
+    const rtl = localeDir(locale()) === "rtl";
+    setMenu({ x: rtl ? box.right - 220 : box.left + 24, y: box.bottom - 4, index: selected() });
   }
 
   /** The index was rebuilt since this search: its ids are void. Say so and refresh the results. */
@@ -245,8 +327,29 @@ export default function App(props: { mode: WindowMode }) {
     const page = list?.pageSize() ?? 8;
     const ctrl = e.ctrlKey || e.metaKey;
     // Physical keys (KeyboardEvent.code) so shortcuts work under the Arabic layout too (design §11).
+    // Shift+F10 / the Menu key: the selected result's context menu.
+    if ((e.key === "F10" && e.shiftKey && !ctrl && !e.altKey) || e.key === "ContextMenu") {
+      if (!current()) return;
+      e.preventDefault();
+      openMenuForSelected();
+      return;
+    }
+    if (ctrl && !e.altKey && !e.shiftKey && (e.code === "KeyD" || e.code === "KeyS")) {
+      // Ctrl+D: add the selected result to the favorites. Ctrl+S: save this search.
+      e.preventDefault();
+      if (e.code === "KeyD") void favorite();
+      else promptSave();
+      return;
+    }
     switch (e.code === "NumpadEnter" ? "Enter" : e.key) {
-      case "ArrowDown": move(selected() + 1); break;
+      case "ArrowDown":
+        // In the empty field, ArrowDown walks into the recent / saved searches.
+        if (!text().trim() && !n) {
+          if (!library?.focusFirst()) return;
+          break;
+        }
+        move(selected() + 1);
+        break;
       case "ArrowUp": move(selected() - 1); break;
       case "PageDown": move(selected() + page); break;
       case "PageUp": move(selected() - page); break;
@@ -267,7 +370,11 @@ export default function App(props: { mode: WindowMode }) {
         move(e.key === "Home" ? 0 : n - 1);
         break;
       case "Enter":
-        if (!n) return;
+        if (!n) {
+          // Nothing to open, but the search counts as made.
+          if (text().trim() && !e.repeat) record();
+          return;
+        }
         void open(selected(), ctrl);
         break;
       case "Escape":
@@ -333,6 +440,71 @@ export default function App(props: { mode: WindowMode }) {
     };
     document.addEventListener("keydown", onGlobalKey);
     onCleanup(() => document.removeEventListener("keydown", onGlobalKey));
+  }
+
+  // ---- settings dialog and welcome screen (main window only) ----
+  const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [settingsSection, setSettingsSection] = createSignal<SettingsSection>("general");
+  /** An update found by the start-up check (`app://update-available`); dismissible. */
+  const [update, setUpdate] = createSignal<UpdateInfo | null>(null);
+  const [welcomeOpen, setWelcomeOpen] = createSignal(!quick && !welcomeDone());
+  function openSettings(section: SettingsSection = "general") {
+    setMenu(null);
+    setSettingsSection(section);
+    setSettingsOpen(true);
+  }
+  function closeSettings() {
+    setSettingsOpen(false);
+    queueMicrotask(() => input.focus());
+  }
+  if (!quick) {
+    // Ctrl+, opens the settings from anywhere in the window.
+    const onSettingsKey = (e: KeyboardEvent) => {
+      if (e.isComposing || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || (e.code !== "Comma" && e.key !== ",")) return;
+      if (welcomeOpen() || savePrompt()) return;
+      e.preventDefault();
+      if (!settingsOpen()) openSettings();
+    };
+    document.addEventListener("keydown", onSettingsKey);
+    onCleanup(() => document.removeEventListener("keydown", onSettingsKey));
+
+    // Explorer's "search in this folder" (app://search-in): the folder filter alone in the field.
+    const searchIn = (path: string) => {
+      batch(() => {
+        setSettingsOpen(false);
+        setSavePrompt(null);
+        setMenu(null);
+        setChip("all");
+        // A scope that does not hold the folder would hide everything in it.
+        const where = storedScope();
+        if (where && !rootKey(path).startsWith(rootKey(where))) setScope("");
+      });
+      setQuery(folderQuery(path));
+    };
+    onMount(async () => {
+      let disposed = false;
+      let unlisten: (() => void) | undefined;
+      onCleanup(() => {
+        disposed = true;
+        unlisten?.();
+      });
+      try {
+        const stop = await onUpdateAvailable(setUpdate);
+        if (disposed) stop();
+        else onCleanup(stop);
+      } catch (err) {
+        console.warn("update listener unavailable", err);
+      }
+      try {
+        unlisten = await onSearchIn(({ path }) => searchIn(path));
+        if (disposed) return unlisten();
+        // A folder from the launch that came before we listened.
+        const pending = await api.takePendingSearchIn().catch(() => null);
+        if (pending) searchIn(pending);
+      } catch (err) {
+        console.warn("search-in listener unavailable", err);
+      }
+    });
   }
 
   // ---- splitter between the results and the pane ----
@@ -421,7 +593,21 @@ export default function App(props: { mode: WindowMode }) {
         expanded={items().length > 0}
         activeDescendant={activeDescendant()}
         describedBy={queryError() || failure() ? ERROR_ID : undefined}
-        addon={<ScopeSelect roots={roots()} value={scope()} onChange={setScope} />}
+        addon={
+          <>
+            <Show when={text().trim()}>
+              <button type="button" class="save-search-btn" title={t("library.saveSearchTitle")}
+                aria-label={t("library.saveSearchTitle")} aria-keyshortcuts="Control+S"
+                onMouseDown={(e) => e.preventDefault()} onClick={promptSave}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M7 4h10a1 1 0 0 1 1 1v15l-6-4-6 4V5a1 1 0 0 1 1-1Z" />
+                </svg>
+              </button>
+            </Show>
+            <ScopeSelect roots={roots()} value={scope()} onChange={setScope} />
+          </>
+        }
       />
       <div class="progress" classList={{ active: indexing() }} aria-hidden="true" />
       <FilterChips value={chip()} onChange={setChip} content={searchContent()} onContentChange={setSearchContent} />
@@ -434,14 +620,33 @@ export default function App(props: { mode: WindowMode }) {
       />
 
       {/* In the popup the area is as tall as its rows (--list-h), so the window grows with them. */}
-      <div class="results-area" style={quick ? { "--list-h": `${listHeight()}px` } : undefined}>
+      <div
+        class="results-area"
+        style={quick ? { "--list-h": text().trim() ? `${listHeight()}px` : "auto" } : undefined}
+        onContextMenu={onResultsContextMenu}
+      >
         <Switch>
           <Match when={!text().trim()}>
-            <EmptyState onExample={setQuery} compact={quick} />
+            <LibraryPanel
+              ref={(h) => (library = h)}
+              compact={quick}
+              now={now()}
+              onRun={runFromLibrary}
+              onNotice={showNotice}
+              onExit={() => input.focus()}
+              fallback={<EmptyState onExample={setQuery} compact={quick} indexing={indexing()} />}
+              before={quick ? undefined : <EmptyState onExample={setQuery} library indexing={indexing()} />}
+            />
           </Match>
           <Match when={queryError() || failure()}>{null}</Match>
           <Match when={notReady() && !items().length}>
-            <NotReady failed={index()?.state === "error"} />
+            <NotReady
+              failed={index()?.state === "error"}
+              state={index()?.state}
+              message={index()?.error}
+              onRetry={retryIndexing}
+              onStart={() => void api.startIndexing()}
+            />
           </Match>
           <Match when={response() && !items().length}>
             <NoResults
@@ -462,6 +667,7 @@ export default function App(props: { mode: WindowMode }) {
           id={LIST_ID}
           label={t("search.resultsLabel")}
           items={items()}
+          truncated={!!response()?.truncated}
           selected={selected()}
           now={now()}
           compact={quick}
@@ -479,6 +685,25 @@ export default function App(props: { mode: WindowMode }) {
         <p class="quick-notice" role="status">{notice()}</p>
       </Show>
       <HintBar quick={quick} previewKey={towardPane() === "ArrowLeft" ? "←" : "→"} />
+      <Show when={menu()}>
+        {(m) => <ContextMenu x={m().x} y={m().y} label={t("library.menuLabel")} items={menuItems(m().index)} onClose={closeMenu} />}
+      </Show>
+      <Show when={savePrompt()}>
+        {(p) => (
+          <PromptDialog
+            title={t("library.saveTitle")}
+            label={t("library.nameLabel")}
+            detail={p().query}
+            initial={p().query}
+            confirm={t("library.saveConfirm")}
+            onSubmit={(name) => saveSearch(name, p().query, p().scope).then(() => showNotice(t("library.savedNotice", { name })))}
+            onClose={() => {
+              setSavePrompt(null);
+              input.focus();
+            }}
+          />
+        )}
+      </Show>
     </section>
   );
 
@@ -499,32 +724,49 @@ export default function App(props: { mode: WindowMode }) {
 
   return (
     <div class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <img src="/athrix.svg" alt="" />
-          <span class="brand-name" lang="en">{t("app.brandName")}</span>
-          <span class="brand-ar" lang="ar">{t("app.brandNative")}</span>
-        </div>
-        <Show when={info()}>
-          {(i) => (
-            <bdi class="version" dir="ltr" title={t("topbar.versionTitle")}>
-              {t("topbar.version", { version: i().version })}
-            </bdi>
+      <div>
+        <header class="topbar">
+          <div class="brand">
+            <img src="/athrix.svg" alt="" />
+            <span class="brand-name" lang="en">{t("app.brandName")}</span>
+            <span class="brand-ar" lang="ar">{t("app.brandNative")}</span>
+          </div>
+          <Show when={info()}>
+            {(i) => (
+              <bdi class="version" dir="ltr" title={t("topbar.versionTitle")}>
+                {t("topbar.version", { version: i().version })}
+              </bdi>
+            )}
+          </Show>
+          <button type="button" class="drives-btn" aria-pressed={previewOpen()}
+            aria-controls={previewOpen() ? PREVIEW_ID : undefined}
+            title={t(previewOpen() ? "preview.hide" : "preview.show")}
+            onMouseDown={(e) => e.preventDefault()} onClick={() => setPreview(!previewOpen())}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.5" y="4.5" width="17" height="15" rx="2" /><path d="M14 4.5v15" />
+            </svg>
+            {t("hints.preview")}
+          </button>
+          <button type="button" class="drives-btn" aria-haspopup="dialog" aria-keyshortcuts="Control+Comma"
+            title={t("settings.openTitle")} onClick={() => openSettings()}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 7h10M18 7h2M4 17h4M12 17h8" /><circle cx="16" cy="7" r="2" /><circle cx="10" cy="17" r="2" />
+            </svg>
+            {t("settings.title")}
+          </button>
+        </header>
+        <Show when={update()}>
+          {(u) => (
+            <div class="update-banner" role="status">
+              <span class="update-banner-text">{t("update.banner")} <bdi dir="ltr">{u().version ?? ""}</bdi></span>
+              <button type="button" class="btn-ghost" onClick={() => openSettings("about")}>{t("update.bannerOpen")}</button>
+              <button type="button" class="btn-ghost" onClick={() => setUpdate(null)}>{t("update.bannerDismiss")}</button>
+            </div>
           )}
         </Show>
-        <button type="button" class="drives-btn" aria-pressed={previewOpen()}
-          aria-controls={previewOpen() ? PREVIEW_ID : undefined}
-          title={t(previewOpen() ? "preview.hide" : "preview.show")}
-          onMouseDown={(e) => e.preventDefault()} onClick={() => setPreview(!previewOpen())}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
-            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="3.5" y="4.5" width="17" height="15" rx="2" /><path d="M14 4.5v15" />
-          </svg>
-          {t("hints.preview")}
-        </button>
-        <IndexSettings onError={(message) => showNotice(t("drives.failed", { message }))} />
-        <SettingsControls />
-      </header>
+      </div>
 
       <main ref={mainEl} class="main" classList={{ "with-preview": previewOpen() }}>
         {panel}
@@ -564,8 +806,35 @@ export default function App(props: { mode: WindowMode }) {
         notice={notice()}
         mock={usingMock}
         onRetry={retryIndexing}
-        content={<ContentStatusControl onError={(message) => showNotice(t("content.actionFailed", { message }))} />}
+        content={
+          <ContentStatusControl
+            onError={(message) => showNotice(t("content.actionFailed", { message }))}
+            onOpenSettings={() => openSettings("indexing")}
+          />
+        }
       />
+
+      <Show when={settingsOpen()}>
+        <SettingsDialog
+          initial={settingsSection()}
+          info={info()}
+          onClose={closeSettings}
+          onNotice={showNotice}
+          onShowWelcome={() => {
+            setSettingsOpen(false);
+            setWelcomeOpen(true);
+          }}
+        />
+      </Show>
+      <Show when={welcomeOpen()}>
+        <Onboarding
+          onNotice={showNotice}
+          onDone={() => {
+            setWelcomeOpen(false);
+            input.focus();
+          }}
+        />
+      </Show>
     </div>
   );
 }

@@ -25,12 +25,14 @@ athrix-extract.workspace = true
 athrix-fs-index.workspace = true
 athrix-query.workspace = true
 athrix-ranking.workspace = true
+athrix-store.workspace = true
 athrix-text-ar.workspace = true
 nass.workspace = true
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-opener.workspace = true
 tauri-plugin-global-shortcut.workspace = true
 tauri-plugin-single-instance.workspace = true
+tauri-plugin-updater.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Volume listing for the drive picker (mount point, label, removable): a safe wrapper over

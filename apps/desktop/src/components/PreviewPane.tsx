@@ -1,11 +1,12 @@
 import { batch, createEffect, createMemo, createSignal, For, Match, on, onCleanup, Show, Switch, type JSX } from "solid-js";
 import { locale, t, tPlural, type MessageKey } from "../i18n";
-import { api, errorMessage, isStaleIdError, type Preview, type PreviewBody, type Range16, type ResultItem } from "../lib/api";
+import { api, errorMessage, isStaleIdError, type Preview, type PreviewBody, type Range16, type ResultItem, type UnsupportedReason } from "../lib/api";
 import { categoryOf } from "../lib/fileKinds";
 import { formatCount, formatDateTime, formatSize } from "../lib/format";
 import { highlightSyntax, type SyntaxSpan } from "../lib/syntax";
 import { findMatches, queryTerms } from "../lib/textMatch";
-import { TypeIcon } from "./icons";
+import { StateBlock } from "./EmptyState";
+import { TypeIcon, type StateIconName } from "./icons";
 
 /** Text characters asked of the backend (its default too). */
 const MAX_CHARS = 65_536;
@@ -254,7 +255,15 @@ export default function PreviewPane(props: Props) {
             <p class="pv-note">{t("preview.empty")}</p>
           </Match>
           <Match when={failure()}>
-            {(msg) => <p class="pv-note" role="alert">{t("preview.failed", { message: msg() })}</p>}
+            {(msg) => (
+              <Show
+                when={!isStaleIdError(msg())}
+                fallback={<StateBlock icon="stale" live class="pv-state" title={t("preview.staleTitle")} body={t("preview.staleBody")} />}
+              >
+                <StateBlock icon="error" live class="pv-state" title={t("preview.failedTitle")}
+                  body={<bdi dir="auto">{msg()}</bdi>} />
+              </Show>
+            )}
           </Match>
           <Match when={!preview()}>
             <p class="pv-note">{t("preview.loading")}</p>
@@ -326,11 +335,17 @@ export default function PreviewPane(props: Props) {
           </Match>
           <Match when={bodyOf(preview(), "unsupported")}>
             {(u) => (
-              <div class="pv-unsupported">
-                <TypeIcon category={categoryOf(ext(), false)} />
-                <p>{t(`preview.reason.${u().reason}` as MessageKey)}</p>
-                <button type="button" class="btn-primary" onClick={() => props.onOpen()}>{t("preview.open")}</button>
-              </div>
+              // Why there is no preview (missing, too large, encrypted, unsupported, no PDF
+              // worker…): one icon, title and line; "open" unless the file is gone.
+              <StateBlock
+                icon={REASON_ICON[u().reason] ?? "unsupported"}
+                class="pv-state"
+                title={t(`preview.title.${u().reason}` as MessageKey)}
+                body={t(u().reason === "pdf" ? "preview.reason.pdfWorker" : (`preview.reason.${u().reason}` as MessageKey))}
+                action={u().reason === "missing" ? undefined : (
+                  <button type="button" class="btn-primary" onClick={() => props.onOpen()}>{t("preview.open")}</button>
+                )}
+              />
             )}
           </Match>
         </Switch>
@@ -351,6 +366,16 @@ export default function PreviewPane(props: Props) {
     </aside>
   );
 }
+
+const REASON_ICON: Record<UnsupportedReason, StateIconName> = {
+  pdf: "unsupported",
+  format: "unsupported",
+  tooLarge: "tooLarge",
+  encrypted: "locked",
+  corrupt: "damaged",
+  missing: "missing",
+  unreadable: "locked",
+};
 
 function Pieces(props: { pieces: Piece[] }): JSX.Element {
   return (

@@ -1,9 +1,13 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount } from "solid-js";
+import { locale, t, tPlural } from "../i18n";
 import type { ResultItem } from "../lib/api";
+import { formatCount } from "../lib/format";
 import ResultRow, { ROW_HEIGHT, rowHeight } from "./ResultRow";
 
 /** Rows rendered above and below the viewport. */
 const OVERSCAN = 6;
+/** The count is announced once typing pauses this long (not on every keystroke). */
+const ANNOUNCE_DELAY_MS = 450;
 
 export type ResultListHandle = {
   /** Rows that fit in the viewport (for PageUp/PageDown). */
@@ -22,6 +26,8 @@ type Props = {
   compact?: boolean;
   onSelect: (index: number) => void;
   onOpen: (index: number) => void;
+  /** The backend stopped at the limit: the announced count says "more than N". */
+  truncated?: boolean;
   /** Total height of all rows, in px (the popup sizes its list area with it). */
   onHeight?: (px: number) => void;
   ref?: (handle: ResultListHandle) => void;
@@ -100,6 +106,21 @@ export default function ResultList(props: Props) {
     setScrollTop(viewport.scrollTop);
   };
 
+  // Result count for screen readers ("23 نتيجة", plural-aware), in both windows (the popup has
+  // no status bar). Only non-empty sets: "no results" is announced by the NoResults state.
+  const [announced, setAnnounced] = createSignal("");
+  let announceTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(announceTimer));
+  createEffect(on(() => [props.items.length, !!props.truncated, locale()] as const, ([n, truncated]) => {
+    clearTimeout(announceTimer);
+    if (!n) {
+      setAnnounced("");
+      return;
+    }
+    const text = truncated ? t("results.truncated", { count: formatCount(n, locale()) }) : tPlural("results.count", n, formatCount(n, locale()));
+    announceTimer = setTimeout(() => setAnnounced(text), ANNOUNCE_DELAY_MS);
+  }));
+
   // New result set: back to the top.
   createEffect(on(() => props.items, () => scrollTo(0), { defer: true }));
 
@@ -146,6 +167,7 @@ export default function ResultList(props: Props) {
           }}
         </For>
       </div>
+      <p class="sr-only" role="status" aria-atomic="true">{announced()}</p>
     </div>
   );
 }

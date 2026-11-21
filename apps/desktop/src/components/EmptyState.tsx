@@ -1,40 +1,88 @@
-import { For, Show } from "solid-js";
+import { For, Show, type JSX } from "solid-js";
 import { t, type MessageKey } from "../i18n";
+import type { IndexState } from "../lib/api";
+import { StateIcon, type StateIconName } from "./icons";
 
 const EXAMPLES = [1, 2, 3, 4] as const;
+
+/** Keeps the caret in the search input when a state's button is clicked. */
+const keepFocus = (e: MouseEvent) => e.preventDefault();
+
+/**
+ * The common shape of every empty / error state (task 5.5): a calm line icon, one short title,
+ * one helpful line, at most one action. `live` announces it politely when it appears.
+ */
+export function StateBlock(props: {
+  icon: StateIconName;
+  title: JSX.Element;
+  body?: JSX.Element;
+  action?: JSX.Element;
+  live?: boolean;
+  class?: string;
+  children?: JSX.Element;
+}) {
+  return (
+    <div class={`state ${props.class ?? ""}`.trim()}>
+      <StateIcon name={props.icon} />
+      {/* The text in its own live region: the icon and the button are not read out with it. */}
+      <div class="state-text" role={props.live ? "status" : undefined}>
+        <h2 class="state-title">{props.title}</h2>
+        <Show when={props.body}>
+          <p class="state-body">{props.body}</p>
+        </Show>
+      </div>
+      <Show when={props.action}>
+        <div class="state-actions">{props.action}</div>
+      </Show>
+      {props.children}
+    </div>
+  );
+}
 
 /**
  * No query yet (design §9.3 "empty state"): a friendly line plus clickable example queries.
  * `compact` (the quick-search popup): a single hint line, so the popup stays small.
+ * `library`: the main window shows its library panel in this space instead, so only the
+ * indexing note (if any) remains here. `indexing`: the first indexing is still running.
  */
-export function EmptyState(props: { onExample: (query: string) => void; compact?: boolean }) {
-  if (props.compact) return <p class="state-hint">{t("empty.quickHint")}</p>;
+export function EmptyState(props: {
+  onExample: (query: string) => void;
+  compact?: boolean;
+  library?: boolean;
+  indexing?: boolean;
+}) {
+  if (props.compact) {
+    return <p class="state-hint">{t(props.indexing ? "empty.indexingNote" : "empty.quickHint")}</p>;
+  }
   return (
-    <div class="state">
-      <svg class="state-art" width="56" height="56" viewBox="0 0 56 56" fill="none" stroke="currentColor"
-        stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M14 8h18l10 10v26a4 4 0 0 1-4 4H14a4 4 0 0 1-4-4V12a4 4 0 0 1 4-4Z" />
-        <path d="M32 8v10h10" />
-        <circle cx="26" cy="31" r="6" />
-        <path d="m30.5 35.5 5 5" />
-      </svg>
-      <h2 class="state-title">{t("empty.title")}</h2>
-      <p class="state-body">{t("empty.body")}</p>
-      <div class="examples">
-        <span class="examples-label">{t("empty.examples")}</span>
-        <For each={EXAMPLES}>
-          {(n) => {
-            const q = () => t(`empty.ex${n}.query` as MessageKey);
-            return (
-              <button type="button" class="example" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onExample(q())}>
-                <bdi class="example-query" dir="auto">{q()}</bdi>
-                <span class="example-desc">{t(`empty.ex${n}.desc` as MessageKey)}</span>
-              </button>
-            );
-          }}
-        </For>
-      </div>
-    </div>
+    <Show
+      when={!props.library}
+      fallback={
+        <Show when={props.indexing}>
+          <p class="state-hint state-note" role="status">{t("empty.indexingNote")}</p>
+        </Show>
+      }
+    >
+      <StateBlock icon="search" class="state-welcome" title={t("empty.title")} body={t("empty.body")}>
+        <Show when={props.indexing}>
+          <p class="state-note" role="status">{t("empty.indexingNote")}</p>
+        </Show>
+        <div class="examples" role="group" aria-label={t("empty.examples")}>
+          <span class="examples-label" aria-hidden="true">{t("empty.examples")}</span>
+          <For each={EXAMPLES}>
+            {(n) => {
+              const q = () => t(`empty.ex${n}.query` as MessageKey);
+              return (
+                <button type="button" class="example" onMouseDown={keepFocus} onClick={() => props.onExample(q())}>
+                  <bdi class="example-query" dir="auto">{q()}</bdi>
+                  <span class="example-desc">{t(`empty.ex${n}.desc` as MessageKey)}</span>
+                </button>
+              );
+            }}
+          </For>
+        </div>
+      </StateBlock>
+    </Show>
   );
 }
 
@@ -44,12 +92,16 @@ export interface DidYouMean {
   kind: "layout" | "fuzzy";
 }
 
-/** A query with no matches (design §9.3 "no results"). */
+/**
+ * A query with no matches (design §9.3 "no results"). One action only, the most useful first:
+ * the "did you mean" rewrite, then widening the scope, then all types, then searching file
+ * contents too. The helpful line explains why that action is offered.
+ */
 export function NoResults(props: {
   query: string;
   filtered: boolean;
   onClearFilter: () => void;
-  /** Searching one drive only: offer the whole computer. */
+  /** Searching one drive or folder only: offer the whole computer. */
   scoped?: boolean;
   onClearScope?: () => void;
   /** A rewrite of the query that finds results (from `SearchResponse.suggestion`). */
@@ -58,42 +110,48 @@ export function NoResults(props: {
   /** Plain words do not search file contents yet: offer to (design §9.3 "no results"). */
   onSearchContent?: () => void;
 }) {
-  return (
-    <div class="state">
-      <h2 class="state-title">{t("noResults.title", { query: `⁨${props.query}⁩` /* bidi-isolated */ })}</h2>
-      <Show when={props.suggestion}>
-        {(s) => (
-          <button
-            type="button"
-            class="btn-primary did-you-mean"
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => props.onSuggestion?.(s().text)}
-          >
-            <Show when={s().kind === "layout"} fallback={t("noResults.tryFuzzy")}>
-              <DidYouMeanLabel text={s().text} />
+  type Offer = { body: MessageKey; action?: JSX.Element };
+  const offer = (): Offer => {
+    const s = props.suggestion;
+    if (s) {
+      return {
+        body: s.kind === "layout" ? "noResults.hintLayout" : "noResults.hintFuzzy",
+        action: (
+          <button type="button" class="btn-primary did-you-mean" onMouseDown={keepFocus} onClick={() => props.onSuggestion?.(s.text)}>
+            <Show when={s.kind === "layout"} fallback={t("noResults.tryFuzzy")}>
+              <DidYouMeanLabel text={s.text} />
             </Show>
           </button>
-        )}
-      </Show>
-      <p class="state-body">{t("noResults.hint")}</p>
-      <div class="state-actions">
-        <Show when={props.filtered}>
-          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={props.onClearFilter}>
-            {t("noResults.allTypes")}
-          </button>
-        </Show>
-        <Show when={props.scoped}>
-          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onClearScope?.()}>
-            {t("noResults.wholeComputer")}
-          </button>
-        </Show>
-        <Show when={props.onSearchContent}>
-          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onSearchContent?.()}>
-            {t("noResults.searchContent")}
-          </button>
-        </Show>
-      </div>
-    </div>
+        ),
+      };
+    }
+    if (props.scoped && props.onClearScope) {
+      return { body: "noResults.hintScoped", action: <ActionButton label={t("noResults.wholeComputer")} onClick={props.onClearScope} /> };
+    }
+    if (props.filtered) {
+      return { body: "noResults.hintFiltered", action: <ActionButton label={t("noResults.allTypes")} onClick={props.onClearFilter} /> };
+    }
+    if (props.onSearchContent) {
+      return { body: "noResults.hintContent", action: <ActionButton label={t("noResults.searchContent")} onClick={props.onSearchContent} /> };
+    }
+    return { body: "noResults.hintSpelling" };
+  };
+  return (
+    <StateBlock
+      icon="noResults"
+      live
+      title={t("noResults.title", { query: `⁨${props.query}⁩` /* bidi-isolated */ })}
+      body={t(offer().body)}
+      action={offer().action}
+    />
+  );
+}
+
+function ActionButton(props: { label: string; onClick: () => void }) {
+  return (
+    <button type="button" class="btn-secondary" onMouseDown={keepFocus} onClick={() => props.onClick()}>
+      {props.label}
+    </button>
   );
 }
 
@@ -113,12 +171,49 @@ function DidYouMeanLabel(props: { text: string }) {
   );
 }
 
-/** A query typed before the first indexing finished (or after it failed). */
-export function NotReady(props: { failed: boolean }) {
+/**
+ * A query typed while there is no usable index: never built (`state` "idle"), the first
+ * indexing still running, or it failed (`failed`, with the backend's `message` if given).
+ * `onStart` / `onRetry` add the one action; without them the line points at the status bar.
+ */
+export function NotReady(props: {
+  failed: boolean;
+  state?: IndexState;
+  message?: string | null;
+  onRetry?: () => void;
+  onStart?: () => void;
+}) {
+  const kind = () => (props.failed || props.state === "error" ? "error" : props.state === "idle" ? "idle" : "building");
   return (
-    <div class="state">
-      <h2 class="state-title">{t(props.failed ? "notReady.errorTitle" : "notReady.title")}</h2>
-      <p class="state-body">{t(props.failed ? "notReady.errorBody" : "notReady.body")}</p>
-    </div>
+    <Show
+      when={kind() !== "error"}
+      fallback={
+        <StateBlock
+          icon="error"
+          live
+          class="state-error"
+          title={t("notReady.errorTitle")}
+          body={props.onRetry ? t("notReady.errorHint") : t("notReady.errorBody")}
+          action={props.onRetry ? <ActionButton label={t("index.retry")} onClick={props.onRetry} /> : undefined}
+        >
+          <Show when={props.message}>
+            {(m) => <p class="state-detail"><bdi dir="auto">{m()}</bdi></p>}
+          </Show>
+        </StateBlock>
+      }
+    >
+      <Show
+        when={kind() === "idle"}
+        fallback={<StateBlock icon="building" live title={t("notReady.title")} body={t("notReady.body")} />}
+      >
+        <StateBlock
+          icon="notBuilt"
+          live
+          title={t("notReady.idleTitle")}
+          body={t("notReady.idleBody")}
+          action={props.onStart ? <ActionButton label={t("notReady.start")} onClick={props.onStart} /> : undefined}
+        />
+      </Show>
+    </Show>
   );
 }

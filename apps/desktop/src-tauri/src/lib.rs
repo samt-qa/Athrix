@@ -12,13 +12,18 @@
 //! - [`volumes`]: the drives of this computer;
 //! - [`state`]: state shared by the commands;
 //! - [`commands`]: the Tauri commands themselves;
+//! - [`library`]: search history, saved searches and favorites (SQLite) and their commands;
 //! - [`popup`]: the quick-search popup window and hide-to-tray of the main window;
 //! - [`shortcut`]: the global shortcut that toggles the popup;
-//! - [`tray`]: the system-tray icon and its menu.
+//! - [`tray`]: the system-tray icon and its menu;
+//! - [`launch_args`]: `--search-in <folder>` from Explorer's context menu;
+//! - [`updater`]: manual update checks / install and the update settings.
 
 pub mod commands;
 pub mod content;
 pub mod indexing;
+pub mod launch_args;
+pub mod library;
 pub mod model;
 pub mod pdf_worker;
 pub mod popup;
@@ -30,6 +35,7 @@ pub mod shortcut;
 pub mod state;
 pub mod suggest;
 pub mod tray;
+pub mod updater;
 pub mod volumes;
 
 use serde::Serialize;
@@ -95,20 +101,31 @@ pub fn run() {
     tauri::Builder::default()
         // First, per the plugin's docs: a second launch exits right away and this instance
         // shows its main window instead (no second tray icon, no failed shortcut).
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             tracing::info!("another launch of the app; showing the main window");
-            popup::show_main(app);
+            // `--search-in <folder>` (Explorer context menu) shows the window itself.
+            if !launch_args::handle_args(app, args, Some(std::path::Path::new(&cwd))) {
+                popup::show_main(app);
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(launch_args::SearchInState::default())
+        .manage(updater::UpdaterState::default())
         .manage(state::AppState::default())
         .manage(popup::PopupState::default())
+        .manage(library::Library::default())
         .setup(|app| {
             commands::start_default_indexing(app.handle());
+            library::open(app.handle());
             shortcut::register(app.handle());
             if let Err(err) = tray::create(app.handle()) {
                 tracing::warn!("couldn't create the tray icon: {err}");
             }
+            updater::init(app.handle());
+            let cwd = std::env::current_dir().ok();
+            launch_args::handle_args(app.handle(), std::env::args_os(), cwd.as_deref());
             Ok(())
         })
         .on_window_event(popup::on_window_event)
@@ -137,6 +154,24 @@ pub fn run() {
             commands::content_pause,
             commands::content_resume,
             commands::set_content_indexing,
+            library::history_list,
+            library::history_add,
+            library::history_remove,
+            library::history_clear,
+            library::saved_list,
+            library::saved_create,
+            library::saved_rename,
+            library::saved_delete,
+            library::favorite_list,
+            library::favorite_add,
+            library::favorite_remove,
+            library::favorite_open,
+            library::favorite_reveal,
+            launch_args::take_pending_search_in,
+            updater::update_check,
+            updater::update_install,
+            updater::get_update_settings,
+            updater::set_update_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Athrix app")

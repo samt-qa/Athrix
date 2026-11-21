@@ -1,6 +1,6 @@
 [package]
 name = "athrix-store"
-description = "SQLite store: tags, history, saved searches, index state."
+description = "SQLite store: search history, saved searches and favorites."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,13 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-athrix-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

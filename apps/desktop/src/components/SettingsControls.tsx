@@ -1,3 +1,4 @@
+import type { JSX } from "solid-js";
 import Segmented from "./Segmented";
 import { locale, setLocale, t, type Locale } from "../i18n";
 import { theme, setTheme, type Theme } from "../lib/theme";
@@ -20,28 +21,41 @@ const MoonIcon = () => (
   <svg {...iconProps}><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" /></svg>
 );
 
-export default function SettingsControls() {
+/** Icon + word, for the labelled settings rows. */
+const Labeled = (props: { icon?: JSX.Element; text: string; lang?: string }) => (
+  <span class="seg-labeled" lang={props.lang}>
+    {props.icon}
+    <span>{props.text}</span>
+  </span>
+);
+
+/** UI language: Arabic / English (applies at once, in both windows). */
+export function LanguageSetting() {
   return (
-    <div class="settings-controls">
-      <Segmented<Locale>
-        label={t("settings.language")}
-        value={locale()}
-        onChange={setLocale}
-        options={[
-          { value: "ar", label: t("settings.languageAr"), content: "ع", lang: "ar" },
-          { value: "en", label: t("settings.languageEn"), content: "EN", lang: "en" },
-        ]}
-      />
-      <Segmented<Theme>
-        label={t("settings.theme")}
-        value={theme()}
-        onChange={setTheme}
-        options={[
-          { value: "system", label: t("settings.themeSystem"), content: <SystemIcon /> },
-          { value: "light", label: t("settings.themeLight"), content: <SunIcon /> },
-          { value: "dark", label: t("settings.themeDark"), content: <MoonIcon /> },
-        ]}
-      />
-    </div>
+    <Segmented<Locale>
+      label={t("settings.language")}
+      value={locale()}
+      onChange={setLocale}
+      options={[
+        { value: "ar", label: t("settings.languageAr"), content: <Labeled text="العربية" lang="ar" />, lang: "ar" },
+        { value: "en", label: t("settings.languageEn"), content: <Labeled text="English" lang="en" />, lang: "en" },
+      ]}
+    />
+  );
+}
+
+/** Theme: follow the system / light / dark. */
+export function ThemeSetting() {
+  return (
+    <Segmented<Theme>
+      label={t("settings.theme")}
+      value={theme()}
+      onChange={setTheme}
+      options={[
+        { value: "system", label: t("settings.themeSystem"), content: <Labeled icon={<SystemIcon />} text={t("settings.themeSystem")} /> },
+        { value: "light", label: t("settings.themeLight"), content: <Labeled icon={<SunIcon />} text={t("settings.themeLight")} /> },
+        { value: "dark", label: t("settings.themeDark"), content: <Labeled icon={<MoonIcon />} text={t("settings.themeDark")} /> },
+      ]}
+    />
   );
 }

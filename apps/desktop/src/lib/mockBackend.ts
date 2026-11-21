@@ -17,8 +17,9 @@
 // More switches: `?mockBattery` (pauses "on battery" for 8 s at about a third of the way),
 // `?mockContentError` (the content indexer fails), `?mockContentRate=N` (docs per second).
 import type {
-  CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, IndexRoots, IndexStatus, MatchSource,
-  PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, SearchResponse, SearchSuggestion, Volume,
+  CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, Favorite, HistoryEntry, IndexRoots,
+  IndexStatus, MatchSource, PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, SavedSearch,
+  SearchResponse, SearchSuggestion, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
 import { tokenize, type Token } from "./queryLang";
@@ -1116,6 +1117,58 @@ function previewBody(entry: MockEntry, maxChars: number): PreviewBody {
   return { kind: "unsupported", reason: "format", message: `no preview for .${it.ext || "?"} files` };
 }
 
+// ---------- history, saved searches, favorites (task 5.3): in memory, seeded ----------
+
+const MINUTE = 60_000;
+const t0 = Date.now();
+let nextLibraryId = 100;
+let history: HistoryEntry[] = [
+  { id: 3, query: "تقرير", scope: null, searchedAt: t0 - 4 * MINUTE, count: 3 },
+  { id: 2, query: "ext:pdf dm:thisweek", scope: null, searchedAt: t0 - 95 * MINUTE, count: 1 },
+  { id: 1, query: "invoice", scope: "D:\\", searchedAt: t0 - 26 * 60 * MINUTE, count: 2 },
+];
+let saved: SavedSearch[] = [
+  { id: 10, name: "فواتير هذا العام", query: "فاتورة ext:pdf", scope: null, createdAt: t0 - 3 * 24 * 60 * MINUTE },
+];
+let favorites: Favorite[] = [
+  { path: `${HOME}\\Documents\\العمل`, name: "العمل", isDir: true, addedAt: t0 - 7 * 24 * 60 * MINUTE, exists: true },
+  { path: `${HOME}\\Desktop\\خطة المشروع.pptx`, name: "خطة المشروع.pptx", isDir: false, addedAt: t0 - 2 * 24 * 60 * MINUTE, exists: true },
+  { path: `${HOME}\\Downloads\\old-draft.docx`, name: "old-draft.docx", isDir: false, addedAt: t0 - 30 * 24 * 60 * MINUTE, exists: false },
+];
+
+function addHistory(query: string, scope: string | null) {
+  const q = query.trim();
+  if (!q) throw "empty query";
+  const same = history.find((h) => h.query === q && (h.scope ?? "") === (scope ?? ""));
+  history = history.filter((h) => h !== same);
+  history.unshift(same
+    ? { ...same, searchedAt: Date.now(), count: same.count + 1 }
+    : { id: nextLibraryId++, query: q, scope, searchedAt: Date.now(), count: 1 });
+  history = history.slice(0, 200);
+}
+
+function findSaved(id: number): SavedSearch {
+  const s = saved.find((x) => x.id === id);
+  if (!s) throw `no saved search with id ${id}`;
+  return s;
+}
+
+function cleanName(name: unknown): string {
+  const n = typeof name === "string" ? name.trim() : "";
+  if (!n) throw "the name is empty";
+  return n.slice(0, 120);
+}
+
+function findFavorite(path: string): Favorite {
+  const f = favorites.find((x) => pathKey(x.path) === pathKey(path));
+  if (!f) throw `not a favorite: ${path}`;
+  if (!f.exists) throw `not found: ${path}`;
+  return f;
+}
+
+/** The "check for updates at start-up" setting (Rust keeps it in its settings file). */
+let mockAutoUpdate = false;
+
 /** Dispatches one command. Rejections carry an English string, like Tauri commands. */
 export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs<C> | undefined): Promise<CommandResult<C>> {
   const args = (rawArgs ?? {}) as Record<string, unknown>;
@@ -1213,6 +1266,81 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       result = `${it.parent}\\${it.name}`;
       break;
     }
+    case "history_list": {
+      const limit = typeof args.limit === "number" ? Math.max(0, Math.floor(args.limit)) : 50;
+      result = history.slice(0, limit).map((h) => ({ ...h }));
+      break;
+    }
+    case "history_add":
+      addHistory(String(args.query ?? ""), (args.scope as string | null | undefined) ?? null);
+      break;
+    case "history_remove":
+      history = history.filter((h) => h.id !== args.id);
+      break;
+    case "history_clear":
+      history = [];
+      break;
+    case "saved_list":
+      result = saved.map((s) => ({ ...s }));
+      break;
+    case "saved_create": {
+      const query = String(args.query ?? "").trim();
+      if (!query) throw "empty query";
+      const s: SavedSearch = {
+        id: nextLibraryId++, name: cleanName(args.name), query,
+        scope: (args.scope as string | null | undefined) ?? null, createdAt: Date.now(),
+      };
+      saved = [s, ...saved];
+      result = { ...s };
+      break;
+    }
+    case "saved_rename": {
+      const s = findSaved(args.id as number);
+      s.name = cleanName(args.name);
+      result = { ...s };
+      break;
+    }
+    case "saved_delete":
+      findSaved(args.id as number);
+      saved = saved.filter((s) => s.id !== args.id);
+      break;
+    case "favorite_list":
+      result = favorites.map((f) => ({ ...f }));
+      break;
+    case "favorite_add": {
+      const it = findEntry(args.id as number);
+      const path = `${it.parent}\\${it.name}`;
+      const existing = favorites.find((f) => pathKey(f.path) === pathKey(path));
+      const f: Favorite = existing ?? { path, name: it.name, isDir: it.isDir, addedAt: Date.now(), exists: true };
+      if (!existing) favorites = [f, ...favorites];
+      result = { ...f };
+      break;
+    }
+    case "favorite_remove":
+      favorites = favorites.filter((f) => pathKey(f.path) !== pathKey(String(args.path ?? "")));
+      break;
+    case "favorite_open":
+      console.info("[mock] favorite_open", findFavorite(String(args.path ?? "")).path);
+      break;
+    case "favorite_reveal":
+      console.info("[mock] favorite_reveal", findFavorite(String(args.path ?? "")).path);
+      break;
+    case "take_pending_search_in":
+      result = null;
+      break;
+    case "update_check":
+      await sleep(600);
+      result = { available: false };
+      break;
+    case "update_install":
+      throw "no update to install (mock)";
+    case "get_update_settings":
+      result = { autoUpdateCheck: mockAutoUpdate };
+      break;
+    case "set_update_settings":
+      mockAutoUpdate = (args.settings as { autoUpdateCheck?: boolean } | undefined)?.autoUpdateCheck === true;
+      result = { autoUpdateCheck: mockAutoUpdate };
+      break;
     default:
       throw `unknown command ${String(cmd)}`;
   }

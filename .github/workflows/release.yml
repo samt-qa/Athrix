@@ -1,0 +1,63 @@
+name: Release
+
+# Builds the Windows installer when a version tag is pushed (v0.1.0, v1.0.0-beta.1, ...) and
+# attaches it to a DRAFT GitHub release together with the updater files (latest.json + .sig).
+# Nothing is published until someone reviews and publishes the draft. See docs/RELEASE.md.
+#
+# Secrets:
+#   TAURI_SIGNING_PRIVATE_KEY           updater private key (content of updater.key), required
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password (empty for the current key), optional
+# Authenticode signing is not wired yet (no certificate; docs/RELEASE.md explains how).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      # `npm run tauri` stages the release PDF worker (src-tauri/binaries) before building.
+      # createUpdaterArtifacts is enabled only here, so local builds need no signing key.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: npm run tauri --
+          args: --config {"bundle":{"createUpdaterArtifacts":true}}
+          tagName: ${{ github.ref_name }}
+          releaseName: Athrix ${{ github.ref_name }}
+          releaseBody: "See the assets below to download and install this version."
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true

@@ -1,3 +1,5 @@
+import { createSignal } from "solid-js";
+
 // localStorage access that never throws: storage can be disabled, full, or blocked.
 const PREFIX = "athrix.";
 
@@ -25,4 +27,18 @@ export function onSettingChange(key: string, handler: (value: string | null) => 
   window.addEventListener("storage", (e) => {
     if (e.key === PREFIX + key) handler(e.newValue);
   });
+}
+
+/**
+ * An on/off setting kept in local storage as "1" / "0", followed across windows. Returns the
+ * reactive getter and a setter that persists. Create it at module level (one per key).
+ */
+export function storedFlag(key: string, fallback: boolean): [() => boolean, (on: boolean) => void] {
+  const read = (v: string | null) => (v === "1" ? true : v === "0" ? false : fallback);
+  const [get, set] = createSignal(read(readSetting(key)));
+  onSettingChange(key, (v) => set(read(v)));
+  return [get, (on: boolean) => {
+    set(on);
+    writeSetting(key, on ? "1" : "0");
+  }];
 }

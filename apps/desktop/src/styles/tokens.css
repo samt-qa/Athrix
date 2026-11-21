@@ -20,8 +20,10 @@
   --bg-row-hover: var(--beige-200);
   --bg-row-selected: var(--burgundy-100);
   --text-primary: var(--gray-900);
-  --text-secondary: var(--gray-600);
-  --text-muted: var(--gray-500);
+  /* Contrast (task 5.6): both ≥ 4.5:1 on every light surface, row hover and selection included.
+     Was gray-600 / gray-500 (muted 3.15–3.94:1, failing). */
+  --text-secondary: #5E575B;
+  --text-muted: var(--gray-600);
   --text-on-accent: #FFFFFF;
   --accent: var(--burgundy-700);
   --accent-hover: var(--burgundy-500);
@@ -37,8 +39,9 @@
   --kbd-edge: var(--beige-400);
 
   /* Status (design §2.4) */
-  --success: #3F7A5A;
-  --warning: #A6722A;
+  /* Darkened for text use (query tokens, code strings): was #3F7A5A (3.99:1 on hover) and #A6722A (3.27:1). */
+  --success: #396F52;
+  --warning: #865C22;
   --danger: #B3261E;
   --info: #3E6A8A;
 
@@ -83,7 +86,7 @@
     color-scheme: dark;
     --bg-app:#1C1719; --bg-surface:#261F22; --bg-surface-raised:#2F272B; --bg-sunken:#161214;
     --bg-input:#211B1E; --bg-row-hover:#2A2326; --bg-row-selected:#3A1E25;
-    --text-primary:#E9E2E4; --text-secondary:#A39A9E; --text-muted:#7D7478; --text-on-accent:#1C1719;
+    --text-primary:#E9E2E4; --text-secondary:#B0A7AB; --text-muted:#9A8F94; --text-on-accent:#1C1719;
     --accent:#E38795; --accent-hover:#EC9AA6; --accent-pressed:#D4707F; --accent-subtle:#2E1A1F;
     --border:#3A3236; --border-strong:#4D4448; --border-warm:#3F3530;
     --focus-ring: rgb(227 135 149 / .50); --match-bg:#4A1F28; --match-fg:#F3C9CF;
@@ -98,7 +101,7 @@
   color-scheme: dark;
   --bg-app:#1C1719; --bg-surface:#261F22; --bg-surface-raised:#2F272B; --bg-sunken:#161214;
   --bg-input:#211B1E; --bg-row-hover:#2A2326; --bg-row-selected:#3A1E25;
-  --text-primary:#E9E2E4; --text-secondary:#A39A9E; --text-muted:#7D7478; --text-on-accent:#1C1719;
+  --text-primary:#E9E2E4; --text-secondary:#B0A7AB; --text-muted:#9A8F94; --text-on-accent:#1C1719;
   --accent:#E38795; --accent-hover:#EC9AA6; --accent-pressed:#D4707F; --accent-subtle:#2E1A1F;
   --border:#3A3236; --border-strong:#4D4448; --border-warm:#3F3530;
   --focus-ring: rgb(227 135 149 / .50); --match-bg:#4A1F28; --match-fg:#F3C9CF;

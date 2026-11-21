@@ -30,7 +30,10 @@ tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
-serde = { version = "1", features = ["derive"] }
+# Manual update checks (off by default: no internet unless the user asks). native-tls = the OS
+# TLS (SChannel on Windows): no C build, smaller than rustls+ring. No `zip`: NSIS updates only.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls"] }
+serde ={ version = "1", features = ["derive"] }
 serde_json = "1"
 
 # External
@@ -61,6 +64,8 @@ sysinfo = { version = "0.36", default-features = false }
 starship-battery = "0.10.2"
 # athrix-daemon: lower worker-thread priority through a safe API (MSRV 1.85)
 thread-priority = "3.1"
+# athrix-store: SQLite with the bundled C library (no system sqlite). Pinned: builds on 1.85.
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -22,7 +22,7 @@ function formatMs(ms: number): string {
   }).format(ms >= 1000 ? ms / 1000 : ms);
 }
 
-/** Index state, transient notices, and the result count (announced politely). */
+/** Index state, transient notices, and the result count (ResultList announces it). */
 export default function StatusBar(props: Props) {
   const count = () => {
     const r = props.response;
@@ -34,7 +34,7 @@ export default function StatusBar(props: Props) {
 
   return (
     <footer class="statusbar">
-      <span class={`index-state index-${props.index?.state ?? "idle"}`}>
+      <span class={`index-state index-${props.index?.state ?? "idle"}`} role="status">
         <span class="dot" aria-hidden="true" />
         <Switch fallback={t("index.idle")}>
           <Match when={props.index?.state === "indexing"}>{t("index.indexing")}</Match>
@@ -48,7 +48,8 @@ export default function StatusBar(props: Props) {
           <Match when={props.index?.state === "error" && props.index}>
             {(s) => (
               <>
-                {t("index.error", { message: s().error ?? "" })}
+                {/* The backend's message is English: isolated so it keeps its own direction. */}
+                {t("index.error", { message: `⁨${s().error ?? ""}⁩` })}
                 <button type="button" class="link-btn" onClick={props.onRetry}>{t("index.retry")}</button>
               </>
             )}
@@ -68,7 +69,8 @@ export default function StatusBar(props: Props) {
       </Show>
       <span class="status-end">
         <span class="notice" role="status">{props.notice ?? ""}</span>
-        <span class="count" aria-live="polite" aria-atomic="true">{count()}</span>
+        {/* Not a live region: the results list announces its count (in the popup too). */}
+        <span class="count">{count()}</span>
         <Show when={props.response && !props.response.error}>
           <span class="elapsed">{t("results.elapsed", { time: formatMs(props.response!.elapsedMs) })}</span>
         </Show>

@@ -98,8 +98,9 @@ fn cut_start(text: &str, min: usize, lo: usize) -> usize {
     while !text.is_char_boundary(s) {
         s += 1;
     }
-    match text[s..lo].find(char::is_whitespace) {
-        Some(i) if s > 0 => s + i + 1,
+    // Skip the whole whitespace char: some take several bytes (U+00A0: 2, U+3000: 3).
+    match text[s..lo].char_indices().find(|&(_, c)| c.is_whitespace()) {
+        Some((i, c)) if s > 0 => s + i + c.len_utf8(),
         _ => s,
     }
 }
@@ -154,6 +155,24 @@ mod tests {
         assert_eq!(s.highlights.len(), 2);
         assert_eq!(&s.fragment[s.highlights[1].clone()], "الايجار");
         assert_eq!(&text[s.offset..s.offset + s.fragment.len()], s.fragment);
+    }
+
+    /// Regression (found by the perf audit, task 5.8): a multi-byte whitespace (here a
+    /// no-break space, 2 bytes in UTF-8) just before the window start made `cut_start` return
+    /// an offset inside it, and slicing the fragment panicked.
+    #[test]
+    fn multi_byte_whitespace_before_the_window_is_skipped_whole() {
+        for ws in ['\u{a0}', '\u{2003}', '\u{3000}'] {
+            for pad in 0..12 {
+                let filler: String = std::iter::repeat_n(format!("yy{ws}"), 30).collect();
+                let text = format!("{}{ws}{filler}match here", "x".repeat(pad));
+                for max in [8, 12, 20, 40, 80] {
+                    let s = make(&text, &terms(&["match"]), Analyzer::default(), max);
+                    assert_eq!(&text[s.offset..s.offset + s.fragment.len()], s.fragment);
+                    assert_eq!(&s.fragment[s.highlights[0].clone()], "match");
+                }
+            }
+        }
     }
 
     #[test]

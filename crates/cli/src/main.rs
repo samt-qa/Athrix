@@ -2,6 +2,8 @@
 //! snapshots, and print names as the index normalizes them. Mostly a measuring and debugging
 //! tool for now; the full CLI comes in M7 (task 7.1).
 
+mod bench;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -22,7 +24,13 @@ const USAGE: &str = "usage:
       The app's default exclusions (.git, node_modules, $RECYCLE.BIN, ...) apply unless
       --no-default-excludes is given.
   athrix search <SNAPSHOT> <QUERY>... [--limit N]
-      load a snapshot written by `index --save` and print the matching paths";
+      load a snapshot written by `index --save` and print the matching paths
+  athrix bench names <SNAPSHOT> [--rounds N] [--limit N]
+      load a snapshot (read only) and time realistic typing, keystroke by keystroke
+  athrix bench content <ROOT>... --index-dir DIR [--max-files N] [--max-bytes N]
+               [--names SNAPSHOT] [--rounds N] [--reuse]
+      extract documents under the roots into a scratch content index, then time content
+      queries (see docs/PERF-AUDIT.md)";
 
 /// Same defaults as the desktop app (`apps/desktop/src-tauri/src/indexing.rs`), so CLI
 /// measurements index what the app indexes.
@@ -52,6 +60,7 @@ fn main() -> ExitCode {
         }
         Some("index") => cmd_index(&args[1..]),
         Some("search") => cmd_search(&args[1..]),
+        Some("bench") => bench::cmd_bench(&args[1..]),
         _ => Err(Usage(None).into()),
     };
     match result {

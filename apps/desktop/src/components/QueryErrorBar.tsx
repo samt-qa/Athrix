@@ -16,7 +16,12 @@ type Props = {
 /** Localized message for a QueryError: i18n by `kind`, falling back to the English message. */
 export function queryErrorMessage(err: QueryError, text: string): string {
   const key = `queryError.${err.kind}`;
-  if (!hasMessage(key)) return err.message;
+  if (!hasMessage(key)) {
+    // A kind this UI does not know yet: a localized generic line pointing at the span, rather
+    // than the backend's English message (kept only when there is no span to point at).
+    const at = text.slice(err.start, err.end).trim();
+    return at ? t("queryError.generic", { span: `⁨${at}⁩` }) : err.message;
+  }
   const span = text.slice(err.start, err.end).trim() || err.message;
   // First-strong isolates (FSI…PDI) keep "szie:" intact inside Arabic sentences.
   return t(key, { span: `\u2068${span}\u2069` });
@@ -30,9 +35,13 @@ function suggestionText(err: QueryError, text: string): string {
 
 /** One-line error strip under the chips: message + "Did you mean …" action. */
 export default function QueryErrorBar(props: Props) {
+  // The live region stays mounted (a region inserted together with its text is often not read)
+  // and is polite: a half-typed filter ("size:") must not interrupt every keystroke. The error
+  // is also the input's aria-describedby, and its span is underlined in the field.
   return (
+    <div class="query-error-live" role="status">
     <Show when={props.error || props.failure}>
-      <div id={props.id} class="query-error" role="alert">
+      <div id={props.id} class="query-error" classList={{ "query-error-failure": !props.error }}>
         <AlertIcon />
         <span class="query-error-text">
           {props.error ? queryErrorMessage(props.error, props.text) : props.failure}
@@ -56,5 +65,6 @@ export default function QueryErrorBar(props: Props) {
         </Show>
       </div>
     </Show>
+    </div>
   );
 }

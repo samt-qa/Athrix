@@ -245,3 +245,78 @@ type PreviewBody =          // موسوم بالحقل kind
 - بالمسار: `**/AppData/Local/Temp`، `**/Windows/WinSxS` (مخزن مكونات ويندوز: نحو 100 ألف نسخة مرتبطة من ملفات النظام).
 - خارج ويندوز فقط: `/proc`، `/sys`، `/dev`.
 - لا تُتبع الروابط الرمزية ولا الـ junctions (مثل `Documents and Settings`). الملفات مثل `pagefile.sys` و `hiberfil.sys` تُفهرس كأسماء عادية.
+
+## مكتبة البحث: السجل والبحوث المحفوظة والمفضلة (المهمة 5.3)
+تُحفظ في `<app_data>/library.sqlite3` (SQLite، `athrix-store`). يُفتح الملف مرة عند الإقلاع؛ ملف تالف يُعاد تسميته إلى
+`library.sqlite3.corrupt-<unix ms>` ويُنشأ ملف جديد فارغ، فلا يمنع إقلاع التطبيق. إن تعذّر الفتح كليًا تُرفض أوامر هذا القسم
+برسالة (string) ويبقى باقي التطبيق يعمل.
+
+```ts
+interface HistoryEntry { id: number; query: string; scope: string | null; searchedAt: number /* unix ms */; count: number }
+interface SavedSearch { id: number; name: string; query: string; scope: string | null; createdAt: number /* unix ms */ }
+interface Favorite { path: string; name: string; isDir: boolean; addedAt: number /* unix ms */; exists: boolean }
+```
+
+| الأمر | المدخلات | المخرجات | ملاحظات |
+|---|---|---|---|
+| `history_list` | `{ limit?: number }` | `HistoryEntry[]` | الأحدث أولًا. الافتراضي 50، والحد الأعلى 500 |
+| `history_add` | `{ query: string, scope: string \| null }` | `void` | تستدعيه الواجهة عند Enter أو فتح نتيجة، لا مع كل حرف. الاستعلام يُقصّ؛ الفارغ يُتجاهل. الزوج (query, scope) نفسه لا يتكرر: تُحدَّث `searchedAt` ويزيد `count`. يُحتفظ بآخر 500 فقط (الأقدم يُحذف) |
+| `history_remove` | `{ id: number }` | `void` | |
+| `history_clear` | — | `void` | |
+| `saved_list` | — | `SavedSearch[]` | الأحدث أولًا |
+| `saved_create` | `{ name: string, query: string, scope: string \| null }` | `SavedSearch` | الاسم يُقصّ، غير فارغ، بحد أقصى 120 حرفًا (لا يشترط التفرد). استعلام فارغ ⇠ رفض. `scope` فارغ = `null` |
+| `saved_rename` | `{ id: number, name: string }` | `SavedSearch` | قواعد الاسم نفسها. معرّف غير موجود ⇠ `"saved search not found"` |
+| `saved_delete` | `{ id: number }` | `void` | |
+| `favorite_list` | — | `Favorite[]` | الأحدث أولًا. `exists` يُفحص لحظة الطلب (ملف حُذف أو قرص غير موصول ⇠ `false`) |
+| `favorite_add` | `{ id: number }` | `Favorite` | `id` معرّف نتيجة (لا مسار)، يُحلّ كما في `open_entry`؛ المعرّف القديم ⇠ `"this result is out of date; search again"`. إضافة مسار موجود تحدّثه وتنقله إلى الأعلى |
+| `favorite_remove` | `{ path: string }` | `void` | |
+| `favorite_open` | `{ path: string }` | `void` | يفتح بالبرنامج الافتراضي (ويسجّل فتحًا في Frecency) — فقط لمسار في المفضلة، وإلا `"not a favorite"` |
+| `favorite_reveal` | `{ path: string }` | `void` | يفتح المجلد ويحدّد العنصر، بالقاعدة نفسها |
+
+ملاحظات:
+- قاعدة الأمان: المسارات لا تنتقل من الواجهة إلى Rust إلا في أوامر المفضلة الثلاثة الأخيرة، وهي تعمل فقط على مسار مخزّن في
+  المفضلة (يُفتح المسار المخزّن، لا النص المرسل). الإضافة دائمًا بمعرّف نتيجة.
+- مقارنة مسارات المفضلة غير حساسة لحالة الأحرف على ويندوز (و `/` ≡ `\`)، كمفاتيح المسارات في فهرس المحتوى.
+- `scope` في السجل والبحوث المحفوظة نص كما في `search.scope` (`null` = كل الفهرس)؛ لا يُتحقق منه هنا.
+
+## «ابحث هنا بـ Athrix» من مستكشف ويندوز (المهمة 5.4)
+- المثبّت يسجّل أمرًا في قائمة الزر الأيمن للمجلدات والأقراص وخلفية المجلد المفتوح (HKCU، بلا صلاحيات مدير) يشغّل
+  `"<مجلد التثبيت>\Athrix.exe" --search-in "%V"`. في ويندوز 11 يظهر تحت «إظهار المزيد من الخيارات».
+- يُقرأ `--search-in <مسار>` (أو `--search-in=<مسار>`) من سطر الأوامر عند الإقلاع، ومن نداء النسخة الواحدة إن كان التطبيق
+  يعمل. المسار يجب أن يكون مجلدًا موجودًا، وإلا يُتجاهل (يُسجَّل فقط). في الحالتين تُظهر النافذة الرئيسية وتُركَّز.
+- **التسليم للواجهة** (بلا تكرار):
+  - قبل أن تستدعي الواجهة `take_pending_search_in` لأول مرة، يُحفظ المجلد معلّقًا (الأحدث يغلب).
+  - بعد أول استدعاء، كل مجلد جديد يُرسل حدثًا `app://search-in` إلى النافذة الرئيسية فقط.
+  - لذلك: تستدعي الواجهة `take_pending_search_in` **مرة واحدة عند الإقلاع** (بعد تسجيل المستمع) وتستمع للحدث، وتحوّل المسار
+    في الحالتين إلى استعلام `infolder:"<path>"`.
+
+| الأمر / الحدث | الوسائط / الحمولة | النتيجة | ملاحظات |
+|---|---|---|---|
+| `take_pending_search_in` | — | `string \| null` | المجلد المعلّق (ويُمسح)، ويحوّل التسليم اللاحق إلى الحدث |
+| حدث `app://search-in` | `{ path: string }` | — | مسار مطلق لمجلد موجود |
+
+## التحديثات (المهمة 5.7)
+مبدأ الخصوصية: **لا اتصال بالإنترنت افتراضيًا**. التطبيق لا يسأل خادم التحديثات إلا إذا طلب المستخدم ذلك (زر «تحقق من
+التحديثات») أو فعّل الإعداد `autoUpdateCheck` (مطفأ افتراضيًا)، وعندها يجري فحص واحد في الخلفية عند الإقلاع فقط. لا يُثبَّت
+شيء أبدًا دون طلب المستخدم.
+
+```ts
+interface UpdateInfo {
+  available: boolean;
+  version?: string;   // فقط حين available
+  notes?: string;     // ملاحظات الإصدار إن وُجدت
+}
+interface UpdateSettings {
+  autoUpdateCheck: boolean; // الافتراضي false
+}
+```
+
+| الأمر / الحدث | الوسائط / الحمولة | النتيجة | ملاحظات |
+|---|---|---|---|
+| `update_check` | — | `UpdateInfo` | فحص يدوي. خطأ (نص إنجليزي) عند انقطاع الشبكة أو تعذّر الوصول للعنوان أو رد غير صالح |
+| `update_install` | — | `void` | يفحص من جديد، ينزّل الإصدار ويتحقق من توقيعه ثم يثبّته ويعيد التشغيل. على ويندوز يشغّل المثبّت في الوضع الصامت (passive) وتخرج العملية (لا يعود الوعد غالبًا)؛ فهرس المحتوى يُحفظ قبل الخروج. لا تحديث ⇠ خطأ `"no update available"` |
+| `get_update_settings` | — | `UpdateSettings` | |
+| `set_update_settings` | `{ settings: UpdateSettings }` | `UpdateSettings` | يُحفظ في `<app_data>/update-settings.json`، ويسري من الإقلاع التالي. فشل الحفظ ⇠ خطأ، والقيمة تبقى للجلسة |
+| حدث `app://update-available` | `UpdateInfo` | — | فقط من فحص الإقلاع حين `autoUpdateCheck = true` ووُجد إصدار أحدث |
+
+- العنوان: `latest.json` من GitHub Releases (`samt-qa/Athrix`)؛ ما دام المستودع خاصًا فالفحص يفشل (انظر `docs/RELEASE.md`).
