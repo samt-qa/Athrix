@@ -10,10 +10,11 @@
 //! - **Tombstones**: a bitset over base ids. Removing a path marks the base entry and, for a
 //!   folder, its whole subtree. A base file whose size or time changed is tombstoned too and
 //!   re-added in the delta with the new metadata.
-//! - **Delta**: added and updated entries, kept as a sorted map from [path key](path_key) to
-//!   entry. After each batch the map is turned into a small ordinary [`FileIndex`] in which
-//!   every entry whose parent lives in the base gets a chain of hidden **anchor** entries: copies
-//!   of its base ancestors (names, normalized names and metadata), from the root down. The delta
+//! - **Delta**: added and updated entries, kept as a sorted map from path key (`/` separators,
+//!   case-folded on Windows) to entry. After each batch the map is turned into a small ordinary
+//!   [`FileIndex`] in which every entry whose parent lives in the base gets a chain of hidden
+//!   **anchor** entries: copies of its base ancestors (names, normalized names and metadata),
+//!   from the root down. The delta
 //!   index is therefore self-contained, so *all* query features (path, `parent:`, `infolder:`,
 //!   wildcards on folders...) evaluate exactly as in the base, with the same compiled query and
 //!   the same scan code. Anchors are masked out of results.
@@ -679,8 +680,9 @@ impl LiveIndex {
         self.finish(st, stats)
     }
 
-    /// Replaces the base with a freshly walked index (after [`WatchBatch::RescanNeeded`]
-    /// (crate::WatchBatch)), dropping the overlay. Renumbers all ids.
+    /// Replaces the base with a freshly walked index (after
+    /// [`WatchBatch::RescanNeeded`](crate::WatchBatch::RescanNeeded)), dropping the overlay.
+    /// Renumbers all ids.
     pub fn replace_base(&self, base: impl Into<Arc<FileIndex>>) {
         let mut st = self.lock();
         st.set_base(base.into());

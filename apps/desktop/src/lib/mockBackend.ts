@@ -9,7 +9,7 @@
 // it rejects with the stale-id error and the ids change, like the Rust side).
 import type {
   CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, QueryError, Range16, ResultItem, SearchResponse,
-  Volume,
+  SearchSuggestion, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
 
@@ -208,7 +208,7 @@ const ARABIC_FILTERS: Record<string, string> = {
 };
 const VALUE_FILTERS = new Set(["ext", "type", "size", "dm", "dc", "da", "path", "parent", "infolder", "tag"]);
 /** Valid filters the name index cannot answer yet (contract: QueryError.kind "Unsupported"). */
-const UNSUPPORTED = new Set(["content", "sem", "tag", "regex", "fuzzy", "dupe", "similar", "dc", "da"]);
+const UNSUPPORTED = new Set(["content", "sem", "tag", "regex", "dupe", "similar", "dc", "da"]);
 const KINDS: Record<string, string> = {
   doc: "doc", docs: "doc", document: "doc", documents: "doc", "مستند": "doc", "مستندات": "doc",
   image: "image", images: "image", "صورة": "image", "صور": "image",
@@ -224,6 +224,10 @@ interface Parsed {
   kinds: string[] | null;
   exts: string[] | null;
   size: { op: string; bytes: number } | null;
+  /** `fuzzy:word` terms. */
+  fuzzy: string[];
+  /** The valueless `fuzzy:` switch: every plain word is fuzzy. */
+  fuzzyAll: boolean;
 }
 
 class MockParseError extends Error {
@@ -263,7 +267,7 @@ function closest(word: string, list: string[]): string | null {
 const SIZE_UNITS: Record<string, number> = { "": 1, b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3 };
 
 function parse(q: string): Parsed {
-  const out: Parsed = { terms: [], negated: [], kinds: null, exts: null, size: null };
+  const out: Parsed = { terms: [], negated: [], kinds: null, exts: null, size: null, fuzzy: [], fuzzyAll: false };
   let i = 0;
   while (i < q.length) {
     if (/\s/.test(q[i])) { i++; continue; }
@@ -322,6 +326,10 @@ function applyFilter(out: Parsed, name: string, value: string, start: number, va
     const m = /^(>=|<=|>|<|=)?(\d+(?:\.\d+)?)(b|kb|mb|gb)?$/i.exec(value);
     if (!m) fail("InvalidSize", valueStart, valueStart + value.length, `cannot read size \`${value}\``);
     out.size = { op: m[1] ?? "=", bytes: Number(m[2]) * SIZE_UNITS[(m[3] ?? "").toLowerCase()] };
+  }
+  else if (name === "fuzzy") {
+    if (value) out.fuzzy.push(value);
+    else out.fuzzyAll = true;
   }
   else if (UNSUPPORTED.has(name)) {
     fail("Unsupported", start, valueStart + value.length, `\`${name}:\` is not supported by name search yet`);
@@ -413,22 +421,98 @@ function startIndexing(roots?: string[]) {
   }, INDEX_DELAY_MS);
 }
 
-function search(query: string, limit: number, requestId: number, scope: string | null): SearchResponse {
+// ---------- fuzzy matching and "did you mean" (rough stand-ins for fs-index / text-ar) ----------
+
+/** Greedy subsequence match of `term` in `norm`: matched positions, or null. */
+function subsequence(norm: string, term: string): number[] | null {
+  const at: number[] = [];
+  let from = 0;
+  for (const c of term) {
+    const i = norm.indexOf(c, from);
+    if (i < 0) return null;
+    at.push(i);
+    from = i + 1;
+  }
+  return at;
+}
+
+/** US QWERTY ⇄ Arabic 101, unshifted keys only (text-ar `swap_layout` handles more). */
+const LAYOUT_KEYS: [string, string][] = [
+  ["`", "ذ"], ["q", "ض"], ["w", "ص"], ["e", "ث"], ["r", "ق"], ["t", "ف"], ["y", "غ"], ["u", "ع"], ["i", "ه"],
+  ["o", "خ"], ["p", "ح"], ["[", "ج"], ["]", "د"], ["a", "ش"], ["s", "س"], ["d", "ي"], ["f", "ب"], ["g", "ل"],
+  ["h", "ا"], ["j", "ت"], ["k", "ن"], ["l", "م"], [";", "ك"], ["'", "ط"], ["z", "ئ"], ["x", "ء"], ["c", "ؤ"],
+  ["v", "ر"], ["b", "لا"], ["n", "ى"], ["m", "ة"], [",", "و"], [".", "ز"], ["/", "ظ"],
+];
+const TO_ARABIC = new Map(LAYOUT_KEYS);
+const TO_LATIN = new Map(LAYOUT_KEYS.map(([en, ar]) => [ar, en] as [string, string]));
+
+function swapLayout(word: string): string | null {
+  const latin = /[a-z]/i.test(word);
+  const arabic = /[\u0600-\u06ff]/.test(word);
+  if (latin === arabic) return null;
+  let out = "";
+  if (latin) {
+    for (const c of word.toLowerCase()) out += TO_ARABIC.get(c) ?? c;
+  } else {
+    for (let i = 0; i < word.length; i++) {
+      if (word.startsWith("لا", i)) { out += "b"; i++; continue; }
+      out += TO_LATIN.get(word[i]) ?? word[i];
+    }
+  }
+  return out !== word ? out : null;
+}
+
+/** The query with its plain words (not filters) retyped on the other layout, or null. */
+function layoutSwapped(query: string): string | null {
+  let changed = false;
+  const out = query.replace(/[^\s"]+/g, (word) => {
+    if (word.includes(":")) return word;
+    const neg = /^[-!]/.test(word) ? word[0] : "";
+    const swapped = swapLayout(word.slice(neg.length));
+    if (!swapped) return word;
+    changed = true;
+    return neg + swapped;
+  });
+  return changed ? out : null;
+}
+
+/** "Did you mean": the other keyboard layout, else the `fuzzy:` switch, if it finds results. */
+function suggest(query: string, p: Parsed, limit: number, scope: string | null): SearchSuggestion | null {
+  const candidates: [string | null, SearchSuggestion["kind"]][] = [
+    [layoutSwapped(query), "layout"],
+    [p.fuzzyAll || p.fuzzy.length || !p.terms.length ? null : `fuzzy: ${query.trimStart()}`, "fuzzy"],
+  ];
+  for (const [candidate, kind] of candidates) {
+    if (!candidate) continue;
+    const r = search(candidate, limit, 0, scope, false);
+    if (!r.error && r.items.length) return { query: candidate, kind, count: r.items.length };
+  }
+  return null;
+}
+
+function search(query: string, limit: number, requestId: number, scope: string | null, withSuggestion = true): SearchResponse {
   const t0 = performance.now();
+  let p: Parsed | null = null;
   const done = (items: ResultItem[], truncated: boolean, error: QueryError | null = null): SearchResponse => ({
-    requestId, items, truncated, error, cancelled: false, elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
+    requestId, items, truncated, error, cancelled: false,
+    suggestion: withSuggestion && p && !error && !items.length && limit > 0 ? suggest(query, p, limit, scope) : null,
+    elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
   });
   if (!query.trim()) return done([], false);
-  let p: Parsed;
   try {
     p = parse(query);
   } catch (e) {
     if (e instanceof MockParseError) return done([], false, e.err);
     throw e;
   }
-  if (!index) return done([], false);
+  if (!index) {
+    p = null; // no suggestion before the index is ready
+    return done([], false);
+  }
 
-  const terms = p.terms.map((t) => normalizeWithMap(t).norm).filter(Boolean);
+  const norm = (t: string) => normalizeWithMap(t).norm;
+  const terms = (p.fuzzyAll ? [] : p.terms).map(norm).filter(Boolean);
+  const fuzzy = [...p.fuzzy, ...(p.fuzzyAll ? p.terms : [])].map(norm).filter(Boolean);
   const negated = p.negated.map((t) => normalizeWithMap(t).norm).filter(Boolean);
   const hits: { e: MockEntry; score: number; highlights: Range16[] }[] = [];
   for (const e of index) {
@@ -446,6 +530,14 @@ function search(query: string, limit: number, requestId: number, scope: string |
       if (at < 0) { ok = false; break; }
       if (at === 0) score -= 1000;
       highlights.push(toOriginalRange(e, at, at + t.length));
+    }
+    if (!ok) continue;
+    // Fuzzy terms: a subsequence; tighter matches rank first.
+    for (const f of fuzzy) {
+      const at = subsequence(e.norm, f);
+      if (!at) { ok = false; break; }
+      score += (at[at.length - 1] - at[0]) * 100 - (at[0] === 0 ? 1000 : 0);
+      for (const i of at) highlights.push(toOriginalRange(e, i, i + 1));
     }
     if (!ok) continue;
     hits.push({ e, score: score + e.norm.length + (it.isDir ? -5 : 0), highlights: mergeRanges(highlights) });

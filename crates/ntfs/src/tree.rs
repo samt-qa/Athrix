@@ -393,9 +393,10 @@ impl VolumeTree {
         RefLookup::build(&self.file_refs)
     }
 
-    /// Sets the size and/or modification time of entry `i` (used by the MFT reader); `None`
-    /// leaves a field unchanged.
-    pub(crate) fn set_metadata(&mut self, i: u32, size: Option<u64>, mtime: Option<i64>) {
+    /// Sets the size and/or modification time of entry `i` (used by the MFT reader, and by
+    /// tests or other metadata sources); `None` leaves a field unchanged. Sizes are only
+    /// reported by [`VolumeTree::get`] once [`VolumeTree::mark_metadata`] was called.
+    pub fn set_metadata(&mut self, i: u32, size: Option<u64>, mtime: Option<i64>) {
         let k = i as usize;
         if let (Some(s), Some(slot)) = (size, self.sizes.get_mut(k)) {
             *slot = s;
@@ -405,8 +406,8 @@ impl VolumeTree {
         }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))] // only the Windows MFT reader sets it
-    pub(crate) fn mark_metadata(&mut self) {
+    /// Marks sizes and modification times as filled (see [`VolumeTree::has_metadata`]).
+    pub fn mark_metadata(&mut self) {
         self.has_metadata = true;
     }
 

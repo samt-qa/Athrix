@@ -5,6 +5,7 @@
 //! - [`indexing`]: background indexing, live updates from the file watcher and the shared index;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
+//! - [`suggest`]: the "did you mean…" rewrite offered when a search finds nothing;
 //! - [`roots`]: which drives / folders are indexed, persisted for the next start;
 //! - [`volumes`]: the drives of this computer;
 //! - [`state`]: state shared by the commands;
@@ -22,6 +23,7 @@ pub mod results;
 pub mod roots;
 pub mod shortcut;
 pub mod state;
+pub mod suggest;
 pub mod tray;
 pub mod volumes;
 

@@ -1,6 +1,7 @@
 //! Parallel directory walk (via `jwalk`) that fills an [`IndexBuilder`].
 //!
-//! This is the cross-platform fallback; the NTFS MFT reader (M2) will feed the same builder.
+//! This is the cross-platform path; on Windows, [`crate::ntfs`] fills the same builder from an
+//! NTFS volume enumeration with the same exclusion rules.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,6 +56,16 @@ impl WalkOptions {
         self.follow_links = follow;
         self
     }
+
+    /// The roots, in order.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Whether symbolic links and junctions are followed.
+    pub fn follows_links(&self) -> bool {
+        self.follow_links
+    }
 }
 
 /// Compiled exclusion rules, shared with the walker threads (and the live watcher).
@@ -67,7 +78,7 @@ pub(crate) struct Exclusions {
 }
 
 impl Exclusions {
-    fn new(opts: &WalkOptions) -> Result<Self> {
+    pub(crate) fn new(opts: &WalkOptions) -> Result<Self> {
         let mut names = GlobSetBuilder::new();
         let mut paths = GlobSetBuilder::new();
         for pattern in &opts.exclude_globs {
@@ -99,6 +110,11 @@ impl Exclusions {
                 .map(|p| prefix_key(p))
                 .collect(),
         })
+    }
+
+    /// True if some rule looks at the full path (path globs or prefixes), not only the name.
+    pub(crate) fn needs_paths(&self) -> bool {
+        !self.paths.is_empty() || !self.prefixes.is_empty()
     }
 
     pub(crate) fn excludes(&self, path: &Path, name: &std::ffi::OsStr) -> bool {
@@ -313,11 +329,11 @@ fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
 
 /// Folders a walk could not list.
 #[derive(Debug, Default, Clone, Copy)]
-struct Skipped {
+pub(crate) struct Skipped {
     /// All folders whose children could not be read.
-    folders: usize,
+    pub(crate) folders: usize,
     /// Of those, the ones refused with "access denied".
-    access_denied: usize,
+    pub(crate) access_denied: usize,
 }
 
 /// True for "access denied" / "permission denied", which whole-drive walks hit by the hundred
@@ -335,7 +351,7 @@ fn log_entry_error(e: &jwalk::Error) {
     }
 }
 
-fn walk_root(
+pub(crate) fn walk_root(
     root: &Path,
     follow_links: bool,
     exclusions: &Arc<Exclusions>,

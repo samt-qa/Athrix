@@ -328,6 +328,9 @@ mark.match {
   font-size: 13px; color: var(--text-secondary);
 }
 .state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+/* "Did you mean": the rewrite that finds results, above the generic hint. */
+.did-you-mean { block-size: auto; min-block-size: 32px; padding-block: 6px; line-height: 1.4; max-inline-size: 100%; overflow-wrap: anywhere; }
+.did-you-mean-query { font-weight: 700; }
 .state-actions:empty { display: none; }
 
 /* ---- Indexed drives (top bar button + panel) ---- */

@@ -2,13 +2,18 @@
 //!
 //! nass handles normalization and offsets into the original text. This crate adds what file
 //! search needs on top: name normalization for the index, keyboard-layout correction
-//! ([`swap_layout`], Arabic (101) ⇄ US QWERTY), and later light stemming and the Tantivy
-//! tokenizer (see `docs/03-PROGRESS-TRACKER.md`, M3).
+//! ([`swap_layout`], Arabic (101) ⇄ US QWERTY), a light stemmer ([`light_stem`]) and the
+//! content tokenizer ([`tokenize()`]) whose tokens carry byte spans in the original text. The
+//! tokenizer does not depend on Tantivy; `athrix-content-index` adapts it.
 
 pub mod layout;
+pub mod stem;
+pub mod tokenize;
 
 pub use layout::{swap_layout, swap_layout_variants};
 pub use nass::{Level, Match, Normalized, Options};
+pub use stem::{is_arabic_word, light_stem, stem_without_conjunction};
+pub use tokenize::{ANALYZER_VERSION, Analyzer, MAX_TOKEN_BYTES, Token, Tokens, tokenize};
 
 /// Normalizes a file or folder name for the name index, writing into `out` (cleared first) so
 /// one buffer can be reused for millions of names.

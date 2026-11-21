@@ -7,7 +7,7 @@ use athrix_fs_index::{EntryId, FileIndex, IndexSnapshot, Query};
 
 use crate::indexing::{GENERATION_MASK, IndexView};
 use crate::model::ResultItem;
-use crate::query::{CompiledQuery, highlights};
+use crate::query::CompiledQuery;
 use crate::roots::{key_has_prefix, normalize_root, path_key};
 
 /// Largest valid result id: generation and entry bits all set, below 2^53.
@@ -129,14 +129,25 @@ pub fn run_search(
         if cancel.load(Ordering::Relaxed) {
             return Err(SearchFailure::Cancelled);
         }
-        items.push(build_item(
-            view,
-            view.generation(),
-            id,
-            &query.highlight_terms,
-        ));
+        items.push(build_item(view, view.generation(), id, query));
     }
     Ok(SearchHits { items, truncated })
+}
+
+/// How many entries (at most `limit`) match `query` in `scope`, without building items: the
+/// cheap probe behind the "did you mean" suggestion.
+pub fn count_matches(
+    view: &IndexView,
+    query: &Query,
+    limit: usize,
+    scope: Option<&SearchScope>,
+    cancel: &AtomicBool,
+) -> Result<usize, SearchFailure> {
+    let ids = match scope {
+        None => full_search(view, query, limit, cancel)?,
+        Some(scope) => scoped_search(view, query, limit, scope, cancel)?,
+    };
+    Ok(ids.len().min(limit))
 }
 
 fn full_search(
@@ -153,7 +164,9 @@ fn full_search(
 }
 
 /// Up to `limit` matching live ids under `scope`: entries added or updated since the base
-/// first (as in [`IndexSnapshot::search`]), then base entries in index order.
+/// first (as in [`IndexSnapshot::search`]), then base entries in index order. A ranked query
+/// ([`Query::is_ranked`]) returns the best `limit` by score instead, ties in id order, like
+/// [`IndexSnapshot::search`] (see [`ranked_scoped_search`]).
 ///
 /// A scope covering every indexed root is a plain search. Otherwise:
 /// - the delta (small: compaction bounds it) is scanned entry by entry and filtered by path;
@@ -174,26 +187,15 @@ fn scoped_search(
     {
         return full_search(view, query, limit, cancel);
     }
+    if query.is_ranked() {
+        return ranked_scoped_search(view, query, limit, scope, cancel);
+    }
     let mut out = scan_delta(view, query, limit, scope, cancel)?;
     if out.len() >= limit {
         return Ok(out);
     }
-    let mut chunks: Vec<(usize, usize, Coverage)> = Vec::new();
-    let base_len = view.base().len();
-    for run in view.roots() {
-        let coverage = scope.coverage(&run.key);
-        if coverage == Coverage::None {
-            continue;
-        }
-        let (start, end) = (run.start as usize, (run.end as usize).min(base_len));
-        let mut at = start;
-        while at < end {
-            let next = (at + SCOPED_CHUNK).min(end);
-            chunks.push((at, next, coverage));
-            at = next;
-        }
-    }
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    let chunks = scope_chunks(view, scope);
+    let threads = scan_threads();
     let want = limit - out.len();
     let snapshot: &IndexSnapshot = view;
     let mut base_hits: Vec<EntryId> = Vec::new();
@@ -229,6 +231,161 @@ fn scoped_search(
     }
     out.extend(base_hits);
     Ok(out)
+}
+
+/// The base id ranges `start..end` (at most [`SCOPED_CHUNK`] long) of the roots `scope`
+/// touches, with how much of their root the scope covers.
+fn scope_chunks(view: &IndexView, scope: &SearchScope) -> Vec<(usize, usize, Coverage)> {
+    let mut chunks = Vec::new();
+    let base_len = view.base().len();
+    for run in view.roots() {
+        let coverage = scope.coverage(&run.key);
+        if coverage == Coverage::None {
+            continue;
+        }
+        let (start, end) = (run.start as usize, (run.end as usize).min(base_len));
+        let mut at = start;
+        while at < end {
+            let next = (at + SCOPED_CHUNK).min(end);
+            chunks.push((at, next, coverage));
+            at = next;
+        }
+    }
+    chunks
+}
+
+/// Threads per wave of the scoped scan.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(16))
+}
+
+/// A scored hit: `(score, id)`.
+type Scored = (u32, EntryId);
+
+/// Keeps the best `limit` of `hits` (higher score first, ties by id), sorted that way.
+fn keep_best(hits: &mut Vec<Scored>, limit: usize) {
+    let key = |&(score, id): &Scored| (std::cmp::Reverse(score), id);
+    if limit > 0 && hits.len() > limit {
+        hits.select_nth_unstable_by_key(limit - 1, key);
+    }
+    hits.truncate(limit);
+    hits.sort_unstable_by_key(key);
+}
+
+/// [`scoped_search`] for a ranked query: every matching live entry under `scope` (the delta
+/// and the base runs the scope touches) is scored with [`IndexSnapshot::score`]; the best
+/// `limit` are returned, best first, ties by id (the order [`IndexSnapshot::search`] uses).
+/// Each chunk keeps only its best `limit`, so memory stays bounded; there is no early stop.
+fn ranked_scoped_search(
+    view: &IndexView,
+    query: &Query,
+    limit: usize,
+    scope: &SearchScope,
+    cancel: &AtomicBool,
+) -> Result<Vec<EntryId>, SearchFailure> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let snapshot: &IndexSnapshot = view;
+    let mut best: Vec<Scored> = Vec::new();
+    if snapshot.delta_entries() > 0 {
+        for (n, id) in (snapshot.base().len()..snapshot.id_bound()).enumerate() {
+            if n % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+                return Err(SearchFailure::Cancelled);
+            }
+            let Ok(id) = EntryId::try_from(id) else {
+                break;
+            };
+            // `contains` masks the hidden anchor copies of base folders.
+            if !snapshot.contains(id) {
+                continue;
+            }
+            let Some(score) = snapshot.score(query, id) else {
+                continue;
+            };
+            if scope.contains(&snapshot.path(id)) {
+                best.push((score, id));
+                if best.len() >= limit.saturating_mul(2) {
+                    keep_best(&mut best, limit);
+                }
+            }
+        }
+    }
+    let chunks = scope_chunks(view, scope);
+    for wave in chunks.chunks(scan_threads()) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SearchFailure::Cancelled);
+        }
+        let parts: Vec<Option<Vec<Scored>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|&(start, end, coverage)| {
+                    s.spawn(move || {
+                        let chunk = Chunk {
+                            start,
+                            end,
+                            coverage,
+                        };
+                        scan_chunk_ranked(snapshot, query, chunk, scope, limit, cancel)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+        for part in parts {
+            best.extend(part.ok_or(SearchFailure::Cancelled)?);
+        }
+        keep_best(&mut best, limit);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchFailure::Cancelled);
+    }
+    keep_best(&mut best, limit);
+    Ok(best.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Base ids `start..end` of one root run, and how much of the root the scope covers.
+#[derive(Debug, Clone, Copy)]
+struct Chunk {
+    start: usize,
+    end: usize,
+    coverage: Coverage,
+}
+
+/// The best `limit` scored, matching live base ids of `chunk` under `scope`; `None` if
+/// cancelled (or on a panic).
+fn scan_chunk_ranked(
+    index: &IndexSnapshot,
+    query: &Query,
+    chunk: Chunk,
+    scope: &SearchScope,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Option<Vec<Scored>> {
+    let base: &FileIndex = index.base();
+    let mut out: Vec<Scored> = Vec::new();
+    for (n, id) in (chunk.start..chunk.end).enumerate() {
+        if n % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let id = EntryId::try_from(id).ok()?;
+        let Some(score) = base.score(query, id) else {
+            continue;
+        };
+        if index.contains(id)
+            && (chunk.coverage == Coverage::Whole || scope.contains(&base.path(id)))
+        {
+            out.push((score, id));
+            if out.len() >= limit.saturating_mul(2) {
+                keep_best(&mut out, limit);
+            }
+        }
+    }
+    keep_best(&mut out, limit);
+    Some(out)
 }
 
 /// Matching live delta entries (ids `base.len()..id_bound()`) under `scope`, at most `limit`.
@@ -300,7 +457,7 @@ pub fn build_item(
     index: &IndexSnapshot,
     generation: u32,
     id: EntryId,
-    highlight_terms: &[String],
+    query: &CompiledQuery,
 ) -> ResultItem {
     let name = index.name(id);
     let meta = index.meta(id);
@@ -324,7 +481,7 @@ pub fn build_item(
         size: (!meta.is_dir).then_some(meta.size),
         modified: meta.modified,
         ext,
-        highlights: highlights(name, highlight_terms),
+        highlights: query.highlights(name),
     }
 }
 
@@ -370,7 +527,7 @@ mod tests {
     fn builds_items_with_parent_ext_size_and_highlights() {
         let ix = sample();
         let q = compile_query("تقرير").unwrap();
-        let item = build_item(&ix, ix.generation(), 2, &q.highlight_terms);
+        let item = build_item(&ix, ix.generation(), 2, &q);
         let parent: PathBuf = ["/data", "تقارير"].iter().collect();
         assert_eq!(item.id, (7 << 32) | 2);
         assert_eq!(decode_id(item.id), Some((7, 2)));
@@ -382,14 +539,15 @@ mod tests {
         assert_eq!(item.ext, "pdf");
         assert_eq!(item.highlights, vec![(0, "تَقْرِيرُ".encode_utf16().count())]);
 
-        let folder = build_item(&ix, 0, 1, &[]);
+        let none = compile_query("").unwrap();
+        let folder = build_item(&ix, 0, 1, &none);
         assert!(folder.is_dir);
         assert_eq!(folder.size, None);
         assert_eq!(folder.ext, "");
         assert_eq!(folder.parent, "/data");
 
-        assert_eq!(build_item(&ix, 0, 4, &[]).ext, "");
-        assert_eq!(build_item(&ix, 0, 0, &[]).parent, "");
+        assert_eq!(build_item(&ix, 0, 4, &none).ext, "");
+        assert_eq!(build_item(&ix, 0, 0, &none).parent, "");
     }
 
     #[test]
@@ -557,6 +715,187 @@ mod tests {
     }
 
     const MAX: usize = 1_000_000;
+
+    /// The highlighted text of a row, as JavaScript would slice it.
+    fn highlighted(item: &ResultItem) -> String {
+        let units: Vec<u16> = item.name.encode_utf16().collect();
+        item.highlights
+            .iter()
+            .map(|&(s, e)| String::from_utf16(&units[s..e]).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn fuzzy_hits_are_highlighted() {
+        let mut b = IndexBuilder::new();
+        let root = b.push(None, "/data", dir());
+        b.push(Some(root), "report.pdf", file(1));
+        b.push(Some(root), "Monthly Report Summary.xlsx", file(1));
+        b.push(Some(root), "تقرير 😀 report.txt", file(1));
+        let ix = IndexView::from_index(1, b.finish());
+        let row = |text: &str, id: EntryId| build_item(&ix, 1, id, &compile_query(text).unwrap());
+
+        let item = row("fuzzy:rprt", 1);
+        assert_eq!(highlighted(&item), "rprt", "{:?}", item.highlights);
+        assert_eq!(item.highlights, vec![(0, 1), (2, 3), (4, 6)]);
+        // The switch makes plain words fuzzy too.
+        assert_eq!(highlighted(&row("fuzzy: rprt", 1)), "rprt");
+        // An acronym highlights the initials.
+        assert_eq!(highlighted(&row("fuzzy:mrs", 2)), "MRS");
+        // Mixed with a plain term (and after a surrogate pair): merged, sorted, no overlap.
+        let item = row("تقرير fuzzy:rprt", 3);
+        let h = &item.highlights;
+        assert!(h.windows(2).all(|w| w[0].1 < w[1].0), "{h:?}");
+        assert_eq!(highlighted(&item), "تقريرrprt");
+    }
+
+    /// Two drives with names that match `fuzzy:rprt` more or less well, in an order where the
+    /// best one is not first.
+    fn ranked_drives() -> (IndexView, [&'static str; 2]) {
+        let (c, d) = if cfg!(windows) {
+            ("C:\\", "D:\\")
+        } else {
+            ("/c", "/d")
+        };
+        let mut b = IndexBuilder::new();
+        for drive in [c, d] {
+            let root = b.push(None, drive, dir());
+            let work = b.push(Some(root), "Work", dir());
+            for name in [
+                "r_x_p_x_r_x_t_long_name.txt",
+                "my report.txt",
+                "unrelated.txt",
+                "rprt.txt",
+                "Report.doc",
+            ] {
+                b.push(Some(work), name, file(1));
+            }
+        }
+        (IndexView::from_index(1, b.finish()), [c, d])
+    }
+
+    /// What `run_search` returns: `(entry id, score)` pairs.
+    fn ranked(ix: &IndexView, text: &str, scope: Option<&str>, limit: usize) -> Vec<(u32, u32)> {
+        let q = compile_query(text).unwrap();
+        let scope = scope.map(|s| SearchScope::parse(Some(s)).unwrap().unwrap());
+        run_search(ix, &q, limit, scope.as_ref(), &AtomicBool::new(false))
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| {
+                let id = decode_id(i.id).unwrap().1;
+                (id, ix.score(&q.query, id).unwrap())
+            })
+            .collect()
+    }
+
+    fn best_first(hits: &[(u32, u32)]) -> bool {
+        hits.windows(2)
+            .all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 < w[1].0))
+    }
+
+    #[test]
+    fn scoped_ranked_search_returns_the_best_by_score() {
+        let (ix, [_, d]) = ranked_drives();
+        let q = compile_query("fuzzy:rprt").unwrap();
+        assert!(q.query.is_ranked());
+        let everywhere = ranked(&ix, "fuzzy:rprt", None, MAX);
+        assert!(best_first(&everywhere), "{everywhere:?}");
+        let on_d: Vec<(u32, u32)> = everywhere
+            .iter()
+            .copied()
+            .filter(|&(id, _)| path_key(&ix.path(id)).starts_with(&path_key(Path::new(d))))
+            .collect();
+        assert!(on_d.len() >= 3, "{on_d:?}");
+
+        // Whole root and folder inside it (per-entry path check): same order as unscoped.
+        let scoped_d = ranked(&ix, "fuzzy:rprt", Some(d), MAX);
+        assert_eq!(scoped_d, on_d);
+        let work: PathBuf = [d, "Work"].iter().collect();
+        assert_eq!(
+            ranked(&ix, "fuzzy:rprt", Some(&work.to_string_lossy()), MAX),
+            on_d
+        );
+        // Not index order: the best match is not the first matching entry.
+        let first_in_index = on_d.iter().map(|&(id, _)| id).min().unwrap();
+        assert_ne!(
+            on_d[0].0, first_in_index,
+            "the test data must exercise ranking"
+        );
+
+        // The top `limit`, not the first `limit` found.
+        for limit in [1, 2] {
+            let q = compile_query("fuzzy:rprt").unwrap();
+            let scope = SearchScope::parse(Some(d)).unwrap();
+            let hits = run_search(&ix, &q, limit, scope.as_ref(), &AtomicBool::new(false)).unwrap();
+            let ids: Vec<u32> = hits
+                .items
+                .iter()
+                .map(|i| decode_id(i.id).unwrap().1)
+                .collect();
+            let expected: Vec<u32> = on_d.iter().take(limit).map(|&(id, _)| id).collect();
+            assert_eq!(ids, expected);
+            assert!(hits.truncated);
+        }
+        assert_eq!(
+            run_search(
+                &ix,
+                &q,
+                10,
+                SearchScope::parse(Some(d)).unwrap().as_ref(),
+                &AtomicBool::new(true)
+            )
+            .unwrap_err(),
+            SearchFailure::Cancelled
+        );
+    }
+
+    #[test]
+    fn keep_best_orders_by_score_then_id() {
+        let mut hits = vec![(1, 5), (9, 7), (3, 2), (9, 1), (1, 0), (5, 3)];
+        keep_best(&mut hits, 3);
+        assert_eq!(hits, vec![(9, 1), (9, 7), (5, 3)]);
+        let mut few = vec![(1, 2), (2, 1)];
+        keep_best(&mut few, 10);
+        assert_eq!(few, vec![(2, 1), (1, 2)]);
+        keep_best(&mut few, 0);
+        assert!(few.is_empty());
+    }
+
+    /// A ranked scoped search mixes delta and base hits by score.
+    #[test]
+    fn scoped_ranked_search_merges_live_changes_by_score() {
+        let c = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        for dir in [&c, &d] {
+            fs::write(dir.path().join("r_x_p_x_r_x_t_long.txt"), b"x").unwrap();
+            fs::write(dir.path().join("my report.txt"), b"x").unwrap();
+        }
+        let roots = vec![c.path().to_path_buf(), d.path().to_path_buf()];
+        let opts = walk_options(&roots);
+        let live = LiveIndex::new(walk(&opts).unwrap(), &opts).unwrap();
+        let created = d.path().join("rprt.txt");
+        fs::write(&created, b"x").unwrap();
+        live.apply_paths(&[&created]);
+        let view = IndexView::new(2, live.snapshot(), &roots);
+        assert!(view.has_changes());
+
+        let s = d.path().to_string_lossy().into_owned();
+        let hits = ranked(&view, "fuzzy:rprt", Some(&s), MAX);
+        assert!(best_first(&hits), "{hits:?}");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert!(
+            hits.iter()
+                .all(|&(id, _)| view.path(id).starts_with(d.path()))
+        );
+        let everywhere = ranked(&view, "fuzzy:rprt", None, MAX);
+        let on_d: Vec<(u32, u32)> = everywhere
+            .into_iter()
+            .filter(|&(id, _)| view.path(id).starts_with(d.path()))
+            .collect();
+        assert_eq!(hits, on_d);
+        assert!(hits.iter().any(|&(id, _)| view.path(id) == created));
+    }
 
     #[test]
     fn ids_round_trip_and_stay_javascript_safe() {

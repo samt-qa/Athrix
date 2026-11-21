@@ -110,6 +110,8 @@
   "noResults.hint": "تحقّق من الإملاء، أو قلّل الكلمات، أو أزل المرشّحات.",
   "noResults.allTypes": "ابحث في كل الأنواع",
   "noResults.wholeComputer": "ابحث في كل الجهاز",
+  "noResults.didYouMean": "هل تقصد: {query}؟",
+  "noResults.tryFuzzy": "جرّب البحث التقريبي",
   "notReady.title": "ما زال الفهرس قيد البناء",
   "notReady.body": "ستظهر النتائج فور انتهاء الفهرسة.",
   "notReady.errorTitle": "البحث غير متاح: تعذّر بناء الفهرس",

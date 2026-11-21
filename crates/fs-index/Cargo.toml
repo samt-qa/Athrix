@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 athrix-core.workspace = true
+# Builds everywhere (stub off Windows), so the tree adapter is tested on every CI OS.
+athrix-ntfs.workspace = true
 athrix-query.workspace = true
 athrix-text-ar.workspace = true
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
@@ -19,6 +21,7 @@ jwalk = "0.8.1"
 memchr = "2.7.4"
 notify.workspace = true
 rayon = "1.10.0"
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

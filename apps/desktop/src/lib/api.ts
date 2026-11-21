@@ -55,6 +55,18 @@ export interface SearchResponse {
   elapsedMs: number;
   error: QueryError | null;
   cancelled: boolean;
+  /** "Did you mean": only when a valid query found nothing and a rewrite of it finds something. */
+  suggestion?: SearchSuggestion | null;
+}
+
+/** A query to offer instead of one that found nothing. */
+export interface SearchSuggestion {
+  /** The full replacement query (as sent, i.e. including the chip's `type:` filter). */
+  query: string;
+  /** "layout": words retyped on the other keyboard layout; "fuzzy": `fuzzy:` put in front. */
+  kind: "layout" | "fuzzy";
+  /** Results it finds (1..limit). */
+  count: number;
 }
 
 export type VolumeKind = "fixed" | "removable" | "network" | "unknown";

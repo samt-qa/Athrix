@@ -35,6 +35,16 @@ export function composeQuery(text: string, chip: ChipKind): string {
   return `${out} type:${chip}`;
 }
 
+/**
+ * The text to put in the search field for a "did you mean" query: the backend rewrote the query as
+ * sent, so the chip's ` type:<kind>` suffix (see `composeQuery`) is dropped again.
+ */
+export function suggestionInput(suggested: string, chip: ChipKind): string {
+  const suffix = ` type:${chip}`;
+  const text = chip !== "all" && suggested.endsWith(suffix) ? suggested.slice(0, -suffix.length) : suggested;
+  return text.trimEnd();
+}
+
 /** Replaces the error span `[start, end)` of `text` with `suggestion` (keeping a filter's ':'). */
 export function applySuggestion(text: string, start: number, end: number, suggestion: string): string {
   const span = text.slice(start, end);

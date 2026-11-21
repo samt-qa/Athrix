@@ -20,12 +20,17 @@
 //! Fuzzy terms (`fuzzy:rprt`, or the `fuzzy:` switch for every word) also match acronyms and
 //! typos and are ranked best first; see [`Query::is_ranked`] and [`Query::fuzzy_highlights`].
 //!
-//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): NTFS MFT/USN and general ranking.
+//! On Windows, whole NTFS drives can instead be read from the volume's MFT when the process is
+//! elevated, with the walk as the per-root fallback: see [`ntfs::index_roots`].
+//!
+//! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): USN journal replay and general
+//! ranking.
 
 mod exec;
 mod fuzzy;
 mod index;
 pub mod live;
+pub mod ntfs;
 mod search;
 mod snapshot;
 mod walk;

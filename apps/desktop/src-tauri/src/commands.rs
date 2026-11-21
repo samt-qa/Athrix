@@ -11,7 +11,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::indexing::{IndexView, Indexer, SnapshotStore, StatusListener};
-use crate::model::{IndexState, IndexStatus, QueryError, ResultItem, SearchResponse};
+use crate::model::{
+    IndexState, IndexStatus, QueryError, ResultItem, SearchResponse, SearchSuggestion,
+};
 use crate::query::compile_query;
 use crate::results::{SearchFailure, SearchScope, decode_id, run_search};
 use crate::roots::{
@@ -19,6 +21,7 @@ use crate::roots::{
     resolve as resolve_roots,
 };
 use crate::state::AppState;
+use crate::suggest::suggest;
 use crate::volumes::{self, Volume};
 
 /// Error returned for a result id from an index view that is no longer kept (see
@@ -202,11 +205,17 @@ pub async fn search(
         elapsed_ms: 0.0,
         error: None,
         cancelled: false,
+        suggestion: None,
     };
     match outcome {
-        SearchOutcome::Hits { items, truncated } => {
+        SearchOutcome::Hits {
+            items,
+            truncated,
+            suggestion,
+        } => {
             response.items = items;
             response.truncated = truncated;
+            response.suggestion = suggestion;
         }
         SearchOutcome::Empty => {}
         SearchOutcome::Invalid(e) => response.error = Some(e),
@@ -223,6 +232,8 @@ enum SearchOutcome {
     Hits {
         items: Vec<ResultItem>,
         truncated: bool,
+        /// Only when `items` is empty (see [`crate::suggest`]).
+        suggestion: Option<SearchSuggestion>,
     },
     /// Empty query, or no index yet.
     Empty,
@@ -231,7 +242,8 @@ enum SearchOutcome {
     Failed(String),
 }
 
-/// The blocking part of `search`: parse, run, build items.
+/// The blocking part of `search`: parse, run, build items; when nothing is found, look for a
+/// "did you mean" rewrite (same scope, limit and cancel flag).
 fn execute_search(
     index: Option<Arc<IndexView>>,
     text: &str,
@@ -252,13 +264,28 @@ fn execute_search(
     if cancel.load(Ordering::Relaxed) {
         return SearchOutcome::Cancelled;
     }
-    match run_search(&index, &query, limit, scope, cancel) {
-        Ok(hits) => SearchOutcome::Hits {
-            items: hits.items,
-            truncated: hits.truncated,
-        },
-        Err(SearchFailure::Cancelled) => SearchOutcome::Cancelled,
-        Err(SearchFailure::Failed(e)) => SearchOutcome::Failed(e),
+    let hits = match run_search(&index, &query, limit, scope, cancel) {
+        Ok(hits) => hits,
+        Err(SearchFailure::Cancelled) => return SearchOutcome::Cancelled,
+        Err(SearchFailure::Failed(e)) => return SearchOutcome::Failed(e),
+    };
+    let suggestion = if hits.items.is_empty() && limit > 0 {
+        match suggest(&index, text, &query, limit, scope, cancel) {
+            Ok(s) => s,
+            Err(SearchFailure::Cancelled) => return SearchOutcome::Cancelled,
+            // The search itself worked: a failed probe only means no suggestion.
+            Err(SearchFailure::Failed(e)) => {
+                tracing::warn!(error = %e, "suggestion search failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    SearchOutcome::Hits {
+        items: hits.items,
+        truncated: hits.truncated,
+        suggestion,
     }
 }
 
@@ -366,8 +393,13 @@ mod tests {
         let ix = sample();
         let no = AtomicBool::new(false);
         match execute_search(Some(Arc::clone(&ix)), "فاتورة 123", 10, None, &no) {
-            SearchOutcome::Hits { items, truncated } => {
+            SearchOutcome::Hits {
+                items,
+                truncated,
+                suggestion,
+            } => {
                 assert_eq!(items.len(), 1);
+                assert_eq!(suggestion, None);
                 assert_eq!(items[0].id, encode_id(3, 1));
                 assert!(!truncated);
                 assert_eq!(items[0].highlights.len(), 2);
@@ -378,6 +410,48 @@ mod tests {
         assert!(matches!(
             execute_search(Some(ix), "فاتورة", 10, None, &yes),
             SearchOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn an_empty_result_carries_a_suggestion() {
+        use crate::model::SuggestionKind;
+        let ix = sample();
+        let no = AtomicBool::new(false);
+        // `فاتورة` typed with the English layout active, plus a filter kept as is.
+        let s = match execute_search(Some(Arc::clone(&ix)), "thj,vm ext:pdf", 10, None, &no) {
+            SearchOutcome::Hits {
+                items, suggestion, ..
+            } => {
+                assert!(items.is_empty());
+                suggestion.expect("a layout suggestion")
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(s.kind, SuggestionKind::Layout);
+        assert_eq!(s.query, "فاتورة ext:pdf");
+        assert_eq!(s.count, 1);
+        // A typo: the fuzzy rewrite.
+        match execute_search(Some(Arc::clone(&ix)), "فتورة", 10, None, &no) {
+            SearchOutcome::Hits {
+                items, suggestion, ..
+            } => {
+                assert!(items.is_empty());
+                let s = suggestion.expect("a fuzzy suggestion");
+                assert_eq!(
+                    (s.kind, s.query.as_str()),
+                    (SuggestionKind::Fuzzy, "fuzzy: فتورة")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing close: no suggestion.
+        assert!(matches!(
+            execute_search(Some(ix), "zzzzqqqq", 10, None, &no),
+            SearchOutcome::Hits {
+                suggestion: None,
+                ..
+            }
         ));
     }
 

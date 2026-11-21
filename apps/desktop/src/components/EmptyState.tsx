@@ -38,6 +38,12 @@ export function EmptyState(props: { onExample: (query: string) => void; compact?
   );
 }
 
+/** A "did you mean" offer: the text to put in the search field and how it was found. */
+export interface DidYouMean {
+  text: string;
+  kind: "layout" | "fuzzy";
+}
+
 /** A query with no matches (design §9.3 "no results"). */
 export function NoResults(props: {
   query: string;
@@ -46,10 +52,27 @@ export function NoResults(props: {
   /** Searching one drive only: offer the whole computer. */
   scoped?: boolean;
   onClearScope?: () => void;
+  /** A rewrite of the query that finds results (from `SearchResponse.suggestion`). */
+  suggestion?: DidYouMean | null;
+  onSuggestion?: (text: string) => void;
 }) {
   return (
     <div class="state">
       <h2 class="state-title">{t("noResults.title", { query: `⁨${props.query}⁩` /* bidi-isolated */ })}</h2>
+      <Show when={props.suggestion}>
+        {(s) => (
+          <button
+            type="button"
+            class="btn-primary did-you-mean"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => props.onSuggestion?.(s().text)}
+          >
+            <Show when={s().kind === "layout"} fallback={t("noResults.tryFuzzy")}>
+              <DidYouMeanLabel text={s().text} />
+            </Show>
+          </button>
+        )}
+      </Show>
       <p class="state-body">{t("noResults.hint")}</p>
       <div class="state-actions">
         <Show when={props.filtered}>
@@ -64,6 +87,22 @@ export function NoResults(props: {
         </Show>
       </div>
     </div>
+  );
+}
+
+/** "Did you mean: <query>?" with the query bidi-isolated (it may be in the other script). */
+function DidYouMeanLabel(props: { text: string }) {
+  const parts = () => {
+    const template = t("noResults.didYouMean");
+    const at = template.indexOf("{query}");
+    return at < 0 ? [template, ""] : [template.slice(0, at), template.slice(at + "{query}".length)];
+  };
+  return (
+    <>
+      {parts()[0]}
+      <bdi class="did-you-mean-query">{props.text}</bdi>
+      {parts()[1]}
+    </>
   );
 }
 

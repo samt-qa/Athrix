@@ -40,6 +40,18 @@ windows-sys = "0.61" # same major as Tauri's transitive copy: no duplicate build
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# athrix-content-index: 0.26+ needs a newer Rust than the 1.85 MSRV. No zstd (C build): lz4 doc store.
+tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
+tempfile = "3"
+# athrix-extract: pure-Rust parsers only (no C builds)
+zip = { version = "7.3", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "0.38"
+encoding_rs = "0.8.35" # 0.8.36+ may need a newer Rust; resolver 3 keeps a 1.85-compatible one
+chardetng = "1"
+# athrix-extract `pdf` feature (opt-in). 0.11+ pulls lopdf 0.42, which uses let-chains and fails on 1.85.
+pdf-extract = "=0.10.0"
+unicode-normalization = "0.1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -110,6 +110,8 @@
   "noResults.hint": "Check the spelling, use fewer words, or remove filters.",
   "noResults.allTypes": "Search all types",
   "noResults.wholeComputer": "Search the whole computer",
+  "noResults.didYouMean": "Did you mean: {query}?",
+  "noResults.tryFuzzy": "Try fuzzy search",
   "notReady.title": "The index is still being built",
   "notReady.body": "Results will appear as soon as indexing finishes.",
   "notReady.errorTitle": "Search is unavailable: the index couldn't be built",

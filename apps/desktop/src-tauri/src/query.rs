@@ -15,6 +15,20 @@ pub struct CompiledQuery {
     pub highlight_terms: Vec<String>,
 }
 
+impl CompiledQuery {
+    /// Highlight ranges for a result named `name` (the ORIGINAL name), in UTF-16 units, sorted
+    /// and non-overlapping: the plain terms ([`Self::highlight_terms`]) plus what the fuzzy
+    /// terms matched ([`Query::fuzzy_highlights`]: a subsequence's letters, an acronym's
+    /// initials...).
+    pub fn highlights(&self, name: &str) -> Vec<(usize, usize)> {
+        highlights_with(
+            name,
+            &self.highlight_terms,
+            self.query.fuzzy_highlights(name),
+        )
+    }
+}
+
 // ADAPTER: the only place that turns query text into an `athrix_fs_index::Query`. The text is
 // parsed once with `athrix_query::parse`; the AST gives both the executable query
 // (`Query::compile`) and the words to highlight. If the `fs-index` query API changes again,
@@ -103,11 +117,21 @@ fn push_term(piece: &str, out: &mut Vec<String>) {
 
 /// Highlight ranges of `terms` inside the ORIGINAL `name`, in UTF-16 units, sorted and merged.
 pub fn highlights(name: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    highlights_with(name, terms, Vec::new())
+}
+
+/// [`highlights`] plus extra byte ranges of `name` (fuzzy matches), all merged together.
+fn highlights_with(
+    name: &str,
+    terms: &[String],
+    extra: Vec<std::ops::Range<usize>>,
+) -> Vec<(usize, usize)> {
     let mut spans: Vec<(usize, usize)> = terms
         .iter()
         .flat_map(|t| athrix_text_ar::find_in_name(name, t))
-        .filter(|m| m.start < m.end)
         .map(|m| (m.start, m.end))
+        .chain(extra.into_iter().map(|r| (r.start, r.end)))
+        .filter(|&(s, e)| s < e && e <= name.len())
         .collect();
     spans.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());

@@ -106,6 +106,31 @@ pub struct SearchResponse {
     pub error: Option<QueryError>,
     /// Set when a newer request cancelled this one (`items` is then empty).
     pub cancelled: bool,
+    /// "Did you mean…": set only when a valid query found nothing and a rewrite of it does
+    /// find something (see [`crate::suggest`]).
+    pub suggestion: Option<SearchSuggestion>,
+}
+
+/// How a [`SearchSuggestion`] rewrote the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SuggestionKind {
+    /// The words retyped on the other keyboard layout (Arabic ⇄ English).
+    Layout,
+    /// The `fuzzy:` switch put in front of the query.
+    Fuzzy,
+}
+
+/// A query to offer instead of one that found nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSuggestion {
+    /// The full replacement query text.
+    pub query: String,
+    /// What was changed.
+    pub kind: SuggestionKind,
+    /// How many results it finds (at least 1, at most the request's `limit`).
+    pub count: usize,
 }
 
 #[cfg(test)]
@@ -142,5 +167,19 @@ mod tests {
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["isDir"], false);
         assert_eq!(json["highlights"], serde_json::json!([[0, 1]]));
+
+        let suggestion = SearchSuggestion {
+            query: "التقرير ext:pdf".into(),
+            kind: SuggestionKind::Layout,
+            count: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&suggestion).unwrap(),
+            serde_json::json!({ "query": "التقرير ext:pdf", "kind": "layout", "count": 2 })
+        );
+        assert_eq!(
+            serde_json::to_value(SuggestionKind::Fuzzy).unwrap(),
+            serde_json::json!("fuzzy")
+        );
     }
 }

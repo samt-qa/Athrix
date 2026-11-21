@@ -96,3 +96,9 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      - name: cargo doc
+        if: matrix.toolchain == 'stable' && runner.os == 'Linux'
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

@@ -3,7 +3,7 @@ import { t } from "./i18n";
 import {
   api, errorMessage, isStaleIdError, onIndexStatus, usingMock, type IndexStatus, type QueryError, type SearchResponse,
 } from "./lib/api";
-import { applySuggestion, composeQuery, type ChipKind } from "./lib/query";
+import { applySuggestion, composeQuery, suggestionInput, type ChipKind } from "./lib/query";
 import SettingsControls from "./components/SettingsControls";
 import SearchField from "./components/SearchField";
 import FilterChips from "./components/FilterChips";
@@ -116,6 +116,11 @@ export default function App(props: { mode: WindowMode }) {
   createEffect(on([sent, () => index()?.state, scope], ([q, , where]) => void runSearch(q, where)));
 
   const items = () => response()?.items ?? [];
+  // "Did you mean": the backend rewrote the query as sent; the field gets it without the chip suffix.
+  const didYouMean = () => {
+    const s = response()?.suggestion;
+    return s ? { text: suggestionInput(s.query, chip()), kind: s.kind } : null;
+  };
   const queryError = () => response()?.error ?? null;
   const current = () => items()[selected()];
 
@@ -325,6 +330,8 @@ export default function App(props: { mode: WindowMode }) {
               onClearFilter={() => setChip("all")}
               scoped={scope() !== ""}
               onClearScope={() => setScope("")}
+              suggestion={didYouMean()}
+              onSuggestion={setQuery}
             />
           </Match>
         </Switch>

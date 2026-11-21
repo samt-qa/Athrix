@@ -10,6 +10,22 @@ publish.workspace = true
 
 [dependencies]
 athrix-core.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+pdf-extract = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+
+[features]
+# Pure-Rust PDF text extraction (pdf-extract + lopdf). Off by default: see
+# the `pdf` module docs for why.
+pdf = ["dep:pdf-extract", "dep:unicode-normalization", "dep:flate2"]
+
+[dev-dependencies]
+proptest = "1.11.0"
 
 [lints]
 workspace = true
