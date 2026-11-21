@@ -27,6 +27,25 @@ interface ResultItem {
   ext: string;              // الامتداد بحروف صغيرة بلا نقطة، "" إن لم يوجد
   highlights: [number, number][]; // مدى المطابقات داخل name بوحدات UTF-16 (مناسبة لـ JS string.slice)،
                             // مرتبة وغير متداخلة؛ تشمل الكلمات العادية وما طابقته الكلمات التقريبية (fuzzy)
+  matched: "name" | "content" | "both"; // مصدر المطابقة (المهمة 4.7). "name" لكل نتائج بحث الأسماء وحده
+  snippet: ContentSnippet | null;       // مقطع من المحتوى عند مطابقة المحتوى، وإلا null
+}
+
+interface ContentSnippet {
+  text: string;             // مقطع قصير من النص الأصلي (بتشكيله)
+  highlights: [number, number][]; // مدى الكلمات المطابقة داخل text بوحدات UTF-16، مرتبة وغير متداخلة
+}
+
+// حالة فهرسة المحتوى في الخلفية (المهمة 4.5)
+interface ContentStatus {
+  state: "disabled" | "idle" | "running" | "paused" | "stopped" | "error";
+  pausedBy: ("user" | "battery" | "busy")[]; // أسباب الإيقاف المؤقت إن كانت state = "paused"
+  processed: number;        // ما عولج من الطابور (مفهرس + محدّث + فاشل)
+  total: number;            // processed + المتبقي في الطابور
+  indexed: number;          // عدد المستندات في فهرس المحتوى
+  failed: number;
+  docsPerSecond: number;
+  error: string | null;     // رسالة إنجليزية عند state = "error"
 }
 
 interface QueryError {
@@ -126,6 +145,19 @@ type PreviewBody =          // موسوم بالحقل kind
 - البحث لا ينتظر التحديث أبدًا: كل بحث يأخذ العرض الحالي مرة واحدة ويبني نتائجه ومعرّفاتها منه.
 - الواجهة لا تحتاج أمرًا جديدًا. لتحديث النتائج المعروضة يمكنها إعادة البحث عند حدث `index://status` بعدد عناصر مختلف.
 
+
+### أوامر بحث المحتوى (المهمتان 4.5 و 4.7)
+| الأمر | المدخلات | المخرجات | ملاحظات |
+|---|---|---|---|
+| `search` | + `searchContent?: boolean` | `SearchResponse` | `content:`/`محتوى:` في الاستعلام يبحث في المحتوى دائمًا. `searchContent: true` يجعل الكلمات العادية تبحث في الاسم والمحتوى معًا (إعداد في الواجهة، افتراضيه `false`). خطأ التخطيط (مثل `a \| content:b`) يصل كـ `QueryError` بـ `kind` = `"ContentInOr"` أو `"NegatedContentGroup"` أو `"OnlyExcludedContent"` |
+| `content_status` | — | `ContentStatus` | |
+| `content_pause` | — | `void` | إيقاف مؤقت بطلب المستخدم |
+| `content_resume` | — | `void` | |
+| `set_content_indexing` | `{ enabled: boolean }` | `void` | يُحفظ في Rust؛ عند التعطيل `state = "disabled"` |
+
+فتح نتيجة (`open_entry`) يسجّل فتحًا في مخزن Frecency تلقائيًا.
+
+حدث جديد: `content://status` بحمولة `ContentStatus`، بحد أقصى مرتين في الثانية.
 ## نسخة واحدة من التطبيق
 - تشغيل التطبيق مرة ثانية لا يفتح نسخة ثانية (لا أيقونة صينية ثانية ولا فشل في تسجيل الاختصار): النسخة الثانية تخرج فورًا
   وتُظهر النسخة الأولى نافذتها الرئيسية وتركّز عليها (`tauri-plugin-single-instance`).
