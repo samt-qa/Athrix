@@ -1,5 +1,8 @@
-import { createResource, createSignal } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import { createResource, createSignal, Show } from "solid-js";
+import { isTauri } from "@tauri-apps/api/core";
+import { t } from "./i18n";
+import { safeInvoke } from "./lib/tauri";
+import SettingsControls from "./components/SettingsControls";
 
 type AppInfo = { name: string; version: string };
 
@@ -14,30 +17,39 @@ function SearchIcon() {
 }
 
 export default function App() {
-  const [info] = createResource(() => invoke<AppInfo>("app_info"));
+  const inTauri = isTauri();
+  const [info] = createResource(() => safeInvoke<AppInfo>("app_info"));
   const [query, setQuery] = createSignal("");
   // Temporary demo of the UI-to-Rust bridge: how the name index will store the text (task 1.6 replaces it).
-  const [normalized] = createResource(query, (q) => invoke<string>("normalize_preview", { text: q }));
+  const [normalized] = createResource(query, (q) => safeInvoke<string>("normalize_preview", { text: q }));
 
   return (
     <div class="shell">
       <header class="topbar">
         <div class="brand">
           <img src="/athrix.svg" alt="" />
-          <span class="brand-name">Athrix</span>
-          <span class="brand-ar">أثر</span>
+          <span class="brand-name" lang="en">{t("app.brandName")}</span>
+          <span class="brand-ar" lang="ar">{t("app.brandNative")}</span>
         </div>
-        <span class="version">{info() ? `v${info()!.version}` : ""}</span>
+        <Show when={info()}>
+          {(i) => (
+            <bdi class="version" dir="ltr" title={t("topbar.versionTitle")}>
+              {t("topbar.version", { version: i().version })}
+            </bdi>
+          )}
+        </Show>
+        <SettingsControls />
       </header>
 
       <main class="main">
-        <section class="panel" aria-label="البحث">
+        <section class="panel" aria-label={t("search.region")}>
           <label class="search">
             <SearchIcon />
             <input
               dir="auto"
               autofocus
-              placeholder="ابحث عن ملف، أو محتوى، أو فكرة…"
+              aria-label={t("search.inputLabel")}
+              placeholder={t("search.placeholder")}
               value={query()}
               onInput={(e) => setQuery(e.currentTarget.value)}
               onKeyDown={(e) => e.key === "Escape" && setQuery("")}
@@ -45,20 +57,22 @@ export default function App() {
           </label>
           <div class="progress" />
           <div class="preview">
-            <span class="label">هكذا سيخزّنه فهرس الأسماء (تطبيع nass)</span>
+            <span class="label">{t("preview.label")}</span>
             <bdi class="normalized" dir="auto">
-              {query()
-                ? normalized() ?? ""
-                : <span class="empty">اكتب شيئًا، مثل: مُحَاضَرَةُ الفِقْهِ ١</span>}
+              {!query()
+                ? <span class="empty">{t("preview.empty")}</span>
+                : inTauri
+                  ? normalized() ?? ""
+                  : <span class="empty">{t("preview.unavailable")}</span>}
             </bdi>
-            <span class="hint">البحث الفعلي يأتي في المهمة 1.6. هذه الشاشة لاختبار الربط بين الواجهة و Rust.</span>
+            <span class="hint">{t("preview.hint")}</span>
           </div>
         </section>
       </main>
 
       <footer class="statusbar">
-        <span>الفهرس: لم يبدأ بعد</span>
-        <span><kbd>Esc</kbd> مسح</span>
+        <span>{t("status.index")}</span>
+        <span><kbd>Esc</kbd> {t("status.clear")}</span>
       </footer>
     </div>
   );

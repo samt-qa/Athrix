@@ -1,0 +1,22 @@
+{
+  "app.brandName": "Athrix",
+  "app.brandNative": "أثر",
+  "topbar.version": "v{version}",
+  "topbar.versionTitle": "إصدار التطبيق",
+  "settings.language": "لغة الواجهة",
+  "settings.languageAr": "العربية",
+  "settings.languageEn": "English",
+  "settings.theme": "المظهر",
+  "settings.themeSystem": "حسب النظام",
+  "settings.themeLight": "فاتح",
+  "settings.themeDark": "داكن",
+  "search.region": "البحث",
+  "search.inputLabel": "البحث عن الملفات",
+  "search.placeholder": "ابحث عن ملف، أو محتوى، أو فكرة…",
+  "preview.label": "هكذا سيخزّنه فهرس الأسماء (تطبيع nass)",
+  "preview.empty": "اكتب شيئًا، مثل: مُحَاضَرَةُ الفِقْهِ ١",
+  "preview.unavailable": "المعاينة تعمل داخل تطبيق سطح المكتب فقط.",
+  "preview.hint": "البحث الفعلي يأتي في المهمة 1.6. هذه الشاشة لاختبار الربط بين الواجهة و Rust.",
+  "status.index": "الفهرس: لم يبدأ بعد",
+  "status.clear": "مسح"
+}

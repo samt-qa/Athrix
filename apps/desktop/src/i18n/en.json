@@ -1,0 +1,22 @@
+{
+  "app.brandName": "Athrix",
+  "app.brandNative": "أثر",
+  "topbar.version": "v{version}",
+  "topbar.versionTitle": "App version",
+  "settings.language": "Interface language",
+  "settings.languageAr": "العربية",
+  "settings.languageEn": "English",
+  "settings.theme": "Appearance",
+  "settings.themeSystem": "Match system",
+  "settings.themeLight": "Light",
+  "settings.themeDark": "Dark",
+  "search.region": "Search",
+  "search.inputLabel": "Search files",
+  "search.placeholder": "Search for a file, content, or an idea…",
+  "preview.label": "How the name index will store it (nass normalization)",
+  "preview.empty": "Type something, e.g. مُحَاضَرَةُ الفِقْهِ ١",
+  "preview.unavailable": "The preview works only inside the desktop app.",
+  "preview.hint": "Real search arrives in task 1.6. This screen tests the bridge between the UI and Rust.",
+  "status.index": "Index: not started yet",
+  "status.clear": "Clear"
+}

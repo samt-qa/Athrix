@@ -36,9 +36,10 @@
   --kbd-bg: var(--beige-200);
   --kbd-edge: var(--beige-400);
 
-  /* Type (fonts are bundled in task 0.3; system fallbacks until then) */
-  --font-ui: "IBM Plex Sans Arabic", "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
-  --font-display: "Readex Pro", "IBM Plex Sans Arabic", "Segoe UI", sans-serif;
+  /* Type (bundled in styles/fonts.css). Latin first: IBM Plex Sans Arabic has no Latin glyphs
+     in its arabic subset, so the browser falls through to it only for Arabic text. */
+  --font-ui: "IBM Plex Sans", "IBM Plex Sans Arabic", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Readex Pro Variable", "IBM Plex Sans Arabic", "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
 
   /* Shape and depth */
