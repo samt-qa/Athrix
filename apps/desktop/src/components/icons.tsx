@@ -51,3 +51,14 @@ export function TypeIcon(props: { category: FileCategory }) {
     </span>
   );
 }
+
+/** "Matched inside the file": a page with text lines under a small lens. */
+export function ContentMatchIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" {...stroke}>
+      <path d="M4 5h16M4 10h9M4 15h6" />
+      <circle cx="16.5" cy="16.5" r="3.5" />
+      <path d="m19 19 2.5 2.5" />
+    </svg>
+  );
+}

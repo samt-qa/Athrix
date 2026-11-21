@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use athrix_fs_index::{EntryId, FileIndex, IndexSnapshot, Query};
 
 use crate::indexing::{GENERATION_MASK, IndexView};
-use crate::model::ResultItem;
+use crate::model::{Matched, ResultItem};
 use crate::query::CompiledQuery;
 use crate::roots::{key_has_prefix, normalize_root, path_key};
 
@@ -87,7 +87,7 @@ impl SearchScope {
     }
 
     /// True if `path` (an entry's full path) is in the scope.
-    fn contains(&self, path: &Path) -> bool {
+    pub fn contains(&self, path: &Path) -> bool {
         key_has_prefix(&path_key(path), &self.key)
     }
 }
@@ -118,10 +118,7 @@ pub fn run_search(
     cancel: &AtomicBool,
 ) -> Result<SearchHits, SearchFailure> {
     let want = limit.saturating_add(1);
-    let mut ids = match scope {
-        None => full_search(view, &query.query, want, cancel)?,
-        Some(scope) => scoped_search(view, &query.query, want, scope, cancel)?,
-    };
+    let mut ids = search_ids(view, &query.query, want, scope, cancel)?;
     let truncated = ids.len() > limit;
     ids.truncate(limit);
     let mut items = Vec::with_capacity(ids.len());
@@ -134,6 +131,21 @@ pub fn run_search(
     Ok(SearchHits { items, truncated })
 }
 
+/// Up to `limit` matching live ids of `view`, only under `scope` if given, in the order of
+/// [`run_search`] (best first for a ranked query).
+pub fn search_ids(
+    view: &IndexView,
+    query: &Query,
+    limit: usize,
+    scope: Option<&SearchScope>,
+    cancel: &AtomicBool,
+) -> Result<Vec<EntryId>, SearchFailure> {
+    match scope {
+        None => full_search(view, query, limit, cancel),
+        Some(scope) => scoped_search(view, query, limit, scope, cancel),
+    }
+}
+
 /// How many entries (at most `limit`) match `query` in `scope`, without building items: the
 /// cheap probe behind the "did you mean" suggestion.
 pub fn count_matches(
@@ -143,10 +155,7 @@ pub fn count_matches(
     scope: Option<&SearchScope>,
     cancel: &AtomicBool,
 ) -> Result<usize, SearchFailure> {
-    let ids = match scope {
-        None => full_search(view, query, limit, cancel)?,
-        Some(scope) => scoped_search(view, query, limit, scope, cancel)?,
-    };
+    let ids = search_ids(view, query, limit, scope, cancel)?;
     Ok(ids.len().min(limit))
 }
 
@@ -459,6 +468,18 @@ pub fn build_item(
     id: EntryId,
     query: &CompiledQuery,
 ) -> ResultItem {
+    build_row(index, generation, id, |name| query.highlights(name))
+}
+
+/// Builds the UI row for the live entry `id` of `index` (generation `generation`), with the
+/// name highlights `highlights` computes from the original name. `matched` is
+/// [`Matched::Name`] and `snippet` is `None`; content search sets them afterwards.
+pub fn build_row(
+    index: &IndexSnapshot,
+    generation: u32,
+    id: EntryId,
+    highlights: impl FnOnce(&str) -> Vec<(usize, usize)>,
+) -> ResultItem {
     let name = index.name(id);
     let meta = index.meta(id);
     let parent = index
@@ -481,7 +502,9 @@ pub fn build_item(
         size: (!meta.is_dir).then_some(meta.size),
         modified: meta.modified,
         ext,
-        highlights: query.highlights(name),
+        highlights: highlights(name),
+        matched: Matched::Name,
+        snippet: None,
     }
 }
 

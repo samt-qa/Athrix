@@ -104,3 +104,28 @@ export function splitPath(path: string): PathSegment[] {
   if (last < path.length) out.push({ text: path.slice(last), sep: "" });
   return out;
 }
+
+/** Context kept before the first match of a snippet when its start is trimmed. */
+const SNIPPET_LEAD = 28;
+
+/**
+ * A content snippet laid out for one line: whitespace runs (line breaks, tabs) become single
+ * spaces, and when the first match sits far into the text the start is cut at a word boundary
+ * with a leading "…", so the match is visible before the line's own ellipsis. Highlight ranges
+ * are UTF-16 offsets of `text` and stay valid through both steps (each is remapped).
+ */
+export function snippetParts(text: string, highlights: Range16[], lead = SNIPPET_LEAD): TextPart[] {
+  let from = 0;
+  const first = highlights[0]?.[0] ?? 0;
+  if (first > lead * 1.5) {
+    from = first - lead;
+    // Back to the start of a word (never inside a surrogate pair or a word).
+    const space = text.lastIndexOf(" ", from);
+    from = space >= 0 && first - space < lead * 2 ? space + 1 : from;
+    const code = text.charCodeAt(from);
+    if (code >= 0xdc00 && code <= 0xdfff) from--;
+  }
+  const parts = highlightParts(text, highlights, from).map((p) => ({ ...p, text: p.text.replace(/\s+/g, " ") }));
+  if (from > 0 && !text.slice(0, from).trim().endsWith("…")) parts.unshift({ text: "…", match: false });
+  return parts;
+}

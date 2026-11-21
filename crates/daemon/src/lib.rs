@@ -26,8 +26,10 @@
 //!   ([`SchedulerConfig::workers`]), at background priority. For each file a worker skips it
 //!   if the same version failed before or if [`ContentIndex::is_current`](athrix_content_index::ContentIndex::is_current) says the index
 //!   already holds it, and otherwise extracts it through the [`Extractor`] trait. The default
-//!   [`InProcessExtractor`] calls [`athrix_extract::extract`]; an out-of-process PDF worker
-//!   plugs in by implementing the same trait.
+//!   [`InProcessExtractor`] calls [`athrix_extract::extract`]; [`WorkerExtractor`] sends PDFs
+//!   to the isolated `athrix-extract-worker` process through a shared
+//!   [`WorkerPool`](athrix_extract::WorkerPool) (plug it in with
+//!   [`SchedulerBuilder::extractor`]).
 //! - **Writer.** One thread owns all index writes (`add_or_update`, `delete`) and commits
 //!   every [`SchedulerConfig::commit_every`] changes or [`SchedulerConfig::commit_interval`],
 //!   and also when the queue runs dry, when paused, and on shutdown. A bounded channel between
@@ -103,6 +105,7 @@ mod probe;
 mod progress;
 mod queue;
 mod scheduler;
+mod worker_extractor;
 
 pub use candidate::{Candidate, CandidateFilter, default_priority_folders, path_key};
 pub use extractor::{ExtractFailure, Extractor, InProcessExtractor};
@@ -111,3 +114,4 @@ pub use progress::{FailureCounts, FailureKind, PauseReasons, Progress, RunState}
 pub use scheduler::{
     ContentScheduler, FailedFile, Politeness, ProgressCallback, SchedulerBuilder, SchedulerConfig,
 };
+pub use worker_extractor::{WorkerExtractor, worker_failure};

@@ -130,7 +130,16 @@ export default function PreviewPane(props: Props) {
     for (const el of marked) el.classList.remove("current");
     marked = Array.from(body.querySelectorAll(`[data-m="${i}"]`));
     for (const el of marked) el.classList.add("current");
-    marked[0]?.scrollIntoView({ block: gentle ? "nearest" : "center", inline: "nearest" });
+    const el = marked[0];
+    if (!el) return;
+    // Gentle (new preview or new words): leave the view alone if the match is already in it;
+    // otherwise (e.g. a content match far down the file) bring it to the middle.
+    if (gentle) {
+      const r = el.getBoundingClientRect();
+      const v = body.getBoundingClientRect();
+      if (r.top >= v.top && r.bottom <= v.bottom) return;
+    }
+    el.scrollIntoView({ block: "center", inline: "nearest" });
   }
   function step(delta: number) {
     const n = matches().length;

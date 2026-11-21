@@ -2,7 +2,7 @@
 //! bookkeeping the UI needs (error spans and highlight ranges).
 
 use athrix_fs_index::{Query, QueryError as IndexQueryError};
-use athrix_query::{Expr, ExprKind, ParseError};
+use athrix_query::{Expr, ExprKind, ParseError, PlanError, PlanErrorKind, Query as AstQuery};
 
 use crate::model::QueryError;
 
@@ -37,7 +37,13 @@ impl CompiledQuery {
 /// units.
 pub fn compile_query(text: &str) -> Result<CompiledQuery, QueryError> {
     let ast = athrix_query::parse(text).map_err(|e| map_parse_error(text, &e))?;
-    let query = Query::compile(&ast).map_err(|e| map_index_error(text, &e))?;
+    compile_ast(text, &ast)
+}
+
+/// Compiles an already parsed query (`ast`, whose spans are byte offsets of `text`, such as
+/// the name part of a content search plan) for the name index.
+pub fn compile_ast(text: &str, ast: &AstQuery) -> Result<CompiledQuery, QueryError> {
+    let query = Query::compile(ast).map_err(|e| map_index_error(text, &e))?;
     let mut highlight_terms = Vec::new();
     if let Some(root) = &ast.root {
         collect_terms(root, &mut highlight_terms);
@@ -46,6 +52,30 @@ pub fn compile_query(text: &str) -> Result<CompiledQuery, QueryError> {
         query,
         highlight_terms,
     })
+}
+
+/// Maps a planning error (a valid query combining `content:` in a way that is not supported,
+/// such as `a | content:b`) to a [`QueryError`] whose `kind` is the [`PlanErrorKind`] name
+/// (`ContentInOr`, `NegatedContentGroup`, `OnlyExcludedContent`) and whose range is the
+/// offending `content:` filter, in UTF-16 units.
+pub fn map_plan_error(text: &str, e: &PlanError) -> QueryError {
+    QueryError {
+        message: e.message.clone(),
+        kind: plan_error_kind(e.kind).to_owned(),
+        start: utf16_offset(text, e.span.start),
+        end: utf16_offset(text, e.span.end),
+        suggestion: None,
+    }
+}
+
+fn plan_error_kind(kind: PlanErrorKind) -> &'static str {
+    match kind {
+        PlanErrorKind::ContentInOr => "ContentInOr",
+        PlanErrorKind::NegatedContentGroup => "NegatedContentGroup",
+        PlanErrorKind::OnlyExcludedContent => "OnlyExcludedContent",
+        // `PlanErrorKind` is non-exhaustive: a kind added later still reaches the UI.
+        _ => "Unsupported",
+    }
 }
 
 /// Maps a compile error of the name index. A valid query that uses something the name index
@@ -202,6 +232,30 @@ mod tests {
         assert_eq!(err.start, "تقرير ".encode_utf16().count());
         assert_eq!(err.end, text.encode_utf16().count());
         assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn plan_errors_map_to_their_kind_and_utf16_span() {
+        let cases = [
+            ("تقرير | content:عقد", "ContentInOr", "content:عقد"),
+            (
+                "!<content:عقد ext:pdf>",
+                "NegatedContentGroup",
+                "content:عقد",
+            ),
+            ("-content:مسودة", "OnlyExcludedContent", "content:مسودة"),
+        ];
+        for (text, kind, culprit) in cases {
+            let ast = athrix_query::parse(text).unwrap();
+            let err = athrix_query::plan(&ast, &athrix_query::PlanOptions::default()).unwrap_err();
+            let mapped = map_plan_error(text, &err);
+            assert_eq!(mapped.kind, kind, "{text}");
+            assert!(!mapped.message.is_empty());
+            assert_eq!(mapped.suggestion, None);
+            let units: Vec<u16> = text.encode_utf16().collect();
+            let got = String::from_utf16(&units[mapped.start..mapped.end]).unwrap();
+            assert!(got.contains(culprit), "{text}: {got:?}");
+        }
     }
 
     #[test]

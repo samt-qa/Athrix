@@ -55,6 +55,8 @@ export function NoResults(props: {
   /** A rewrite of the query that finds results (from `SearchResponse.suggestion`). */
   suggestion?: DidYouMean | null;
   onSuggestion?: (text: string) => void;
+  /** Plain words do not search file contents yet: offer to (design §9.3 "no results"). */
+  onSearchContent?: () => void;
 }) {
   return (
     <div class="state">
@@ -83,6 +85,11 @@ export function NoResults(props: {
         <Show when={props.scoped}>
           <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onClearScope?.()}>
             {t("noResults.wholeComputer")}
+          </button>
+        </Show>
+        <Show when={props.onSearchContent}>
+          <button type="button" class="btn-secondary" onMouseDown={(e) => e.preventDefault()} onClick={() => props.onSearchContent?.()}>
+            {t("noResults.searchContent")}
           </button>
         </Show>
       </div>

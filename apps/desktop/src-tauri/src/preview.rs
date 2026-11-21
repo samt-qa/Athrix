@@ -4,7 +4,11 @@
 //! - Text and code: the first `maxChars` characters through [`athrix_extract`] (encoding
 //!   detection, Arabic code pages), with a language hint from the extension.
 //! - Documents (DOCX, XLSX, PPTX, ODF, EPUB, HTML, EML): their extracted text and title/author.
-//! - PDF: not yet ([`UnsupportedReason::Pdf`]); see the `TODO(pdf-worker)` hook below.
+//! - PDF: a `document` with its text and title/author, extracted by the isolated worker process
+//!   through the shared [`WorkerPool`] of [`crate::pdf_worker`] (never in the app process). A
+//!   missing or failing-to-start worker gives [`UnsupportedReason::Pdf`]; a timeout or a worker
+//!   crash gives [`UnsupportedReason::Unreadable`]. PDFs are found by extension or, without
+//!   one, by their `%PDF` magic.
 //! - Images: never sent as bytes over IPC. The preview registers the file under a random,
 //!   short-lived token in [`PreviewAssets`] and returns a URL of the [`SCHEME`] scheme; the
 //!   scheme handler serves only registered tokens (only the last [`ASSET_SLOTS`] images
@@ -24,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use athrix_extract::{ExtractError, Kind, Limits};
+use athrix_extract::{ExtractError, Kind, Limits, WorkerPool};
 use athrix_fs_index::EntryId;
 
 use crate::indexing::IndexView;
@@ -172,21 +176,19 @@ pub fn build_preview(
     })
 }
 
-/// The body for a file at `path` with extension `ext`.
+/// The body for a file at `path` with extension `ext`. PDFs go through the app's shared
+/// worker pool ([`crate::pdf_worker::shared_pool`]).
 pub fn file_body(path: &Path, ext: &str, max_chars: usize, assets: &PreviewAssets) -> PreviewBody {
     if let Some(mime) = image_mime(ext) {
         return image_body(path, mime, assets);
     }
-    let kind = Kind::from_path(path);
-    if kind == Some(Kind::Pdf) {
-        // TODO(pdf-worker): route PDFs to the isolated PDF extraction worker once it lands
-        // (see the tracker, M4: "عزل PDF في عملية منفصلة"); return a `Document` body from its
-        // text and metadata, with the same `max_chars` bound. Until then: no in-app preview.
-        return unsupported(
-            UnsupportedReason::Pdf,
-            "PDF preview is not available yet".into(),
-        );
-    }
+    file_body_with(path, ext, max_chars, &crate::pdf_worker::shared_pool())
+}
+
+/// [`file_body`] for a non-image file, with PDFs extracted through `pool`
+/// ([`WorkerPool::extract_isolated`]: other formats stay in-process, same results as
+/// [`athrix_extract::extract`]).
+fn file_body_with(path: &Path, ext: &str, max_chars: usize, pool: &WorkerPool) -> PreviewBody {
     let limits = Limits {
         max_input_bytes: MAX_DOCUMENT_BYTES,
         max_output_chars: max_chars,
@@ -194,7 +196,7 @@ pub fn file_body(path: &Path, ext: &str, max_chars: usize, assets: &PreviewAsset
         max_total_bytes: MAX_DOCUMENT_BYTES * 4,
         ..Limits::default()
     };
-    match athrix_extract::extract(path, &limits) {
+    match pool.extract_isolated(path, &limits) {
         Ok(x) if x.kind == Kind::Text => {
             let encoding = x.encoding.map(str::to_owned);
             match language_for(ext).or_else(|| language_for(&file_name_lower(path))) {
@@ -211,10 +213,7 @@ pub fn file_body(path: &Path, ext: &str, max_chars: usize, assets: &PreviewAsset
                 },
             }
         }
-        Ok(x) if x.kind == Kind::Pdf => unsupported(
-            UnsupportedReason::Pdf,
-            "PDF preview is not available yet".into(),
-        ),
+        // Documents, PDFs included (`format: "pdf"`).
         Ok(x) => PreviewBody::Document {
             text: x.text,
             truncated: x.truncated,
@@ -226,6 +225,31 @@ pub fn file_body(path: &Path, ext: &str, max_chars: usize, assets: &PreviewAsset
     }
 }
 
+fn extract_failure(e: &ExtractError) -> PreviewBody {
+    let reason = match e {
+        // No worker (not shipped, failed to start, or in its restart back-off), or a worker
+        // built without PDF support: PDF previews are not available, whatever the file.
+        ExtractError::WorkerUnavailable(_) => UnsupportedReason::Pdf,
+        ExtractError::Unsupported(_) if is_pdf_error(e) => UnsupportedReason::Pdf,
+        ExtractError::Unsupported(_) => UnsupportedReason::Format,
+        ExtractError::TooLarge(_) => UnsupportedReason::TooLarge,
+        ExtractError::Corrupt(_) => UnsupportedReason::Corrupt,
+        ExtractError::Encrypted => UnsupportedReason::Encrypted,
+        ExtractError::Io(io) => io_reason(io),
+        // Worker timeout or crash (the worker was replaced), and future variants: it could
+        // not be read.
+        _ => UnsupportedReason::Unreadable,
+    };
+    unsupported(reason, e.to_string())
+}
+
+/// Whether an `Unsupported` error says PDF support is not compiled in (a worker built
+/// without the `pdf` feature).
+fn is_pdf_error(e: &ExtractError) -> bool {
+    matches!(e, ExtractError::Unsupported(m)
+        if *m == format!("{} extraction is not compiled in", Kind::Pdf.name()))
+}
+
 fn file_name_lower(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -234,19 +258,6 @@ fn file_name_lower(path: &Path) -> String {
 
 fn unsupported(reason: UnsupportedReason, message: String) -> PreviewBody {
     PreviewBody::Unsupported { reason, message }
-}
-
-fn extract_failure(e: &ExtractError) -> PreviewBody {
-    let reason = match e {
-        ExtractError::Unsupported(_) => UnsupportedReason::Format,
-        ExtractError::TooLarge(_) => UnsupportedReason::TooLarge,
-        ExtractError::Corrupt(_) => UnsupportedReason::Corrupt,
-        ExtractError::Encrypted => UnsupportedReason::Encrypted,
-        ExtractError::Io(io) => io_reason(io),
-        // Worker failures (timeout, crash) and future variants: it could not be read.
-        _ => UnsupportedReason::Unreadable,
-    };
-    unsupported(reason, e.to_string())
 }
 
 fn io_reason(e: &std::io::Error) -> UnsupportedReason {
@@ -524,18 +535,140 @@ mod tests {
         }
     }
 
+    /// A pool whose worker never starts ("no worker shipped").
+    fn missing_worker_pool() -> WorkerPool {
+        let mut config = athrix_extract::WorkerConfig::default();
+        config.program = Some(PathBuf::from("no-such-dir/athrix-extract-worker-missing"));
+        WorkerPool::new(config)
+    }
+
+    /// A one-page PDF drawing `line` in Helvetica, with a title.
+    fn simple_pdf(line: &str, title: &str) -> Vec<u8> {
+        let content = format!("BT /F1 12 Tf 72 720 Td ({line}) Tj ET");
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_owned(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+            format!("<< /Title ({title}) >>"),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        let n = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+        for o in offsets {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
     #[test]
-    fn pdf_binary_and_missing_files_are_unsupported() {
+    fn pdf_without_a_worker_is_unsupported_pdf() {
         let tmp = tempfile::tempdir().unwrap();
+        let pool = missing_worker_pool();
         let p = tmp.path().join("a.pdf");
-        fs::write(&p, b"%PDF-1.7\n").unwrap();
+        fs::write(&p, simple_pdf("hello", "t")).unwrap();
+        for _ in 0..2 {
+            // The second call hits the restart back-off: same answer, no wait.
+            assert!(matches!(
+                file_body_with(&p, "pdf", 100, &pool),
+                PreviewBody::Unsupported {
+                    reason: UnsupportedReason::Pdf,
+                    ..
+                }
+            ));
+        }
+        // Found by its magic without the extension too.
+        let p = tmp.path().join("scan");
+        fs::write(&p, simple_pdf("hello", "t")).unwrap();
         assert!(matches!(
-            body(&p, 100),
+            file_body_with(&p, "", 100, &pool),
             PreviewBody::Unsupported {
                 reason: UnsupportedReason::Pdf,
                 ..
             }
         ));
+        // Other formats do not need the worker.
+        let p = tmp.path().join("a.txt");
+        fs::write(&p, "نص").unwrap();
+        assert!(matches!(
+            file_body_with(&p, "txt", 100, &pool),
+            PreviewBody::Text { ref text, .. } if text == "نص"
+        ));
+    }
+
+    /// Through the real worker, which tauri-build copies next to the test binary's parent
+    /// (`target/<profile>/`) from `src-tauri/binaries/` (staged by `npm run worker`).
+    #[test]
+    fn pdf_is_a_document_through_the_worker() {
+        let program = athrix_extract::worker::default_program().unwrap();
+        assert!(
+            program.is_file(),
+            "{} is missing: run `npm run worker` in apps/desktop",
+            program.display()
+        );
+        let mut config = athrix_extract::WorkerConfig::default();
+        config.program = Some(program);
+        let pool = WorkerPool::new(config);
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("report.pdf");
+        fs::write(&p, simple_pdf("Hello Athrix preview", "Quarterly")).unwrap();
+        match file_body_with(&p, "pdf", 100, &pool) {
+            PreviewBody::Document {
+                text,
+                format,
+                title,
+                truncated,
+                ..
+            } => {
+                assert_eq!(format, "pdf");
+                assert!(text.contains("Hello Athrix preview"), "{text:?}");
+                assert_eq!(title.as_deref(), Some("Quarterly"));
+                assert!(!truncated);
+            }
+            other => panic!("{other:?}"),
+        }
+        // `maxChars` bounds the worker's output too.
+        match file_body_with(&p, "pdf", 5, &pool) {
+            PreviewBody::Document {
+                text, truncated, ..
+            } => {
+                assert_eq!(text.chars().count(), 5);
+                assert!(truncated);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A broken PDF is the document's problem, not a missing feature.
+        let p = tmp.path().join("broken.pdf");
+        fs::write(&p, b"%PDF-1.7\n").unwrap();
+        assert!(matches!(
+            file_body_with(&p, "pdf", 100, &pool),
+            PreviewBody::Unsupported {
+                reason: UnsupportedReason::Corrupt,
+                ..
+            }
+        ));
+        assert_eq!(pool.stats().spawned, 1);
+    }
+
+    #[test]
+    fn binary_and_missing_files_are_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("tool.exe");
         fs::write(&p, b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
         assert!(matches!(

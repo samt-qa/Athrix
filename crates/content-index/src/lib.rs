@@ -5,7 +5,9 @@
 //! | Field | Type | Why |
 //! |---|---|---|
 //! | `key` | u64, indexed + stored + fast | [`FileKey`]: hash of path + size + mtime. Stable across rescans, unlike name-index ids, and changes when the file does |
-//! | `path` | raw string, indexed + stored | delete / update by path, and the join with the name index |
+//! | `path` | raw string, indexed + stored + fast | the path as given; the fast column lets [`ContentIndex::paths`] list every document without touching the doc store |
+//! | `pkey` | raw string, indexed | [`path_key`] of the path: identity for update / delete and prefix ranges |
+//! | `phash` | u64, fast | 64-bit hash of `pkey`: [`PathFilter::paths`] sets are matched against this column |
 //! | `size`, `mtime` | u64 / i64, stored + fast | freshness checks and future sorting/filtering |
 //! | `body` | text, `athrix_ar` analyzer, freqs + positions, **not stored** | BM25 and phrase queries over the whole text |
 //! | `preview` | stored only (lz4 doc store), the first [`IndexOptions::stored_text_limit`] bytes | snippets on the original diacritized text |
@@ -25,37 +27,76 @@
 //! `Send + Sync`, so a background indexer can share it through an `Arc` with the search side.
 //! Changes become visible to [`ContentIndex::search`] after [`ContentIndex::commit`].
 //!
+//! # Paths, case and separators
+//!
+//! Identity is the [`path_key`] of the path:
+//!
+//! - **Windows** (`cfg(windows)`): `\` and `/` are the same separator and case is ignored
+//!   ([`str::to_lowercase`]), as on NTFS: `C:\Docs\A.txt` and `c:/docs/a.txt` are one
+//!   document, and adding one replaces the other. Arabic has no case; Arabic paths only get
+//!   the separator change.
+//! - **Elsewhere**: byte for byte, case-sensitive, and `\` is an ordinary character, as on
+//!   Linux and macOS file systems.
+//!
+//! The stored `path` (returned in [`Hit::path`] and by [`ContentIndex::paths`]) keeps the form
+//! last given. [`FileKey`] hashes that exact form, so a case-only rename makes
+//! [`ContentIndex::is_current`] false once and the file is re-indexed under its new spelling.
+//!
+//! Prefixes ([`ContentIndex::delete_prefix`], [`PathFilter::prefix`]) are folders, not string
+//! prefixes: `C:/docs` covers `C:/docs` itself and everything under `C:/docs/`, never
+//! `C:/docs2`. A prefix ending with the separator (`C:/`, `/`) covers what is under it. An
+//! empty prefix covers nothing.
+//!
+//! # Keeping the index in step with the disk
+//!
+//! - [`ContentIndex::delete_prefix`]: a folder was deleted or renamed (re-add the new paths).
+//! - [`ContentIndex::retain`]: at startup, drop every document whose file the name index no
+//!   longer has (deleted while Athrix was not running). It streams over
+//!   [`ContentIndex::paths`] and deletes in batches.
+//!
+//! # Scoped search, paging and totals
+//!
+//! [`ContentIndex::search_with`] takes [`SearchOptions`]: `limit` + `offset` for pages, an
+//! optional [`PathFilter`] (a set of paths from the name side of an AND query, or folders /
+//! drives) applied inside tantivy, and `count_total` for the number of matches in the same
+//! pass. [`ContentIndex::count`] / [`ContentIndex::count_within`] only count.
+//!
 //! # Corruption and upgrades
 //!
 //! [`ContentIndex::open_or_create`] rebuilds an empty index when the existing one is damaged,
 //! or was built with another schema or [`athrix_text_ar::ANALYZER_VERSION`], and reports it
 //! through [`ContentIndex::rebuilt`]: the caller must then re-index every file. Errors met
 //! later (a segment file damaged while running) come back as [`Error::Corrupt`].
+//!
+//! Schema version 2 added the `pkey` and `phash` fields and the `path` fast column: an index from version 1
+//! is rebuilt on first open ([`RebuildReason::Outdated`]) and its files re-indexed.
 
 mod analyzer;
 mod error;
 mod query;
+mod scope;
 mod snippet;
 
 pub use analyzer::{ArabicTokenizer, TOKENIZER_NAME};
 pub use error::{Error, Result};
+pub use scope::{PathFilter, path_key};
 pub use snippet::Snippet;
 
 use athrix_text_ar::{ANALYZER_VERSION, Analyzer};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tantivy::collector::TopDocs;
-use tantivy::query::TermQuery;
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
     TextOptions, Value,
 };
 use tantivy::{
-    Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument, Term,
+    DocId, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument, Term,
 };
 
 /// Version of the schema below. Bump it when fields change; old indexes are then rebuilt.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// File written next to the tantivy files: marks the directory as ours and records versions.
 const MARKER_FILE: &str = "athrix-content-index.version";
@@ -152,6 +193,8 @@ pub struct Hit {
 struct Fields {
     key: Field,
     path: Field,
+    pkey: Field,
+    phash: Field,
     size: Field,
     mtime: Field,
     body: Field,
@@ -168,7 +211,9 @@ impl Fields {
         );
         let fields = Fields {
             key: b.add_u64_field("key", INDEXED | STORED | FAST),
-            path: b.add_text_field("path", STRING | STORED),
+            path: b.add_text_field("path", STRING | STORED | FAST),
+            pkey: b.add_text_field("pkey", STRING),
+            phash: b.add_u64_field(scope::PATH_HASH_FIELD, FAST),
             size: b.add_u64_field("size", STORED | FAST),
             mtime: b.add_i64_field("mtime", STORED | FAST),
             body: b.add_text_field("body", body_opts),
@@ -348,6 +393,9 @@ impl ContentIndex {
         let mut doc = TantivyDocument::default();
         doc.add_u64(f.key, key.0);
         doc.add_text(f.path, path);
+        let pkey = path_key(path);
+        doc.add_text(f.pkey, &pkey);
+        doc.add_u64(f.phash, scope::path_hash(&pkey));
         doc.add_u64(f.size, meta.size);
         doc.add_i64(f.mtime, meta.mtime);
         doc.add_text(f.body, text);
@@ -355,15 +403,16 @@ impl ContentIndex {
             doc.add_text(f.preview, prefix(text, self.options.stored_text_limit));
         }
         let w = self.writer();
-        w.delete_term(Term::from_field_text(f.path, path));
+        w.delete_term(Term::from_field_text(f.pkey, &pkey));
         w.add_document(doc).map_err(|e| self.err(e))?;
         Ok(key)
     }
 
-    /// Removes `path` from the index. Visible after [`commit`](Self::commit).
+    /// Removes `path` (compared by [`path_key`]) from the index. Visible after
+    /// [`commit`](Self::commit).
     pub fn delete(&self, path: &str) {
         self.writer()
-            .delete_term(Term::from_field_text(self.fields.path, path));
+            .delete_term(Term::from_field_text(self.fields.pkey, &path_key(path)));
     }
 
     /// Persists pending changes and makes them visible to searches.
@@ -388,7 +437,7 @@ impl ContentIndex {
     pub fn is_current(&self, path: &str, meta: FileMeta) -> Result<bool> {
         let searcher = self.reader.searcher();
         let q = TermQuery::new(
-            Term::from_field_text(self.fields.path, path),
+            Term::from_field_text(self.fields.pkey, &path_key(path)),
             IndexRecordOption::Basic,
         );
         let top = searcher
@@ -405,20 +454,97 @@ impl ContentIndex {
     /// Searches the committed documents. Words are ANDed, `"…"` is a phrase, `-word`
     /// excludes (see the `query` module docs). Returns at most `limit` hits, best first, each
     /// with a snippet of the original text.
+    /// Searches the committed documents. Words are ANDed, `"…"` is a phrase, `-word`
+    /// excludes (see the `query` module docs). Returns at most `limit` hits, best first, each
+    /// with a snippet of the original text.
     pub fn search(&self, query_text: &str, limit: usize) -> Result<Vec<Hit>> {
+        let opts = SearchOptions {
+            limit,
+            ..SearchOptions::default()
+        };
+        Ok(self.search_with(query_text, &opts)?.hits)
+    }
+
+    /// [`search`](Self::search) restricted to the files `filter` lets through: the best
+    /// `limit` hits *within* the scope.
+    pub fn search_within(
+        &self,
+        query_text: &str,
+        limit: usize,
+        filter: &PathFilter,
+    ) -> Result<Vec<Hit>> {
+        let opts = SearchOptions {
+            limit,
+            filter: Some(filter),
+            ..SearchOptions::default()
+        };
+        Ok(self.search_with(query_text, &opts)?.hits)
+    }
+
+    /// Number of committed documents matching the query, without ranking or snippets.
+    pub fn count(&self, query_text: &str) -> Result<u64> {
+        self.count_impl(query_text, None)
+    }
+
+    /// Number of committed documents matching the query within `filter`.
+    pub fn count_within(&self, query_text: &str, filter: &PathFilter) -> Result<u64> {
+        self.count_impl(query_text, Some(filter))
+    }
+
+    fn count_impl(&self, query_text: &str, filter: Option<&PathFilter>) -> Result<u64> {
+        let opts = SearchOptions {
+            limit: 0,
+            filter,
+            count_total: true,
+            ..SearchOptions::default()
+        };
+        Ok(self.search_with(query_text, &opts)?.total.unwrap_or(0))
+    }
+
+    /// The general search: a page (`offset`, `limit`) of the best hits, optionally scoped by
+    /// a [`PathFilter`] and with the total number of matches. Pages are stable as long as no
+    /// commit happens in between.
+    pub fn search_with(&self, query_text: &str, opts: &SearchOptions<'_>) -> Result<SearchPage> {
         let f = self.fields;
+        let empty = SearchPage {
+            hits: Vec::new(),
+            total: opts.count_total.then_some(0),
+        };
         let analyzer = Analyzer::default();
         let built = query::build(query_text, f.body, analyzer);
-        let Some(q) = built.query else {
-            return Ok(Vec::new());
+        let Some(mut q) = built.query else {
+            return Ok(empty);
         };
-        if limit == 0 {
-            return Ok(Vec::new());
+        if let Some(filter) = opts.filter {
+            let Some(scope) = filter.query() else {
+                return Ok(empty);
+            };
+            // Score 0: the scope must not change BM25 ranking.
+            let scope: Box<dyn Query> = Box::new(ConstScoreQuery::new(scope, 0.0));
+            q = Box::new(BooleanQuery::new(vec![
+                (Occur::Must, q),
+                (Occur::Must, scope),
+            ]));
         }
         let searcher = self.reader.searcher();
-        let top = searcher
-            .search(&q, &TopDocs::with_limit(limit))
-            .map_err(|e| self.err(e))?;
+        let (top, total) = match (opts.limit, opts.count_total) {
+            (0, false) => return Ok(empty),
+            (0, true) => {
+                let n = searcher.search(&q, &Count).map_err(|e| self.err(e))?;
+                (Vec::new(), Some(n as u64))
+            }
+            (limit, false) => {
+                let top = TopDocs::with_limit(limit).and_offset(opts.offset);
+                (searcher.search(&q, &top).map_err(|e| self.err(e))?, None)
+            }
+            (limit, true) => {
+                let top = TopDocs::with_limit(limit).and_offset(opts.offset);
+                let (top, n) = searcher
+                    .search(&q, &(top, Count))
+                    .map_err(|e| self.err(e))?;
+                (top, Some(n as u64))
+            }
+        };
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr).map_err(|e| self.err(e))?;
@@ -436,8 +562,131 @@ impl ContentIndex {
                 snippet: snippet::make(preview, &built.terms, analyzer, self.options.snippet_bytes),
             });
         }
-        Ok(hits)
+        Ok(SearchPage { hits, total })
     }
+
+    /// Calls `f` with the path (as last given to [`add_or_update`](Self::add_or_update)) and
+    /// meta of every committed document; returns how many there were.
+    ///
+    /// Reads only the fast columns (path dictionary, size, mtime), never the stored text:
+    /// memory is 8 bytes per document of the largest segment, whatever the index size. Order:
+    /// sorted by path within each segment, segments one after another (not globally sorted).
+    /// Runs on a snapshot: commits made meanwhile are not seen.
+    pub fn paths(&self, mut f: impl FnMut(&str, FileMeta)) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let mut count = 0u64;
+        let mut pairs: Vec<(u32, DocId)> = Vec::new();
+        for segment in searcher.segment_readers() {
+            let ff = segment.fast_fields();
+            let Some(paths) = ff.str("path").map_err(|e| self.err(e))? else {
+                continue;
+            };
+            let sizes = ff.u64("size").map_err(|e| self.err(e))?;
+            let mtimes = ff.i64("mtime").map_err(|e| self.err(e))?;
+            pairs.clear();
+            pairs.extend(segment.doc_ids_alive().filter_map(|doc| {
+                // Ordinals are < number of docs in the segment, so they fit in u32.
+                Some((u32::try_from(paths.ords().first(doc)?).ok()?, doc))
+            }));
+            pairs.sort_unstable();
+            let mut next = 0;
+            let complete = paths
+                .dictionary()
+                .sorted_ords_to_term_cb(pairs.iter().map(|&(ord, _)| u64::from(ord)), |bytes| {
+                    let doc = pairs[next].1;
+                    next += 1;
+                    let path = std::str::from_utf8(bytes)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    let meta = FileMeta {
+                        size: sizes.first(doc).unwrap_or(0),
+                        mtime: mtimes.first(doc).unwrap_or(0),
+                    };
+                    f(path, meta);
+                    Ok(())
+                })
+                .map_err(|e| self.err(e.into()))?;
+            if !complete {
+                return Err(Error::Corrupt {
+                    path: self.dir.clone(),
+                    message: "path dictionary is missing ordinals".to_owned(),
+                });
+            }
+            count += next as u64;
+        }
+        Ok(count)
+    }
+
+    /// Deletes every document for which `keep(path, meta)` is false, e.g. files the name
+    /// index no longer has. Streams over [`paths`](Self::paths) and queues the deletes in
+    /// batches; returns how many documents were removed. Visible after
+    /// [`commit`](Self::commit).
+    pub fn retain(&self, mut keep: impl FnMut(&str, FileMeta) -> bool) -> Result<u64> {
+        const BATCH: usize = 4096;
+        let field = self.fields.path;
+        let mut batch: Vec<Term> = Vec::new();
+        let mut removed = 0u64;
+        let flush = |batch: &mut Vec<Term>| {
+            if batch.is_empty() {
+                return;
+            }
+            let w = self.writer();
+            for term in batch.drain(..) {
+                w.delete_term(term);
+            }
+        };
+        self.paths(|path, meta| {
+            if !keep(path, meta) {
+                // By the exact stored path: the document `keep` judged, nothing else.
+                batch.push(Term::from_field_text(field, path));
+                removed += 1;
+                if batch.len() >= BATCH {
+                    flush(&mut batch);
+                }
+            }
+        })?;
+        flush(&mut batch);
+        Ok(removed)
+    }
+
+    /// Deletes every document in the folder `prefix` or below it (compared by [`path_key`];
+    /// `C:/docs` covers `C:/docs/…` but not `C:/docs2`, see [`PathFilter`]). An empty prefix
+    /// deletes nothing. Returns the number of committed documents removed; documents added
+    /// under the prefix since the last commit are removed too. Visible after
+    /// [`commit`](Self::commit).
+    pub fn delete_prefix(&self, prefix: &str) -> Result<u64> {
+        let Some(q) = scope::prefix_query(self.fields.pkey, &path_key(prefix)) else {
+            return Ok(0);
+        };
+        let n = self
+            .reader
+            .searcher()
+            .search(&q, &Count)
+            .map_err(|e| self.err(e))?;
+        self.writer().delete_query(q).map_err(|e| self.err(e))?;
+        Ok(n as u64)
+    }
+}
+
+/// Options of [`ContentIndex::search_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions<'a> {
+    /// Maximum number of hits (0: none, e.g. to only count).
+    pub limit: usize,
+    /// Hits to skip, for paging: page `n` is `offset = n * limit`.
+    pub offset: usize,
+    /// Only documents this filter lets through.
+    pub filter: Option<&'a PathFilter>,
+    /// Also count every match ([`SearchPage::total`]) in the same pass.
+    pub count_total: bool,
+}
+
+/// Result of [`ContentIndex::search_with`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SearchPage {
+    /// The requested page of hits, best first.
+    pub hits: Vec<Hit>,
+    /// Number of matching documents, when [`SearchOptions::count_total`] was set.
+    pub total: Option<u64>,
 }
 
 /// The longest prefix of `text` of at most `limit` bytes, on a char boundary.

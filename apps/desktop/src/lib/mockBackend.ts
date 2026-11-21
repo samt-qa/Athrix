@@ -7,12 +7,22 @@
 // Test switches (URL query string): `?mockEntries=N` (default 4000), `?mockIndexError`,
 // `?mockStale` (the first open / reveal / copy acts as if a re-index ran after the search:
 // it rejects with the stale-id error and the ids change, like the Rust side).
+//
+// Content search (tasks 4.5, 4.7): text files and documents get a short body (a few demo files
+// carry hand-written Arabic notes; the rest draw sentences from a bank). After the name index is
+// ready a fake content indexer works through them (~45 docs/s) and emits `content://status`
+// twice a second; only processed files are found by `content:` (or by plain words with
+// `searchContent`), with snippets and `matched`. Pause / resume / disable work, and the
+// planner's errors (ContentInOr, NegatedContentGroup, OnlyExcludedContent) are reported.
+// More switches: `?mockBattery` (pauses "on battery" for 8 s at about a third of the way),
+// `?mockContentError` (the content indexer fails), `?mockContentRate=N` (docs per second).
 import type {
-  CommandArgs, CommandName, CommandResult, IndexRoots, IndexStatus, PreviewBody, PreviewResponse, QueryError, Range16,
-  ResultItem, SearchResponse, SearchSuggestion, Volume,
+  CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, IndexRoots, IndexStatus, MatchSource,
+  PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, SearchResponse, SearchSuggestion, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
-import { normalizeWithMap, toOriginalRange as toOriginal } from "./textMatch";
+import { tokenize, type Token } from "./queryLang";
+import { findMatches, normalizeWithMap, toOriginalRange as toOriginal } from "./textMatch";
 
 const params = new URLSearchParams(window.location.search);
 const ENTRY_COUNT = clampInt(Number(params.get("mockEntries") ?? 4000), 10, 200_000);
@@ -96,11 +106,118 @@ const BASES: [string, string[]][] = [
 
 const ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩";
 
+type MockItem = Omit<ResultItem, "highlights" | "matched" | "snippet">;
+
 interface MockEntry {
-  item: Omit<ResultItem, "highlights">;
+  item: MockItem;
   /** Normalized name, and for each of its UTF-16 units the index in the original name. */
   norm: string;
   map: number[];
+  /** Text the content indexer extracts (text files and documents only). */
+  body?: string;
+  /** Normalized body (what content search looks in). */
+  bodyNorm?: string;
+  /** Position in the content indexer's queue: searchable once processed (and not failed). */
+  contentOrder?: number;
+  /** A hand-written demo document: its preview is exactly its body. */
+  demo?: boolean;
+}
+
+// ---------- file contents ----------
+
+/** Extensions whose text the (mock) content indexer reads. */
+const TEXTUAL = new Set(["md", "txt", "csv", "docx", "pptx", "xlsx", "epub", "html", "pdf", "rs", "ts", "tsx", "py", "go", "js"]);
+
+/** Hand-written demo files with Arabic bodies (design §9.1: «…يجب مراجعة التقرير قبل نهاية الأسبوع…»). */
+const DEMO_DOCS: { folder: string; name: string; body: string }[] = [
+  {
+    folder: "Documents\\العمل", name: "ملاحظات الاجتماع الأسبوعي.md",
+    body: [
+      "# ملاحظات الاجتماع الأسبوعي",
+      "",
+      "الحضور: سارة، خالد، منى، يوسف.",
+      ...Array.from({ length: 26 }, (_, i) => `- البند ${i + 1}: متابعة المهام الجارية وتحديث الجدول الزمني للفريق.`),
+      "",
+      "## القرارات",
+      "- يجب مراجعة التقرير قبل نهاية الأسبوع وإرساله إلى الإدارة.",
+      "- تأجيل ورشة العمل إلى الشهر القادم.",
+      "- اعتماد الميزانية المبدئية للمرحلة الثانية.",
+    ].join("\n"),
+  },
+  {
+    folder: "Documents\\العمل\\التقارير", name: "محضر اجتماع اللجنة.docx",
+    body: [
+      "محضر اجتماع لجنة المشاريع",
+      ...Array.from({ length: 18 }, (_, i) => `الفقرة ${i + 1}: عرض موجز لسير العمل في الأقسام.`),
+      "ناقشت اللجنة التَّقْرِيرَ المالي للربع الثالث، وأوصت بزيادة الميزانية التشغيلية بنسبة ١٠٪.",
+      "The committee approved the quarterly report with minor changes.",
+      "تُرفع التوصيات إلى المدير العام للاعتماد.",
+    ].join("\n"),
+  },
+  {
+    folder: "Documents\\العمل\\العقود", name: "مسودة العقد.docx",
+    body: [
+      "مسودة — لا تُرسل قبل المراجعة القانونية.",
+      "عقد الإيجار بين الطرف الأول (المؤجر) والطرف الثاني (المستأجر).",
+      "مدة العقد سنة واحدة تتجدد تلقائيًا ما لم يُخطر أحد الطرفين الآخر قبل شهرين.",
+      "قيمة الإيجار السنوي: ٤٨٬٠٠٠ ريال تُدفع على دفعتين.",
+    ].join("\n"),
+  },
+  {
+    folder: "Documents\\الجامعة\\مُحَاضَرَاتُ الفِقْهِ", name: "درس أصول الفقه.txt",
+    body: [
+      "بسم الله الرحمن الرحيم",
+      ...Array.from({ length: 14 }, (_, i) => `السطر ${i + 1}: تمهيد عام للدرس.`),
+      "تعريف أُصُولِ الفِقْهِ: علمٌ يُبحث فيه عن أدلة الفقه الإجمالية وكيفية الاستفادة منها.",
+      "من أدلة الأحكام: الكتاب والسنة والإجماع والقِيَاس.",
+    ].join("\n"),
+  },
+  {
+    folder: "Desktop", name: "مهام اليوم.txt",
+    body: "قائمة المهام:\n- إرسال التقرير إلى خالد\n- دفع فاتورة الكهرباء\n- شراء هدية لمنى\n- حجز تذاكر الرحلة",
+  },
+  {
+    folder: "Documents", name: "خطة التسويق 2026.md",
+    body: [
+      "# خطة التسويق 2026",
+      "الهدف: زيادة المبيعات في الرياض وجدة بنسبة ٢٠٪.",
+      "الحملة الإعلانية تبدأ في مارس، والميزانية التسويقية معتمدة من الإدارة.",
+      "Marketing plan: social media first, then outdoor ads.",
+    ].join("\n"),
+  },
+  {
+    folder: "Documents\\Personal\\Receipts", name: "rental-notes.md",
+    body: "Notes on the rental contract: it renews every year.\nملاحظة: نسخة عقد الإيجار الأصلية في الدرج الثاني.",
+  },
+];
+
+/** Sentences for the generated bodies (keywords spread so content queries find a fair share). */
+const SENTENCES = [
+  "تمت مراجعة الميزانية التشغيلية للربع الثالث وإقرارها.",
+  "يجب مراجعة التقرير قبل نهاية الأسبوع وإرساله إلى الإدارة.",
+  "ناقش الاجتماع جدول تسليم المشروع والمخاطر المتوقعة.",
+  "أُرفقت نسخة من عقد الإيجار الموقّع مع هذا الملف.",
+  "The quarterly report shows steady growth in sales.",
+  "ملاحظات المحاضرة: مقدمة في أصول الفقه والقياس.",
+  "Please review the budget before Thursday's meeting.",
+  "فاتورة الكهرباء لشهر مارس مستحقة الدفع خلال أسبوعين.",
+  "خطة التحول الرقمي تتضمن أتمتة الخدمات الحكومية.",
+  "قائمة المهام: تحديث السيرة الذاتية، وحجز موعد الطبيب.",
+  "Meeting notes: the design system review moved to Monday.",
+  "اعتمدت اللجنة توصيات التقرير السنوي بالإجماع.",
+  "تفاصيل الرحلة إلى إسطنبول: الفندق والتذاكر والميزانية.",
+  "The rental contract renews automatically every year.",
+  "مسودة أولية — لا تُرسل قبل الاعتماد النهائي.",
+  "أرقام المبيعات في الرياض تجاوزت المستهدف بنسبة ١٢٪.",
+];
+
+/** A deterministic 2–4 sentence body for entry number `n`. */
+function generatedBody(n: number): string {
+  const rnd = mulberry32(n * 7919 + 17);
+  const count = 2 + Math.floor(rnd() * 3);
+  const out: string[] = [];
+  for (let i = 0; i < count; i++) out.push(SENTENCES[Math.floor(rnd() * SENTENCES.length)]);
+  return out.join(" ");
 }
 
 /** Typical byte size per category, so sizes look plausible. */
@@ -115,9 +232,12 @@ function buildIndex(count: number): MockEntry[] {
   const entries: MockEntry[] = [];
   let id = 1;
 
-  const push = (item: Omit<ResultItem, "highlights" | "id">) => {
+  const push = (item: Omit<MockItem, "id">, body?: string) => {
     const { norm, map } = normalizeWithMap(item.name);
-    entries.push({ item: { ...item, id: id++ }, norm, map });
+    const n = id++;
+    const demo = body !== undefined;
+    if (!item.isDir && body === undefined && TEXTUAL.has(item.ext)) body = generatedBody(n);
+    entries.push({ item: { ...item, id: n }, norm, map, body, bodyNorm: body ? normalizeWithMap(body).norm : undefined, demo });
   };
 
   // The folders themselves (and their ancestors) are entries too.
@@ -133,6 +253,14 @@ function buildIndex(count: number): MockEntry[] {
         modified: nowSec - Math.floor(rnd() * 400 * 86400), ext: "",
       });
     }
+  }
+
+  // The demo documents, right after the folders (first in the content queue too).
+  for (const d of DEMO_DOCS) {
+    push({
+      name: d.name, parent: `${baseOf(d.folder)}\\${d.folder}`, isDir: false, size: d.body.length * 2 + 2048,
+      modified: nowSec - 3600 * (2 + (entries.length % 40)), ext: d.name.slice(d.name.lastIndexOf(".") + 1),
+    }, d.body);
   }
 
   while (entries.length < count) {
@@ -179,8 +307,9 @@ const ARABIC_FILTERS: Record<string, string> = {
   "محتوى": "content", "وسم": "tag",
 };
 const VALUE_FILTERS = new Set(["ext", "type", "size", "dm", "dc", "da", "path", "parent", "infolder", "tag"]);
-/** Valid filters the name index cannot answer yet (contract: QueryError.kind "Unsupported"). */
-const UNSUPPORTED = new Set(["content", "sem", "tag", "regex", "dupe", "similar", "dc", "da"]);
+/** Valid filters the mock cannot answer (contract: QueryError.kind "Unsupported"). `content:` is
+ *  taken out of the query before parsing (see contentFilters). */
+const UNSUPPORTED = new Set(["sem", "tag", "regex", "dupe", "similar", "dc", "da"]);
 const KINDS: Record<string, string> = {
   doc: "doc", docs: "doc", document: "doc", documents: "doc", "مستند": "doc", "مستندات": "doc",
   image: "image", images: "image", "صورة": "image", "صور": "image",
@@ -309,6 +438,93 @@ function applyFilter(out: Parsed, name: string, value: string, start: number, va
   // Other known filters (dm, path, parent, infolder, case, ww) are accepted and ignored by the mock.
 }
 
+// ---------- content: filters and the planner's rejected combinations (crates/query/src/plan.rs) ----------
+
+interface ContentClause {
+  /** Normalized word or phrase. */
+  term: string;
+  negated: boolean;
+  /** `content:value`, or `-content:value` for an excluded one (the error span). */
+  start: number;
+  end: number;
+}
+
+/**
+ * Takes the `content:` / `محتوى:` filters out of `query` (with the search bar's lexer, so a
+ * quoted value is one phrase) and returns them with the query where they stood blanked out
+ * (same length, so the parser's error offsets stay right). Then applies the planner's rules:
+ * `content:` under `|` ⇒ ContentInOr; a negated group holding `content:` and anything else ⇒
+ * NegatedContentGroup — returned as `planError`, since the parser's own errors come first.
+ * OnlyExcludedContent needs the parsed rest (see search).
+ */
+function contentFilters(query: string): { rest: string; clauses: ContentClause[]; planError: QueryError | null } {
+  const tokens = tokenize(query);
+  const clauses: ContentClause[] = [];
+  let rest = query;
+  const solid = tokens.filter((t) => t.kind !== "ws");
+  for (let i = 0; i < solid.length; i++) {
+    const f = solid[i];
+    if (f.kind !== "filter" || f.filter !== "content") continue;
+    let end = f.end;
+    const value: Token[] = [];
+    for (let j = i + 1; j < solid.length && solid[j].valueStart === f.valueStart && solid[j].filter === "content"; j++) {
+      value.push(solid[j]);
+      end = solid[j].end;
+    }
+    const raw = query.slice(f.end, end);
+    const op = solid[i - 1];
+    const negated = !!op && op.kind === "op" && op.end === f.start && (query[op.start] === "!" || query[op.start] === "-");
+    if (!raw.replace(/"/g, "").trim()) fail("MissingValue", f.start, f.end, `\`${query.slice(f.start, f.end)}\` needs a value`);
+    const term = normalizeWithMap(raw.replace(/^"|"$/g, "")).norm.trim();
+    clauses.push({ term, negated, start: negated ? op.start : f.start, end });
+    rest = rest.slice(0, negated ? op.start : f.start) + " ".repeat(end - (negated ? op.start : f.start)) + rest.slice(end);
+  }
+  if (!clauses.length) return { rest, clauses, planError: null };
+  try {
+    planChecks(query, solid, clauses);
+  } catch (e) {
+    if (e instanceof MockParseError) return { rest, clauses, planError: e.err };
+    throw e;
+  }
+  return { rest, clauses, planError: null };
+}
+
+function planChecks(query: string, solid: Token[], clauses: ContentClause[]) {
+  const first = clauses[0];
+  const filterSpan = (c: ContentClause) => [c.negated ? c.start + 1 : c.start, c.end] as const;
+  // `|` anywhere next to a content filter: a union across the two indexes.
+  if (solid.some((t) => t.kind === "op" && query[t.start] === "|")) {
+    const [s, e] = filterSpan(first);
+    fail("ContentInOr", s, e, "`content:` cannot be combined with `|` (OR) yet; search the alternatives one at a time");
+  }
+  // `!<…>` / `-<…>` holding content: plus anything else.
+  const groups: { negated: boolean; items: number; content: ContentClause | null }[] = [];
+  for (let i = 0; i < solid.length; i++) {
+    const t = solid[i];
+    const ch = query[t.start];
+    if (t.kind === "op" && ch === "<") {
+      const prev = solid[i - 1];
+      groups.push({ negated: !!prev && prev.kind === "op" && prev.end === t.start && (query[prev.start] === "!" || query[prev.start] === "-"), items: 0, content: null });
+    } else if (t.kind === "op" && ch === ">" && !t.filter) {
+      const g = groups.pop();
+      if (g?.negated && g.content && g.items > 1) {
+        const [s, e] = filterSpan(g.content);
+        fail("NegatedContentGroup", s, e,
+          "`!`/`-` before a group with `content:` is not supported; negate the `content:` filter itself, for example `-content:draft`");
+      }
+      if (g && groups.length) {
+        const parent = groups[groups.length - 1];
+        parent.items++;
+        parent.content ??= g.content;
+      }
+    } else if (groups.length && (t.kind === "filter" || t.kind === "phrase" || (t.kind === "text" && solid[i - 1]?.end !== t.start))) {
+      const g = groups[groups.length - 1];
+      g.items++;
+      if (t.kind === "filter" && t.filter === "content") g.content ??= clauses.find((c) => filterSpan(c)[0] === t.start) ?? null;
+    }
+  }
+}
+
 function kindMatches(kinds: string[], item: MockEntry["item"]): boolean {
   const cat = categoryOf(item.ext, item.isDir);
   return kinds.some((k) => {
@@ -390,7 +606,131 @@ function startIndexing(roots?: string[]) {
     setStatus({
       state: "ready", entries: index.length, roots: r, elapsedMs: Math.round(performance.now() - t0), error: null,
     });
+    startContentIndexing(index);
   }, INDEX_DELAY_MS);
+}
+
+// ---------- the content indexer (task 4.5) ----------
+
+const CONTENT_RATE = clampInt(Number(params.get("mockContentRate") ?? 45), 1, 100_000);
+const TICK_MS = 500;
+/** Every FAIL_EVERY-th file of the queue "cannot be read" (encrypted, corrupt…). */
+const FAIL_EVERY = 41;
+
+let content: ContentStatus = {
+  state: "idle", pausedBy: [], processed: 0, total: 0, indexed: 0, failed: 0, docsPerSecond: 0, error: null,
+};
+let contentEnabled = true;
+let contentTimer: ReturnType<typeof setInterval> | undefined;
+let batteryDone = !params.has("mockBattery");
+const contentListeners = new Set<(s: ContentStatus) => void>();
+
+export function onContentStatus(handler: (s: ContentStatus) => void): () => void {
+  contentListeners.add(handler);
+  return () => contentListeners.delete(handler);
+}
+
+function setContent(next: Partial<ContentStatus>) {
+  content = { ...content, ...next };
+  if (content.state !== "running") content.docsPerSecond = 0;
+  for (const l of contentListeners) l({ ...content, pausedBy: [...content.pausedBy] });
+}
+
+/** Whether entry `e` is in the content index now. */
+const contentIndexed = (e: MockEntry) =>
+  contentEnabled && e.contentOrder !== undefined && e.contentOrder < content.processed && (e.contentOrder + 1) % FAIL_EVERY !== 0;
+
+/** Queues every file with text (the demo documents first) and starts working through it. */
+function startContentIndexing(entries: MockEntry[]) {
+  let order = 0;
+  for (const e of entries) if (e.body !== undefined) e.contentOrder = order++;
+  const processed = Math.min(content.processed, order);
+  setContent({ total: order, processed, ...counts(processed) });
+  if (!contentEnabled) return;
+  if (params.has("mockContentError")) {
+    setTimeout(() => setContent({ state: "error", error: "the content index is damaged (mock); delete it to rebuild" }), 3000);
+    return;
+  }
+  if (content.state !== "paused") setContent({ state: processed < order ? "running" : "idle" });
+  clearInterval(contentTimer);
+  contentTimer = setInterval(tickContent, TICK_MS);
+}
+
+function counts(processed: number) {
+  const failed = Math.floor(processed / FAIL_EVERY);
+  return { failed, indexed: processed - failed };
+}
+
+function tickContent() {
+  if (!contentEnabled || content.state === "error") return;
+  // `?mockBattery`: unplugged for 8 s at about a third of the way.
+  if (!batteryDone && content.state === "running" && content.processed > content.total / 3) {
+    batteryDone = true;
+    setContent({ state: "paused", pausedBy: [...content.pausedBy, "battery"] });
+    setTimeout(() => {
+      const pausedBy = content.pausedBy.filter((r) => r !== "battery");
+      setContent({ pausedBy, state: pausedBy.length ? "paused" : content.processed < content.total ? "running" : "idle" });
+    }, 8000);
+  }
+  if (content.state !== "running") return;
+  const rate = CONTENT_RATE * (0.85 + Math.random() * 0.3);
+  const processed = Math.min(content.total, content.processed + Math.max(1, Math.round((rate * TICK_MS) / 1000)));
+  setContent({
+    processed, ...counts(processed), docsPerSecond: rate,
+    state: processed < content.total ? "running" : "idle",
+  });
+}
+
+function pauseContent(by: "user") {
+  if (!contentEnabled || content.state === "error") return;
+  if (!content.pausedBy.includes(by)) setContent({ state: "paused", pausedBy: [...content.pausedBy, by] });
+}
+
+function resumeContent() {
+  if (!contentEnabled || content.state === "error") return;
+  const pausedBy = content.pausedBy.filter((r) => r !== "user");
+  setContent({ pausedBy, state: pausedBy.length ? "paused" : content.processed < content.total ? "running" : "idle" });
+}
+
+function setContentIndexing(enabled: boolean) {
+  contentEnabled = enabled;
+  if (!enabled) {
+    clearInterval(contentTimer);
+    setContent({ state: "disabled", pausedBy: [] });
+  } else if (index) {
+    setContent({ state: "idle", pausedBy: [] });
+    startContentIndexing(index);
+  } else {
+    setContent({ state: "idle" });
+  }
+}
+
+// ---------- snippets ----------
+
+/** Context kept around the first match of a snippet. */
+const SNIPPET_BEFORE = 50;
+const SNIPPET_AFTER = 110;
+
+/** An excerpt of `body` around the first occurrence of `terms` (normalized), with their ranges. */
+function makeSnippet(body: string, terms: string[]): ContentSnippet | null {
+  const all = findMatches(body, terms, 1);
+  if (!all.length) return null;
+  const [ms, me] = all[0];
+  let s = Math.max(0, ms - SNIPPET_BEFORE);
+  let e = Math.min(body.length, me + SNIPPET_AFTER);
+  // Snap to word boundaries.
+  if (s > 0) {
+    const sp = body.indexOf(" ", s);
+    if (sp >= 0 && sp < ms) s = sp + 1;
+  }
+  if (e < body.length) {
+    const sp = body.lastIndexOf(" ", e);
+    if (sp > me) e = sp;
+  }
+  const pre = s > 0 ? "…" : "";
+  const post = e < body.length ? "…" : "";
+  const text = pre + body.slice(s, e).replace(/\s/g, " ") + post;
+  return { text, highlights: findMatches(text, terms, 50) };
 }
 
 // ---------- fuzzy matching and "did you mean" (rough stand-ins for fs-index / text-ar) ----------
@@ -449,30 +789,53 @@ function layoutSwapped(query: string): string | null {
 }
 
 /** "Did you mean": the other keyboard layout, else the `fuzzy:` switch, if it finds results. */
-function suggest(query: string, p: Parsed, limit: number, scope: string | null): SearchSuggestion | null {
+function suggest(query: string, p: Parsed, limit: number, scope: string | null, withContent: boolean): SearchSuggestion | null {
   const candidates: [string | null, SearchSuggestion["kind"]][] = [
     [layoutSwapped(query), "layout"],
     [p.fuzzyAll || p.fuzzy.length || !p.terms.length ? null : `fuzzy: ${query.trimStart()}`, "fuzzy"],
   ];
   for (const [candidate, kind] of candidates) {
     if (!candidate) continue;
-    const r = search(candidate, limit, 0, scope, false);
+    const r = search(candidate, limit, 0, scope, withContent, false);
     if (!r.error && r.items.length) return { query: candidate, kind, count: r.items.length };
   }
   return null;
 }
 
-function search(query: string, limit: number, requestId: number, scope: string | null, withSuggestion = true): SearchResponse {
+/**
+ * One search. Plans like crates/query/src/plan.rs: `content:` clauses filter by the content
+ * index (AND with the name words and filters); with `withContent` (the UI's "search contents
+ * too"), a query of plain words and filters without `content:` finds files whose name matches
+ * OR whose content has all the words (name hits rank first). Content hits carry a snippet.
+ */
+function search(
+  query: string, limit: number, requestId: number, scope: string | null, withContent = false, withSuggestion = true,
+): SearchResponse {
   const t0 = performance.now();
   let p: Parsed | null = null;
   const done = (items: ResultItem[], truncated: boolean, error: QueryError | null = null): SearchResponse => ({
     requestId, items, truncated, error, cancelled: false,
-    suggestion: withSuggestion && p && !error && !items.length && limit > 0 ? suggest(query, p, limit, scope) : null,
+    suggestion: withSuggestion && p && !error && !items.length && limit > 0 ? suggest(query, p, limit, scope, withContent) : null,
     elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
   });
   if (!query.trim()) return done([], false);
+  let clauses: ContentClause[] = [];
   try {
-    p = parse(query);
+    const cf = contentFilters(query);
+    clauses = cf.clauses;
+    p = parse(cf.rest);
+    if (cf.planError) {
+      p = null;
+      return done([], false, cf.planError);
+    }
+    const positive = p.terms.length || p.kinds || p.exts || p.size || p.fuzzy.length || p.fuzzyAll;
+    if (clauses.length && clauses.every((c) => c.negated) && !positive) {
+      p = null;
+      return done([], false, {
+        kind: "OnlyExcludedContent", start: clauses[0].start, end: clauses[0].end, suggestion: null,
+        message: "a query with only excluded `content:` has nothing to search for; add a word or filter, for example `ext:docx -content:draft`",
+      });
+    }
   } catch (e) {
     if (e instanceof MockParseError) return done([], false, e.err);
     throw e;
@@ -486,7 +849,33 @@ function search(query: string, limit: number, requestId: number, scope: string |
   const terms = (p.fuzzyAll ? [] : p.terms).map(norm).filter(Boolean);
   const fuzzy = [...p.fuzzy, ...(p.fuzzyAll ? p.terms : [])].map(norm).filter(Boolean);
   const negated = p.negated.map((t) => normalizeWithMap(t).norm).filter(Boolean);
-  const hits: { e: MockEntry; score: number; highlights: Range16[] }[] = [];
+  const wanted = clauses.filter((c) => !c.negated && c.term).map((c) => c.term);
+  const excluded = clauses.filter((c) => c.negated && c.term).map((c) => c.term);
+  // "Search contents too": only plain words and filters (no `content:`, fuzzy or `|`).
+  const nameOrContent = withContent && !clauses.length && terms.length > 0 && !fuzzy.length && !/(^|\s)\|(\s|$)/.test(query);
+
+  /** Name words and fuzzy terms against the name: highlights and a rank score, or null. */
+  const nameMatch = (e: MockEntry): { score: number; highlights: Range16[] } | null => {
+    const highlights: Range16[] = [];
+    let score = 0;
+    for (const t of terms) {
+      const at = e.norm.indexOf(t);
+      if (at < 0) return null;
+      if (at === 0) score -= 1000;
+      highlights.push(toOriginalRange(e, at, at + t.length));
+    }
+    // Fuzzy terms: a subsequence; tighter matches rank first.
+    for (const f of fuzzy) {
+      const at = subsequence(e.norm, f);
+      if (!at) return null;
+      score += (at[at.length - 1] - at[0]) * 100 - (at[0] === 0 ? 1000 : 0);
+      for (const i of at) highlights.push(toOriginalRange(e, i, i + 1));
+    }
+    return { score, highlights: mergeRanges(highlights) };
+  };
+  const contentHas = (e: MockEntry, words: string[]) => words.every((w) => e.bodyNorm!.includes(w));
+
+  const hits: { e: MockEntry; score: number; highlights: Range16[]; matched: MatchSource; snippet: ContentSnippet | null }[] = [];
   for (const e of index) {
     const it = e.item;
     if (scope && !under(`${it.parent}\\${it.name}`, scope)) continue;
@@ -494,28 +883,38 @@ function search(query: string, limit: number, requestId: number, scope: string |
     if (p.exts && !p.exts.includes(it.ext)) continue;
     if (p.size && !sizeMatches(p.size, it.size)) continue;
     if (negated.some((n) => e.norm.includes(n))) continue;
-    const highlights: Range16[] = [];
-    let ok = true;
-    let score = 0;
-    for (const t of terms) {
-      const at = e.norm.indexOf(t);
-      if (at < 0) { ok = false; break; }
-      if (at === 0) score -= 1000;
-      highlights.push(toOriginalRange(e, at, at + t.length));
+    const indexed = contentIndexed(e);
+    // Files not in the content index always pass an excluded `content:`.
+    if (indexed && excluded.length && excluded.some((w) => e.bodyNorm!.includes(w))) continue;
+    const name = nameMatch(e);
+    const base = e.norm.length + (it.isDir ? -5 : 0);
+
+    if (wanted.length) {
+      if (!name || !indexed || !contentHas(e, wanted)) continue;
+      hits.push({
+        e, score: name.score + base, highlights: name.highlights, matched: terms.length ? "both" : "content",
+        snippet: makeSnippet(e.body!, wanted),
+      });
+    } else if (nameOrContent) {
+      const inContent = indexed && contentHas(e, terms);
+      if (!name && !inContent) continue;
+      hits.push({
+        e,
+        // Name hits first (as the rank fusion favors them), then content-only hits in queue order.
+        score: name ? name.score + base - (inContent ? 200 : 0) : 100_000 + (e.contentOrder ?? 0),
+        highlights: name?.highlights ?? [],
+        matched: name && inContent ? "both" : name ? "name" : "content",
+        snippet: inContent ? makeSnippet(e.body!, terms) : null,
+      });
+    } else {
+      if (!name) continue;
+      hits.push({ e, score: name.score + base, highlights: name.highlights, matched: "name", snippet: null });
     }
-    if (!ok) continue;
-    // Fuzzy terms: a subsequence; tighter matches rank first.
-    for (const f of fuzzy) {
-      const at = subsequence(e.norm, f);
-      if (!at) { ok = false; break; }
-      score += (at[at.length - 1] - at[0]) * 100 - (at[0] === 0 ? 1000 : 0);
-      for (const i of at) highlights.push(toOriginalRange(e, i, i + 1));
-    }
-    if (!ok) continue;
-    hits.push({ e, score: score + e.norm.length + (it.isDir ? -5 : 0), highlights: mergeRanges(highlights) });
   }
   hits.sort((a, b) => a.score - b.score || a.e.item.name.localeCompare(b.e.item.name));
-  const items = hits.slice(0, limit).map((h) => ({ ...h.e.item, highlights: h.highlights }));
+  const items = hits.slice(0, limit).map((h): ResultItem => ({
+    ...h.e.item, highlights: h.highlights, matched: h.matched, snippet: h.snippet,
+  }));
   return done(items, hits.length > limit);
 }
 
@@ -531,13 +930,17 @@ function mergeRanges(r: Range16[]): Range16[] {
 }
 
 function findEntry(id: number) {
+  return findMockEntry(id).item;
+}
+
+function findMockEntry(id: number): MockEntry {
   if (staleOnce && index) {
     staleOnce = false;
     bumpGeneration(index);
   }
   const e = index?.find((x) => x.item.id === id);
   if (!e) throw Math.floor(id / GEN_UNIT) !== generation ? STALE_ID_ERROR : `no entry with id ${id}`;
-  return e.item;
+  return e;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -662,7 +1065,15 @@ function placeholderImage(name: string): string {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
-function previewBody(it: Omit<ResultItem, "highlights">, maxChars: number): PreviewBody {
+/** `lines` with the text the content indexer reads put in at line `at` (one line per sentence). */
+function withBody(lines: string[], body: string | undefined, at: number): string[] {
+  if (!body) return lines;
+  const own = body.split("\n").flatMap((l) => l.split(/(?<=[.؟!])\s+/));
+  return [...lines.slice(0, at), ...own, ...lines.slice(at)];
+}
+
+function previewBody(entry: MockEntry, maxChars: number): PreviewBody {
+  const it = entry.item;
   const path = `${it.parent}\\${it.name}`;
   if (it.isDir) {
     const children = (index ?? []).filter((e) => e.item.parent === path).map((e) => e.item);
@@ -676,22 +1087,31 @@ function previewBody(it: Omit<ResultItem, "highlights">, maxChars: number): Prev
   const cut = (text: string) => ({ text: text.slice(0, maxChars), truncated: text.length > maxChars });
   if (IMAGES[it.ext]) return { kind: "image", src: placeholderImage(it.name), mime: IMAGES[it.ext] };
   if (it.ext === "pdf") return { kind: "unsupported", reason: "pdf", message: "PDF preview is not available yet" };
+  // Demo documents: exactly what the content index holds (matches far down the file show the
+  // preview's jump to the first match).
+  if (entry.demo && entry.body !== undefined) {
+    if (DOCUMENTS.has(it.ext)) {
+      return { kind: "document", ...cut(entry.body), format: it.ext, title: stem, author: "سارة أحمد" };
+    }
+    return { kind: "text", ...cut(entry.body + "\n"), encoding: "UTF-8" };
+  }
   const language = CODE_LANGUAGES[it.ext];
   if (language) {
     return { kind: "code", ...cut(SAMPLE_CODE[language](stem).join("\n") + "\n"), encoding: "UTF-8", language };
   }
   if (DOCUMENTS.has(it.ext)) {
-    const body = [
+    const body = withBody([
       stem,
       "مقدمة: يتناول هذا المستند نتائج التَّقْرِير الربعي ويعرض الأرقام الرئيسة.",
       "The document summarizes the quarterly report and its main figures.",
       ...Array.from({ length: 40 }, (_, i) => `الفقرة ${i + 1}: تفاصيل إضافية حول ${stem} — paragraph ${i + 1}.`),
-    ].join("\n");
+    ], entry.body, 24).join("\n");
     return { kind: "document", ...cut(body), format: it.ext, title: stem, author: "سارة أحمد" };
   }
   if (["md", "txt", "csv"].includes(it.ext)) {
     const big = it.ext === "txt";
-    return { kind: "text", ...cut(sampleText(stem, big ? 400 : 60)), encoding: big ? "windows-1256" : "UTF-8" };
+    const text = withBody(sampleText(stem, big ? 400 : 60).split("\n"), entry.body, 30).join("\n");
+    return { kind: "text", ...cut(text), encoding: big ? "windows-1256" : "UTF-8" };
   }
   return { kind: "unsupported", reason: "format", message: `no preview for .${it.ext || "?"} files` };
 }
@@ -746,7 +1166,7 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
         if (scope && !/^([a-z]:([\\/].*)?|[\\/].*)$/i.test(scope)) {
           throw `invalid search scope: "${scope}" is not an absolute path or a drive like D:`;
         }
-        result = search(query, args.limit as number, requestId, scope || null);
+        result = search(query, args.limit as number, requestId, scope || null, args.searchContent === true);
       }
       break;
     }
@@ -759,7 +1179,8 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
     case "preview_entry": {
       const requestId = args.requestId as number;
       latestPreview = Math.max(latestPreview, requestId);
-      const it = findEntry(args.id as number);
+      const entry = findMockEntry(args.id as number);
+      const it = entry.item;
       await sleep(20 + (it.id % 7) * 15);
       if (requestId < latestPreview) {
         result = { requestId, cancelled: true, preview: null } satisfies PreviewResponse;
@@ -770,11 +1191,23 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
         requestId, cancelled: false,
         preview: {
           entry: { name, path: `${it.parent}\\${name}`, isDir, size, modified, ext },
-          body: previewBody(it, (args.maxChars as number | undefined) ?? 65536),
+          body: previewBody(entry, (args.maxChars as number | undefined) ?? 65536),
         },
       } satisfies PreviewResponse;
       break;
     }
+    case "content_status":
+      result = { ...content, pausedBy: [...content.pausedBy] } satisfies ContentStatus;
+      break;
+    case "content_pause":
+      pauseContent("user");
+      break;
+    case "content_resume":
+      resumeContent();
+      break;
+    case "set_content_indexing":
+      setContentIndexing(args.enabled === true);
+      break;
     case "entry_path": {
       const it = findEntry(args.id as number);
       result = `${it.parent}\\${it.name}`;

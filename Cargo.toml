@@ -18,6 +18,7 @@ athrix-query = { path = "crates/query" }
 athrix-text-ar = { path = "crates/text-ar" }
 athrix-extract = { path = "crates/extract" }
 athrix-content-index = { path = "crates/content-index" }
+athrix-daemon = { path = "crates/daemon" }
 athrix-semantic = { path = "crates/semantic" }
 athrix-ranking = { path = "crates/ranking" }
 athrix-store = { path = "crates/store" }

@@ -3,6 +3,7 @@
 //! The UI ⇄ Rust contract is `docs/IPC-CONTRACT.md`. Modules:
 //! - [`model`]: the JSON types of the contract;
 //! - [`indexing`]: background indexing, live updates from the file watcher and the shared index;
+//! - [`content`]: the content index, its background indexing, content search and frecency;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
 //! - [`preview`]: previews for the preview pane and the scheme serving previewed images;
@@ -16,8 +17,10 @@
 //! - [`tray`]: the system-tray icon and its menu.
 
 pub mod commands;
+pub mod content;
 pub mod indexing;
 pub mod model;
+pub mod pdf_worker;
 pub mod popup;
 pub mod preview;
 pub mod query;
@@ -130,7 +133,17 @@ pub fn run() {
             commands::reveal_entry,
             commands::entry_path,
             commands::preview_entry,
+            commands::content_status,
+            commands::content_pause,
+            commands::content_resume,
+            commands::set_content_indexing,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the Athrix app");
+        .build(tauri::generate_context!())
+        .expect("error while building the Athrix app")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Commit what was extracted, join the indexing threads, save frecency.
+                app.state::<state::AppState>().content.shutdown();
+            }
+        });
 }

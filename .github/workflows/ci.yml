@@ -87,6 +87,12 @@ jobs:
         with:
           key: ${{ matrix.toolchain }}
 
+      # tauri-build (bundle.externalBin) requires the isolated PDF worker to be
+      # staged in src-tauri/binaries before cargo compiles athrix-desktop.
+      - name: Stage PDF worker
+        working-directory: apps/desktop
+        run: npm run worker
+
       - name: cargo fmt
         if: matrix.toolchain == 'stable'
         run: cargo fmt --all --check

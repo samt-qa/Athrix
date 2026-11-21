@@ -54,8 +54,9 @@ const CONTENT_FILTERS = new Set(["content"]);
 
 /**
  * The words of query `src` worth highlighting in a preview, normalized: plain words, quoted
- * phrases and `content:` values, minus negated ones (`!word`, `-word`). Wildcards split a word
- * (`rep*rt` → `rep`, `rt`); filter names and other filter values are skipped. Longest first.
+ * phrases and `content:` / `محتوى:` values (a quoted value as one phrase), minus negated ones
+ * (`!word`, `-word`, `-content:word`). Wildcards split a word (`rep*rt` → `rep`, `rt`); filter
+ * names and other filter values are skipped. Longest first.
  */
 export function queryTerms(src: string): string[] {
   const tokens = tokenize(src);
@@ -90,7 +91,12 @@ export function queryTerms(src: string): string[] {
       case "value":
         flush();
         if (tok.filter && CONTENT_FILTERS.has(tok.filter)) {
-          word = text.split(/\s+/);
+          // The filter token (`content:`) and whether a `!` / `-` stands right before it.
+          let f = i - 1;
+          while (f >= 0 && tokens[f].kind !== "filter") f--;
+          negated = f >= 0 && isNegation(tokens[f - 1], src, tokens[f].start);
+          // A quoted value (one token, quotes included) is a phrase: `content:"عقد الإيجار"`.
+          word = text.startsWith('"') ? [text.replace(/^"|"$/g, "")] : text.split(/\s+/);
           flush();
         }
         break;

@@ -3,16 +3,19 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::content::{ContentOptions, ContentService};
 use crate::indexing::Indexer;
 use crate::preview::PreviewAssets;
 use crate::roots::RootsSetting;
 
-/// Everything the commands share: the indexer, the indexed-roots setting, the cancel flags of
-/// the latest search and preview, and the images the preview may serve.
-#[derive(Debug, Default)]
+/// Everything the commands share: the indexer, the content service, the indexed-roots setting,
+/// the cancel flags of the latest search and preview, and the images the preview may serve.
+#[derive(Debug)]
 pub struct AppState {
     /// The name index and its background indexing.
     pub indexer: Arc<Indexer>,
+    /// The content index, its background indexing and the frecency store.
+    pub content: Arc<ContentService>,
     /// Which folders to index (persisted in the app data folder).
     pub roots: RootsSetting,
     /// Cancel flag of the most recent `search` request.
@@ -24,6 +27,20 @@ pub struct AppState {
     pub preview_gate: Arc<Mutex<()>>,
     /// Images the `athrix-preview` scheme may serve.
     pub preview_assets: Arc<PreviewAssets>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            indexer: Arc::default(),
+            content: ContentService::new(ContentOptions::default()),
+            roots: RootsSetting::default(),
+            search_cancel: Mutex::default(),
+            preview_cancel: Mutex::default(),
+            preview_gate: Arc::default(),
+            preview_assets: Arc::default(),
+        }
+    }
 }
 
 impl AppState {

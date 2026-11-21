@@ -273,10 +273,13 @@ dependencies = [
 name = "athrix-desktop"
 version = "0.0.1"
 dependencies = [
+ "athrix-content-index",
  "athrix-core",
+ "athrix-daemon",
  "athrix-extract",
  "athrix-fs-index",
  "athrix-query",
+ "athrix-ranking",
  "athrix-text-ar",
  "nass",
  "serde",
@@ -289,6 +292,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tracing",
+ "zip",
 ]
 
 [[package]]

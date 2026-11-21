@@ -201,12 +201,21 @@ export function tokenize(src: string): Token[] {
     return !!c && filterName(c.name) !== undefined;
   };
 
-  /** `"…"`: quote marks as operators, the inside as `inner`. An unclosed quote runs to the end. */
+  /**
+   * `"…"`: a phrase's quote marks are operators around the `phrase`. A quoted filter value
+   * (`content:"عقد الإيجار"`, `path:"My Docs"`) is one `value` token, quotes included, so it
+   * colors as a single value. An unclosed quote runs to the end.
+   */
   const quoted = (inner: TokenKind, filter?: FilterId, valueStart?: number) => {
+    const close = src.indexOf('"', pos + 1);
+    const end = close < 0 ? n : close;
+    if (inner === "value") {
+      push("value", pos, close < 0 ? n : close + 1, filter, valueStart);
+      pos = close < 0 ? n : close + 1;
+      return;
+    }
     push("op", pos, pos + 1, filter, valueStart);
     pos++;
-    const close = src.indexOf('"', pos);
-    const end = close < 0 ? n : close;
     push(inner, pos, end, filter, valueStart);
     pos = end;
     if (close >= 0) {

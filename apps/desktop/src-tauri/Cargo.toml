@@ -17,10 +17,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build.workspace = true
 
 [dependencies]
+athrix-content-index.workspace = true
 athrix-core.workspace = true
+# Not in [workspace.dependencies] yet (root Cargo.toml is outside this change): path dep.
+athrix-daemon.workspace = true
 athrix-extract.workspace = true
 athrix-fs-index.workspace = true
 athrix-query.workspace = true
+athrix-ranking.workspace = true
 athrix-text-ar.workspace = true
 nass.workspace = true
 tauri = { workspace = true, features = ["tray-icon"] }
@@ -37,6 +41,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Builds small .docx files for the content-search tests.
+zip.workspace = true
 
 [lints]
 workspace = true

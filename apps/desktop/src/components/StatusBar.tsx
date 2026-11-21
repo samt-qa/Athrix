@@ -1,4 +1,4 @@
-import { Match, Show, Switch } from "solid-js";
+import { Match, Show, Switch, type JSX } from "solid-js";
 import { locale, t, tPlural } from "../i18n";
 import type { IndexStatus, SearchResponse } from "../lib/api";
 import { formatCount, intlLocale } from "../lib/format";
@@ -11,6 +11,8 @@ type Props = {
   notice: string | null;
   mock: boolean;
   onRetry: () => void;
+  /** Shown after the index state (the content-indexing control). */
+  content?: JSX.Element;
 };
 
 function formatMs(ms: number): string {
@@ -53,6 +55,7 @@ export default function StatusBar(props: Props) {
           </Match>
         </Switch>
       </span>
+      {props.content}
       <Show when={props.index?.roots.length ? props.index.roots : null}>
         {(roots) => (
           <span class="index-roots" title={roots().join("\n")}>

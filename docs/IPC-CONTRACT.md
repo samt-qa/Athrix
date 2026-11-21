@@ -158,6 +158,10 @@ type PreviewBody =          // موسوم بالحقل kind
 فتح نتيجة (`open_entry`) يسجّل فتحًا في مخزن Frecency تلقائيًا.
 
 حدث جديد: `content://status` بحمولة `ContentStatus`، بحد أقصى مرتين في الثانية.
+
+ملاحظات التنفيذ:
+- فهرسة المحتوى تبدأ بعد جاهزية فهرس الأسماء (قبلها `state = "idle"` و `indexed` قد يكون 0). التعطيل يوقف الفهرسة فقط؛ ما فُهرس سابقًا يبقى قابلًا للبحث.
+- نتائج المحتوى (`content:` أو `searchContent`) مرتبة بالصلة مع Frecency، ولا يُحسب لها `suggestion` (دائمًا `null`). ملف في فهرس المحتوى لم يعد في فهرس الأسماء لا يظهر.
 ## نسخة واحدة من التطبيق
 - تشغيل التطبيق مرة ثانية لا يفتح نسخة ثانية (لا أيقونة صينية ثانية ولا فشل في تسجيل الاختصار): النسخة الثانية تخرج فورًا
   وتُظهر النسخة الأولى نافذتها الرئيسية وتركّز عليها (`tauri-plugin-single-instance`).
@@ -168,7 +172,7 @@ type PreviewBody =          // موسوم بالحقل kind
   `code` حين يُعرف للامتداد (أو لاسم مثل `Makefile`) تلميح لغة، وإلا `text`. الأسطر مفصولة بـ `\n`.
 - **المستندات**: نص `athrix_extract` مع العنوان والمؤلف إن وُجدا؛ مستند أكبر من 32MB ⇠ `unsupported/tooLarge`.
   حدود الضغط (zip-bomb) من `Limits` مشدّدة للمعاينة.
-- **PDF**: `unsupported/pdf` حاليًا؛ نقطة الربط `TODO(pdf-worker)` في `src-tauri/src/preview.rs` تنتظر عامل PDF المعزول.
+- **PDF**: مدعومة: `document` (`format: "pdf"`) بالنص والعنوان والمؤلف، يستخرجها عامل معزول (`athrix-extract-worker`) لا عملية التطبيق؛ غياب العامل ⇠ `unsupported/pdf`، وانتهاء المهلة أو انهيار العامل ⇠ `unsupported/unreadable`.
 - **الصور** (png، jpg/jpeg/jfif، gif، webp، bmp، ico، avif، svg): لا تمر بايتاتها عبر IPC. تسجّل الخلفية الملف تحت رمز
   عشوائي (128 بت) وتعيد `src` بمخطط URI خاص `athrix-preview` (`http://athrix-preview.localhost/<token>` على ويندوز،
   `athrix-preview://localhost/<token>` غيره). المعالج يخدم **فقط** آخر 8 صور عوينت، بالرمز (لا مسار في العنوان، والواجهة لا

@@ -55,7 +55,13 @@ eq("group", lex("<a|b> c"), ["op:<", "text:a", "op:|", "text:b", "op:>", "text:c
 eq("not group", lex("!<a b>"), ["op:!", "op:<", "text:a", "text:b", "op:>"]);
 eq("phrase", lex('"rental contract" x'), ["op:\"", "phrase:rental contract", "op:\"", "text:x"]);
 eq("unclosed quote", lex('"abc def'), ["op:\"", "phrase:abc def"]);
-eq("quoted value", lex('path:"My Docs"'), ["filter:path:", "op:\"", "value:My Docs", "op:\""]);
+eq("quoted value", lex('path:"My Docs"'), ["filter:path:", 'value:"My Docs"']);
+eq("content value", lex("content:ميزانية x"), ["filter:content:", "value:ميزانية", "text:x"]);
+eq("quoted content value is one token", lex('محتوى:"عقد الإيجار" ext:pdf'),
+  ["filter:محتوى:", 'value:"عقد الإيجار"', "filter:ext:", "value:pdf"]);
+eq("unclosed quoted value", lex('content:"عقد ال'), ["filter:content:", 'value:"عقد ال']);
+eq("negated content", lex("ext:docx -content:مسودة"), ["filter:ext:", "value:docx", "op:-", "filter:content:", "value:مسودة"]);
+eq("content in or", lex("a | content:b"), ["text:a", "op:|", "filter:content:", "value:b"]);
 eq("wildcards", lex("^IMG*?.jpg$"), ["wildcard:^", "text:IMG", "wildcard:*?", "text:.jpg", "wildcard:$"]);
 eq("caret mid-word is text", lex("a^b"), ["text:a^b"]);
 eq("semantic ~", lex("~عقد الإيجار ext:pdf"), ["op:~", "value:عقد", "value:الإيجار", "filter:ext:", "value:pdf"]);
@@ -102,6 +108,11 @@ eq("size:10m", labels(at("size:10m")), ["10mb"]);
 eq("size arabic digits", labels(at("حجم:>١٠", "ar")).slice(0, 2), [">١٠كيلو", ">١٠ميجا"]);
 eq("ext:p", labels(at("ext:p")), ["pdf", "pptx", "png", "py"]);
 eq("path: no suggestions", at("path:"), null);
+eq("content: no value suggestions", at("content:"), null);
+eq("محتوى: no value suggestions", at("محتوى:", "ar"), null);
+eq("content: typed value: nothing", at("content:تقر"), null);
+eq("content: quoted value: nothing", at('content:"عقد ال|'), null);
+eq("مح → محتوى", labels(at("مح")), ["محتوى:"]);
 
 // Accepting
 {
@@ -126,6 +137,9 @@ eq("path: no suggestions", at("path:"), null);
   eq("terms: words, phrase, content:, not negated or filters", queryTerms('تقرير "Annual Plan" -draft ext:pdf content:ميزانية !x'),
     ["annual plan", "ميزانية", "تقرير"]);
   eq("terms: wildcard splits", queryTerms("rep*rt"), ["rep", "rt"]);
+  eq("terms: negated content: skipped", queryTerms("ext:docx -content:مسودة !محتوى:قديم تقرير"), ["تقرير"]);
+  eq("terms: quoted content: is a phrase", queryTerms('content:"عقد الإيجار" محتوى:ميزانية'), ["عقد الايجار", "ميزانية"]);
+  eq("terms: negated word then content:", queryTerms("-x content:y"), ["y"]);
   eq("terms: normalized (hamza, harakat)", queryTerms("أُصول"), ["اصول"]);
   const text = "مقدمة: التَّقْرِيرُ السنوي\nReport and REPORT";
   const m = findMatches(text, queryTerms("تقرير report"));

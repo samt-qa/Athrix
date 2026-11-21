@@ -7,8 +7,10 @@
     "start": "vite",
     "dev": "vite",
     "build": "vite build",
+    "worker": "node scripts/build-worker.mjs",
+    "worker:release": "node scripts/build-worker.mjs --release",
     "serve": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri.mjs",
     "typecheck": "tsc --noEmit",
     "check:query": "node --experimental-strip-types --no-warnings src/lib/queryLang.selfcheck.ts"
   },

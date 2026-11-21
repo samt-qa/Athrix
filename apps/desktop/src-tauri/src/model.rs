@@ -72,6 +72,96 @@ pub struct ResultItem {
     pub ext: String,
     /// Matched ranges inside `name`, as UTF-16 `[start, end)` pairs, sorted and non-overlapping.
     pub highlights: Vec<(usize, usize)>,
+    /// Which part of the query found this result: always [`Matched::Name`] for name-only
+    /// searches.
+    pub matched: Matched,
+    /// A fragment of the file's text with the matched words, when the content matched.
+    pub snippet: Option<ContentSnippet>,
+}
+
+/// Which part of a query found a result (`ResultItem.matched`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Matched {
+    /// The name (and metadata) only.
+    #[default]
+    Name,
+    /// The content only.
+    Content,
+    /// Both the name part and the content part.
+    Both,
+}
+
+impl From<athrix_ranking::Matched> for Matched {
+    fn from(m: athrix_ranking::Matched) -> Self {
+        match m {
+            athrix_ranking::Matched::Name => Matched::Name,
+            athrix_ranking::Matched::Content => Matched::Content,
+            athrix_ranking::Matched::Both => Matched::Both,
+        }
+    }
+}
+
+/// A short piece of a document's original text around the matched words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentSnippet {
+    /// The fragment (original text, diacritics kept).
+    pub text: String,
+    /// Matched words inside `text`, as UTF-16 `[start, end)` pairs, sorted and non-overlapping.
+    pub highlights: Vec<(usize, usize)>,
+}
+
+/// What background content indexing is doing (`ContentStatus.state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentState {
+    /// Content indexing is turned off in the settings.
+    Disabled,
+    /// Nothing to do (or not started yet: the name index is not ready).
+    Idle,
+    /// Extracting and indexing files.
+    Running,
+    /// Work is waiting but paused (see `pausedBy`).
+    Paused,
+    /// Shut down (the app is exiting).
+    Stopped,
+    /// The content index cannot be used (see `error`).
+    Error,
+}
+
+/// Why content indexing is paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PauseReason {
+    /// `content_pause` was called.
+    User,
+    /// The computer runs on battery.
+    Battery,
+    /// Other programs keep the CPU busy.
+    Busy,
+}
+
+/// Payload of `content_status` and of the `content://status` event.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentStatus {
+    /// Current state.
+    pub state: ContentState,
+    /// Why it is paused (only when `state` is `paused`).
+    pub paused_by: Vec<PauseReason>,
+    /// Files finished (indexed, up to date, deleted or failed) since the app started.
+    pub processed: u64,
+    /// `processed` plus the files still queued or in progress.
+    pub total: u64,
+    /// Documents in the content index.
+    pub indexed: u64,
+    /// Files that failed since the app started.
+    pub failed: u64,
+    /// Documents indexed per second (0 when not running).
+    pub docs_per_second: f64,
+    /// English message when `state` is `error`.
+    pub error: Option<String>,
 }
 
 /// A query syntax error, positioned in UTF-16 units of the query text.
@@ -297,10 +387,38 @@ mod tests {
             modified: None,
             ext: "txt".into(),
             highlights: vec![(0, 1)],
+            matched: Matched::Both,
+            snippet: Some(ContentSnippet {
+                text: "ميزانية".into(),
+                highlights: vec![(0, 7)],
+            }),
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["isDir"], false);
         assert_eq!(json["highlights"], serde_json::json!([[0, 1]]));
+        assert_eq!(json["matched"], "both");
+        assert_eq!(
+            json["snippet"],
+            serde_json::json!({ "text": "ميزانية", "highlights": [[0, 7]] })
+        );
+
+        let content = ContentStatus {
+            state: ContentState::Paused,
+            paused_by: vec![PauseReason::User, PauseReason::Battery],
+            processed: 1,
+            total: 2,
+            indexed: 3,
+            failed: 0,
+            docs_per_second: 0.5,
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            serde_json::json!({
+                "state": "paused", "pausedBy": ["user", "battery"], "processed": 1, "total": 2,
+                "indexed": 3, "failed": 0, "docsPerSecond": 0.5, "error": null
+            })
+        );
 
         let suggestion = SearchSuggestion {
             query: "التقرير ext:pdf".into(),

@@ -185,7 +185,16 @@ body {
   cursor: pointer;
   transition: background-color var(--motion-fast) var(--ease-out-soft), color var(--motion-fast) var(--ease-out-soft);
 }
+.chips-group { display: contents; }
 .chip:hover { background: var(--bg-row-hover); color: var(--text-primary); }
+/* "Contents too": an independent switch at the inline end, quieter than a type chip when on. */
+.chip-content {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-inline-start: auto;
+}
+.chip-content[aria-pressed="true"] {
+  background: var(--accent-subtle); border-color: var(--border-strong); color: var(--accent);
+}
 .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--text-on-accent); }
 .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
 @media (forced-colors: active) {
@@ -278,6 +287,23 @@ body {
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .row-time { color: var(--text-muted); }
+/* A content match (main window): a third line with the snippet; meta stays at the top. */
+.row.row-tall { block-size: 64px; align-items: start; padding-block: 5px; }
+/* Snippet: the excerpt around the matched words, in its own direction, one line. */
+.row-snippet {
+  display: block; max-inline-size: 100%;
+  font-size: 12px; line-height: 18px; color: var(--text-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.row-snippet mark.match { font-weight: 600; }
+/* "The content matched": a small accent glyph after the name. */
+.row-source {
+  flex: none; display: inline-grid; place-items: center;
+  inline-size: 18px; block-size: 18px; margin-inline-start: 6px; align-self: center;
+  border-radius: var(--radius-sm);
+  color: var(--accent); background: var(--accent-subtle);
+}
+.row-source.both { box-shadow: inset 0 0 0 1px var(--border-strong); }
 
 mark.match {
   background: var(--match-bg); color: var(--match-fg);
@@ -434,7 +460,7 @@ html.quick, html.quick body, html.quick #root { block-size: auto; }
    max height then shrinks it and the list scrolls. Empty / no-results states size themselves. */
 .quick-panel .results-area {
   flex: 0 1 auto;
-  block-size: calc(var(--rows, 0) * 44px);
+  block-size: var(--list-h, 0px);
 }
 .quick-panel .results-area:has(> .state, > .state-hint) { block-size: auto; }
 /* In the popup the suggestions push the content down instead of overlapping it: the window
@@ -620,3 +646,64 @@ html.quick, html.quick body, html.quick #root { block-size: auto; }
 }
 .pv-meta dt { color: var(--text-muted); }
 .pv-meta dd { margin: 0; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* ---- Content indexing in the status bar (task 4.5) ---- */
+.content-status { position: relative; }
+.content-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  block-size: 24px; padding-inline: 8px; margin-inline: -8px 0;
+  border: 0; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text-secondary);
+  font: inherit; cursor: pointer; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.content-btn:hover, .content-btn[aria-expanded="true"] { background: var(--bg-row-hover); color: var(--text-primary); }
+.content-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 0 4px var(--focus-ring); }
+.content-btn.content-disabled, .content-btn.content-stopped { color: var(--text-muted); }
+.content-btn.content-error { color: var(--danger); }
+/* Thin progress line: accent while running, muted while paused. */
+.content-bar {
+  display: block; inline-size: 64px; block-size: 3px; border-radius: 2px;
+  background: var(--border); overflow: hidden;
+}
+.content-bar-fill {
+  display: block; block-size: 100%; border-radius: inherit;
+  background: var(--accent);
+  transition: inline-size var(--motion-base) var(--ease-out-soft);
+}
+.content-paused .content-bar-fill, .content-meter.paused .content-bar-fill { background: var(--text-muted); }
+@media (forced-colors: active) {
+  .content-bar, .content-meter { border: 1px solid CanvasText; }
+  .content-bar-fill { background: Highlight; }
+}
+.content-panel {
+  position: absolute; z-index: 10; inset-block-end: calc(100% + 10px); inset-inline-start: -8px;
+  inline-size: min(340px, calc(100vw - 32px));
+  padding: 14px 16px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-primary); font-size: 13px;
+  animation: content-in var(--motion-enter) var(--ease-enter);
+}
+@keyframes content-in { from { opacity: 0; transform: translateY(4px); } }
+.content-line { margin: 0 0 10px; color: var(--text-secondary); }
+.content-error-text { color: var(--danger); overflow-wrap: anywhere; }
+.content-meter {
+  display: block; block-size: 6px; border-radius: 3px;
+  background: var(--bg-sunken); overflow: hidden;
+}
+.content-numbers {
+  margin: 4px 0 0; font-size: 12px; color: var(--text-secondary);
+  font-variant-numeric: tabular-nums; text-align: end;
+}
+.content-facts {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 16px;
+  margin: 10px 0 0; font-size: 12px;
+}
+.content-facts dt { color: var(--text-muted); }
+.content-facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+.content-actions { display: flex; gap: 8px; margin-block-start: 12px; }
+.content-actions .btn-secondary { margin-block-start: 0; }
+.btn-secondary:disabled { opacity: .5; cursor: default; }
+.content-switches { margin-block-start: 12px; padding-block-start: 8px; border-block-start: 1px solid var(--border); }

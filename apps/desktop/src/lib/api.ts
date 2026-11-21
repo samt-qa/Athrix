@@ -35,6 +35,40 @@ export interface ResultItem {
   ext: string;
   /** Match ranges inside `name`. */
   highlights: Range16[];
+  /** What matched (task 4.7): always "name" for name-only searches. Optional for older backends. */
+  matched?: MatchSource;
+  /** An excerpt of the content when the content matched, else null. */
+  snippet?: ContentSnippet | null;
+}
+
+export type MatchSource = "name" | "content" | "both";
+
+/** A short excerpt of a file's text around the words that matched in its content. */
+export interface ContentSnippet {
+  /** Original text (with its diacritics). */
+  text: string;
+  /** Matched words inside `text`, UTF-16, sorted and non-overlapping. */
+  highlights: Range16[];
+}
+
+export type ContentState = "disabled" | "idle" | "running" | "paused" | "stopped" | "error";
+export type ContentPauseReason = "user" | "battery" | "busy";
+
+/** Background content indexing (task 4.5): `content_status` and the `content://status` event. */
+export interface ContentStatus {
+  state: ContentState;
+  /** Why it is paused, when state = "paused". */
+  pausedBy: ContentPauseReason[];
+  /** Queue items handled (indexed + updated + failed). */
+  processed: number;
+  /** processed + what is left in the queue. */
+  total: number;
+  /** Documents in the content index. */
+  indexed: number;
+  failed: number;
+  docsPerSecond: number;
+  /** English message when state = "error". */
+  error: string | null;
 }
 
 export interface QueryError {
@@ -139,18 +173,26 @@ export interface Commands {
   /** `roots: null` = whole computer. */
   set_index_roots: [{ roots: string[] | null }, IndexRoots];
   /** `scope`: a root from `IndexStatus.roots` (e.g. "D:\\") to search only there; null = everywhere. */
-  search: [{ query: string; limit: number; requestId: number; scope: string | null }, SearchResponse];
+  /** `searchContent`: plain words also search file contents (a `content:` filter always does). */
+  search: [{ query: string; limit: number; requestId: number; scope: string | null; searchContent?: boolean }, SearchResponse];
   open_entry: [{ id: number }, void];
   reveal_entry: [{ id: number }, void];
   entry_path: [{ id: number }, string];
   /** `maxChars`: text characters to return (default 65536). Each call cancels the previous one. */
   preview_entry: [{ id: number; requestId: number; maxChars?: number }, PreviewResponse];
+  content_status: [undefined, ContentStatus];
+  /** Pause by the user (other reasons, battery or a busy machine, come from the backend). */
+  content_pause: [undefined, void];
+  content_resume: [undefined, void];
+  /** Persisted on the Rust side; disabled = state "disabled". */
+  set_content_indexing: [{ enabled: boolean }, void];
 }
 export type CommandName = keyof Commands;
 export type CommandArgs<C extends CommandName> = Commands[C][0];
 export type CommandResult<C extends CommandName> = Commands[C][1];
 
 export const INDEX_STATUS_EVENT = "index://status";
+export const CONTENT_STATUS_EVENT = "content://status";
 
 /** True when running against the in-browser mock instead of Rust. */
 export const usingMock = !isTauri();
@@ -175,6 +217,12 @@ export async function onIndexStatus(handler: (status: IndexStatus) => void): Pro
   return listen<IndexStatus>(INDEX_STATUS_EVENT, (e) => handler(e.payload));
 }
 
+/** Subscribes to `content://status` (at most twice a second); resolves to an unsubscribe function. */
+export async function onContentStatus(handler: (status: ContentStatus) => void): Promise<() => void> {
+  if (usingMock) return (await mock()).onContentStatus(handler);
+  return listen<ContentStatus>(CONTENT_STATUS_EVENT, (e) => handler(e.payload));
+}
+
 // Thin named wrappers, one per command.
 export const api = {
   appInfo: () => call("app_info"),
@@ -183,13 +231,17 @@ export const api = {
   listVolumes: () => call("list_volumes"),
   getIndexRoots: () => call("get_index_roots"),
   setIndexRoots: (roots: string[] | null) => call("set_index_roots", { roots }),
-  search: (query: string, limit: number, requestId: number, scope: string | null = null) =>
-    call("search", { query, limit, requestId, scope }),
+  search: (query: string, limit: number, requestId: number, scope: string | null = null, searchContent = false) =>
+    call("search", { query, limit, requestId, scope, searchContent }),
   openEntry: (id: number) => call("open_entry", { id }),
   revealEntry: (id: number) => call("reveal_entry", { id }),
   entryPath: (id: number) => call("entry_path", { id }),
   previewEntry: (id: number, requestId: number, maxChars?: number) =>
     call("preview_entry", maxChars === undefined ? { id, requestId } : { id, requestId, maxChars }),
+  contentStatus: () => call("content_status"),
+  contentPause: () => call("content_pause"),
+  contentResume: () => call("content_resume"),
+  setContentIndexing: (enabled: boolean) => call("set_content_indexing", { enabled }),
 };
 
 /**

@@ -92,6 +92,28 @@ const MAX_WALK_BUFFER: usize = 1_000_000;
 /// Called with every new status (start, finish, error), from whichever thread changed it.
 pub type StatusListener = Arc<dyn Fn(&IndexStatus) + Send + Sync>;
 
+/// Follows the name index for other indexes built from it (the content index, see
+/// [`crate::content`]).
+pub trait IndexObserver: Send + Sync {
+    /// A new base is current (a snapshot was loaded or a walk finished), after the status
+    /// event. Called on the indexing thread; may take a while (the walk queue waits, searches
+    /// do not).
+    fn base_ready(&self, view: &Arc<IndexView>);
+
+    /// The watcher reported changed paths; they were applied to the live index first. Called
+    /// on the watcher's thread: keep it short.
+    fn files_changed(&self, batch: &WatchBatch);
+}
+
+#[derive(Default)]
+struct ObserverSlot(OnceLock<Arc<dyn IndexObserver>>);
+
+impl std::fmt::Debug for ObserverSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObserverSlot")
+    }
+}
+
 /// What [`Indexer::start`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartOutcome {
@@ -305,6 +327,7 @@ pub struct Indexer {
     /// Where snapshots are loaded from and saved to; unset means no snapshots.
     snapshots: OnceLock<SnapshotStore>,
     listener: ListenerSlot,
+    observer: ObserverSlot,
     watch_config: WatchConfig,
 }
 
@@ -319,6 +342,23 @@ impl Indexer {
     pub fn set_snapshot_store(&self, store: SnapshotStore) {
         if self.snapshots.set(store).is_err() {
             tracing::warn!("the snapshot store is already set; keeping the first one");
+        }
+    }
+
+    /// Sets the observer told about new bases and watched changes. Only the first call has
+    /// an effect.
+    pub fn set_observer(&self, observer: Arc<dyn IndexObserver>) {
+        if self.observer.0.set(observer).is_err() {
+            tracing::warn!("the index observer is already set; keeping the first one");
+        }
+    }
+
+    /// Tells the observer that `view` is the current base.
+    fn notify_base(&self, view: &Arc<IndexView>) {
+        if let Some(observer) = self.observer.0.get() {
+            if catch_unwind(AssertUnwindSafe(|| observer.base_ready(view))).is_err() {
+                tracing::error!("the index observer panicked on a new base");
+            }
         }
     }
 
@@ -444,6 +484,7 @@ impl Indexer {
                 let mut p = self.lock();
                 let walked = match result {
                     Ok(view) => {
+                        let installed = Arc::clone(&view);
                         let entries = view.len() as u64;
                         tracing::info!(
                             entries,
@@ -455,27 +496,29 @@ impl Indexer {
                         p.status.entries = entries;
                         p.status.elapsed_ms = Some(elapsed_ms);
                         p.status.error = None;
-                        true
+                        Some(installed)
                     }
                     Err(Some(e)) => {
                         tracing::warn!(error = %e, "indexing failed");
                         p.status.state = IndexState::Error;
                         p.status.error = Some(e);
-                        false
+                        None
                     }
                     Err(None) => {
                         tracing::error!("indexing thread panicked");
                         p.status.state = IndexState::Error;
                         p.status.error = Some("indexing stopped unexpectedly".into());
-                        false
+                        None
                     }
                 };
                 (p.status.clone(), walked)
             };
             listener(&finished);
             // Saved after the swap and the `ready` event, so neither search nor the UI waits.
-            if walked {
+            if let Some(view) = walked {
                 self.save_snapshot(&roots);
+                // The current view (changes made during the walk may already be applied).
+                self.notify_base(&self.index().unwrap_or(view));
             }
 
             let next = {
@@ -545,6 +588,7 @@ impl Indexer {
         };
         listener(&ready);
         listener(&indexing);
+        self.notify_base(&self.index().unwrap_or(view));
     }
 
     /// Saves the current live index as the snapshot of `roots`, if a store is set and the live
@@ -641,6 +685,9 @@ impl Indexer {
                 };
                 if let Some((live, session)) = target {
                     self.apply(&live, session, &paths, true);
+                }
+                if let Some(observer) = self.observer.0.get() {
+                    observer.files_changed(&WatchBatch::Changed(paths));
                 }
             }
             WatchBatch::RescanNeeded(reason) => {

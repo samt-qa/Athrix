@@ -12,11 +12,13 @@ import ResultList, { optionId, type ResultListHandle } from "./components/Result
 import { EmptyState, NoResults, NotReady } from "./components/EmptyState";
 import HintBar from "./components/HintBar";
 import StatusBar from "./components/StatusBar";
+import ContentStatusControl from "./components/ContentStatusControl";
 import ScopeSelect from "./components/ScopeSelect";
 import IndexSettings from "./components/IndexSettings";
 import PreviewPane, { type PreviewHandle } from "./components/PreviewPane";
 import { readSetting, writeSetting } from "./lib/storage";
 import { effectiveScope, setScope, storedScope } from "./lib/scope";
+import { searchContent, setSearchContent } from "./lib/searchContent";
 import { fitWindowTo, hideWindow, onWindowFocus, type WindowMode } from "./lib/window";
 
 /** Results per query (contract `limit`). Dev-only override for scroll testing: `?limit=5000`. */
@@ -92,7 +94,7 @@ export default function App(props: { mode: WindowMode }) {
   // Whole numbers: Rust reads requestId as u64. Seeded from the clock so ids keep increasing
   // across a webview reload (or HMR) while the backend stays alive.
   let lastRequest = Date.now();
-  async function runSearch(query: string, where: string) {
+  async function runSearch(query: string, where: string, withContent = searchContent()) {
     const requestId = ++lastRequest;
     if (!query.trim()) {
       batch(() => {
@@ -103,7 +105,7 @@ export default function App(props: { mode: WindowMode }) {
       return;
     }
     try {
-      const r = await api.search(query, LIMIT, requestId, where || null);
+      const r = await api.search(query, LIMIT, requestId, where || null, withContent);
       // Drop anything older than the latest request, and cancelled ones.
       if (r.requestId !== lastRequest || requestId !== lastRequest || r.cancelled) return;
       batch(() => {
@@ -122,8 +124,9 @@ export default function App(props: { mode: WindowMode }) {
   }
   // No debounce: a search takes a few ms, and stale responses are dropped by requestId.
   // Re-runs when the index becomes ready, so a query typed during indexing fills in, and when
-  // the scope changes.
-  createEffect(on([sent, () => index()?.state, scope], ([q, , where]) => void runSearch(q, where)));
+  // the scope or the "search contents too" setting changes.
+  createEffect(on([sent, () => index()?.state, scope, searchContent], ([q, , where, withContent]) =>
+    void runSearch(q, where, withContent)));
 
   const items = () => response()?.items ?? [];
   // "Did you mean": the backend rewrote the query as sent; the field gets it without the chip suffix.
@@ -387,6 +390,8 @@ export default function App(props: { mode: WindowMode }) {
   }
 
   const indexing = () => index()?.state === "indexing";
+  /** Total height of the result rows (the popup's list area takes exactly that). */
+  const [listHeight, setListHeight] = createSignal(0);
   const notReady = () => index()?.state !== "ready";
 
   // ---- quick-search popup ----
@@ -419,7 +424,7 @@ export default function App(props: { mode: WindowMode }) {
         addon={<ScopeSelect roots={roots()} value={scope()} onChange={setScope} />}
       />
       <div class="progress" classList={{ active: indexing() }} aria-hidden="true" />
-      <FilterChips value={chip()} onChange={setChip} />
+      <FilterChips value={chip()} onChange={setChip} content={searchContent()} onContentChange={setSearchContent} />
       <QueryErrorBar
         id={ERROR_ID}
         text={text()}
@@ -428,8 +433,8 @@ export default function App(props: { mode: WindowMode }) {
         onApplySuggestion={useSuggestion}
       />
 
-      {/* In the popup the area is as tall as its rows (--rows), so the window grows with them. */}
-      <div class="results-area" style={quick ? { "--rows": String(items().length) } : undefined}>
+      {/* In the popup the area is as tall as its rows (--list-h), so the window grows with them. */}
+      <div class="results-area" style={quick ? { "--list-h": `${listHeight()}px` } : undefined}>
         <Switch>
           <Match when={!text().trim()}>
             <EmptyState onExample={setQuery} compact={quick} />
@@ -447,6 +452,7 @@ export default function App(props: { mode: WindowMode }) {
               onClearScope={() => setScope("")}
               suggestion={didYouMean()}
               onSuggestion={setQuery}
+              onSearchContent={searchContent() ? undefined : () => setSearchContent(true)}
             />
           </Match>
         </Switch>
@@ -458,6 +464,8 @@ export default function App(props: { mode: WindowMode }) {
           items={items()}
           selected={selected()}
           now={now()}
+          compact={quick}
+          onHeight={setListHeight}
           onSelect={setSelected}
           onOpen={(i) => {
             setSelected(i);
@@ -550,7 +558,14 @@ export default function App(props: { mode: WindowMode }) {
         </Show>
       </main>
 
-      <StatusBar index={index()} response={notReady() ? null : response()} notice={notice()} mock={usingMock} onRetry={retryIndexing} />
+      <StatusBar
+        index={index()}
+        response={notReady() ? null : response()}
+        notice={notice()}
+        mock={usingMock}
+        onRetry={retryIndexing}
+        content={<ContentStatusControl onError={(message) => showNotice(t("content.actionFailed", { message }))} />}
+      />
     </div>
   );
 }

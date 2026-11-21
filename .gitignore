@@ -3,3 +3,8 @@
 **/dist
 *.log
 .DS_Store
+
+# Tauri sidecars staged by apps/desktop/scripts/build-worker.mjs (`npm run worker`);
+# build artifacts, never committed. The folder itself stays (.gitkeep).
+/apps/desktop/src-tauri/binaries/*
+!/apps/desktop/src-tauri/binaries/.gitkeep

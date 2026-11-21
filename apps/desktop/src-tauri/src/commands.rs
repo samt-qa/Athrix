@@ -12,13 +12,16 @@ use tauri_plugin_opener::OpenerExt;
 
 use athrix_fs_index::EntryId;
 
-use crate::indexing::{IndexView, Indexer, SnapshotStore, StatusListener};
+use athrix_query::{PlanOptions, SearchPlan};
+
+use crate::content::{ContentService, StatusSink};
+use crate::indexing::{IndexObserver, IndexView, Indexer, SnapshotStore, StatusListener};
 use crate::model::{
-    IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem, SearchResponse,
-    SearchSuggestion,
+    ContentStatus, IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem,
+    SearchResponse, SearchSuggestion,
 };
 use crate::preview::{DEFAULT_MAX_CHARS, build_preview};
-use crate::query::compile_query;
+use crate::query::{CompiledQuery, compile_ast, map_parse_error, map_plan_error};
 use crate::results::{SearchFailure, SearchScope, decode_id, run_search};
 use crate::roots::{
     IndexRoots, ROOTS_SETTING_FILE, RootsChoice, RootsSetting, normalize_roots,
@@ -38,6 +41,9 @@ pub const SNAPSHOT_DIR: &str = "index";
 /// Event carrying an [`IndexStatus`] on every indexing state change, and (at most once per
 /// [`crate::indexing::LIVE_STATUS_INTERVAL`]) when watched changes alter the entry count.
 pub const STATUS_EVENT: &str = "index://status";
+
+/// Event carrying a [`ContentStatus`], at most once per [`crate::content::STATUS_INTERVAL`].
+pub const CONTENT_STATUS_EVENT: &str = "content://status";
 
 /// Upper bound for `search`'s `limit`, whatever the UI asks.
 pub const MAX_LIMIT: usize = 10_000;
@@ -143,6 +149,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 /// indexed-roots setting (`<app_data>/indexed-roots.json`), then starts indexing those roots
 /// (by default every fixed drive). The indexing thread first loads the snapshot of those
 /// roots, if valid, so searching works at once, then walks to refresh it.
+///
+/// Content indexing (`<app_data>/content`, see [`crate::content`]) follows the name index: it
+/// starts once that index is ready.
 pub fn start_default_indexing(app: &AppHandle) {
     let state = app.state::<AppState>();
     let indexer = &state.indexer;
@@ -150,12 +159,17 @@ pub fn start_default_indexing(app: &AppHandle) {
         Ok(dir) => {
             indexer.set_snapshot_store(SnapshotStore::new(dir.join(SNAPSHOT_DIR)));
             state.roots.load_from(dir.join(ROOTS_SETTING_FILE));
+            state.content.configure(&dir);
         }
         Err(e) => tracing::warn!(
             error = %e,
-            "no app data folder; index snapshots and the roots setting are not saved"
+            "no app data folder; index snapshots, the roots setting and the content index are \
+             not saved"
         ),
     }
+    state.content.set_status_sink(content_status_sink(app));
+    let observer: Arc<dyn IndexObserver> = state.content.clone();
+    indexer.set_observer(observer);
     match startup_roots(&state.roots) {
         Ok(roots) => {
             tracing::info!(?roots, "start-up indexing");
@@ -181,9 +195,21 @@ fn status_listener(app: &AppHandle) -> StatusListener {
     })
 }
 
+/// Emits content statuses as [`CONTENT_STATUS_EVENT`] (the service throttles them).
+fn content_status_sink(app: &AppHandle) -> StatusSink {
+    let handle = app.clone();
+    Arc::new(move |status: &ContentStatus| {
+        if let Err(e) = handle.emit(CONTENT_STATUS_EVENT, status) {
+            tracing::warn!(error = %e, "cannot emit the content status");
+        }
+    })
+}
+
 /// Searches the name index, only under `scope` if given (a drive such as `D:\` or a folder;
-/// blank = everywhere; a relative path rejects). Each call cancels the previous one; the work
-/// runs on a blocking thread pool, never on the UI thread.
+/// blank = everywhere; a relative path rejects). `content:` filters search the content index
+/// too, and `searchContent: true` makes plain words search names and contents (see
+/// [`crate::content`]). Each call cancels the previous one; the work runs on a blocking thread
+/// pool, never on the UI thread.
 #[tauri::command]
 pub async fn search(
     state: State<'_, AppState>,
@@ -191,14 +217,20 @@ pub async fn search(
     limit: u32,
     request_id: u64,
     scope: Option<String>,
+    search_content: Option<bool>,
 ) -> Result<SearchResponse, String> {
     let started = Instant::now();
     let scope = SearchScope::parse(scope.as_deref())?;
     let cancel = state.begin_search();
     let index = state.indexer.index();
-    let limit = (limit as usize).min(MAX_LIMIT);
+    let content = Arc::clone(&state.content);
+    let request = SearchRequest {
+        limit: (limit as usize).min(MAX_LIMIT),
+        scope,
+        search_content: search_content.unwrap_or(false),
+    };
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        execute_search(index, &query, limit, scope.as_ref(), &cancel)
+        execute_search(index, &content, &query, &request, &cancel)
     })
     .await
     .map_err(|e| format!("search task failed: {e}"))?;
@@ -246,19 +278,43 @@ enum SearchOutcome {
     Failed(String),
 }
 
-/// The blocking part of `search`: parse, run, build items; when nothing is found, look for a
-/// "did you mean" rewrite (same scope, limit and cancel flag).
+/// The options of one `search` call.
+#[derive(Debug, Default)]
+struct SearchRequest {
+    limit: usize,
+    scope: Option<SearchScope>,
+    /// Plain words search contents too (`searchContent`).
+    search_content: bool,
+}
+
+/// The blocking part of `search`: parse and plan, then either the name-index fast path (with a
+/// "did you mean" rewrite when nothing is found) or a content search.
 fn execute_search(
     index: Option<Arc<IndexView>>,
+    content: &ContentService,
     text: &str,
-    limit: usize,
-    scope: Option<&SearchScope>,
+    request: &SearchRequest,
     cancel: &AtomicBool,
 ) -> SearchOutcome {
     if text.trim().is_empty() {
         return SearchOutcome::Empty;
     }
-    let query = match compile_query(text) {
+    let ast = match athrix_query::parse(text) {
+        Ok(ast) => ast,
+        Err(e) => return SearchOutcome::Invalid(map_parse_error(text, &e)),
+    };
+    let options = PlanOptions {
+        plain_words_search_content: request.search_content,
+    };
+    let plan = match athrix_query::plan(&ast, &options) {
+        Ok(plan) => plan,
+        Err(e) => return SearchOutcome::Invalid(map_plan_error(text, &e)),
+    };
+    let (limit, scope) = (request.limit, request.scope.as_ref());
+    if plan.uses_content() {
+        return content_search(index, content, text, &plan, limit, scope, cancel);
+    }
+    let query = match compile_ast(text, &ast) {
         Ok(q) => q,
         Err(e) => return SearchOutcome::Invalid(e),
     };
@@ -293,13 +349,88 @@ fn execute_search(
     }
 }
 
-/// Opens the entry with the system's default program.
+/// A plan that needs the content index: compiles its name parts (reporting what the name
+/// index cannot run, like the fast path), then runs it. No "did you mean" here.
+fn content_search(
+    index: Option<Arc<IndexView>>,
+    content: &ContentService,
+    text: &str,
+    plan: &SearchPlan,
+    limit: usize,
+    scope: Option<&SearchScope>,
+    cancel: &AtomicBool,
+) -> SearchOutcome {
+    let (name, filters) = match plan {
+        SearchPlan::NameAndContent { name, .. } => (name.as_ref(), None),
+        SearchPlan::NameOrContent { name, filters, .. } => (Some(name), filters.as_ref()),
+        SearchPlan::Name(_) | SearchPlan::Empty => (None, None),
+    };
+    let name_query: Option<CompiledQuery> = match name.map(|q| compile_ast(text, q)).transpose() {
+        Ok(q) => q,
+        Err(e) => return SearchOutcome::Invalid(e),
+    };
+    if let Some(Err(e)) = filters.map(|q| compile_ast(text, q)) {
+        return SearchOutcome::Invalid(e);
+    }
+    let Some(index) = index else {
+        return SearchOutcome::Empty;
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return SearchOutcome::Cancelled;
+    }
+    match content.search(&index, plan, name_query.as_ref(), limit, scope, cancel) {
+        Ok(hits) => SearchOutcome::Hits {
+            items: hits.items,
+            truncated: hits.truncated,
+            suggestion: None,
+        },
+        Err(SearchFailure::Cancelled) => SearchOutcome::Cancelled,
+        Err(SearchFailure::Failed(e)) => SearchOutcome::Failed(e),
+    }
+}
+
+/// Opens the entry with the system's default program, and records the open in the frecency
+/// store (which boosts it in later content searches).
 #[tauri::command]
 pub async fn open_entry(app: AppHandle, state: State<'_, AppState>, id: u64) -> Result<(), String> {
     let path = resolve(&state.indexer, id)?;
+    let text = path.to_string_lossy().into_owned();
     app.opener()
-        .open_path(path.to_string_lossy(), None::<&str>)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))
+        .open_path(text.as_str(), None::<&str>)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    state.content.record_open(&text);
+    Ok(())
+}
+
+/// The state of background content indexing.
+#[tauri::command]
+pub fn content_status(state: State<'_, AppState>) -> ContentStatus {
+    state.content.status()
+}
+
+/// Pauses content indexing (user request).
+#[tauri::command]
+pub fn content_pause(state: State<'_, AppState>) {
+    state.content.pause();
+}
+
+/// Ends a user pause of content indexing.
+#[tauri::command]
+pub fn content_resume(state: State<'_, AppState>) {
+    state.content.resume();
+}
+
+/// Turns content indexing on or off; saved in `<app_data>/content-indexing.json`. Off stops
+/// the background work (what is indexed stays searchable) and the status says `disabled`.
+#[tauri::command]
+pub async fn set_content_indexing(app: AppHandle, enabled: bool) -> Result<(), String> {
+    // Stopping waits for the workers to finish their file; starting queues the whole index.
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let current = state.indexer.index();
+        state.content.set_enabled(enabled, current);
+    })
+    .await
 }
 
 /// Opens the entry's folder in the file manager with the entry selected.
@@ -381,6 +512,23 @@ mod tests {
     use crate::results::encode_id;
     use athrix_fs_index::{EntryMeta, FileIndex, IndexBuilder};
 
+    /// `execute_search` as the UI calls it without `searchContent`.
+    fn name_search(
+        index: Option<Arc<IndexView>>,
+        text: &str,
+        limit: usize,
+        scope: Option<SearchScope>,
+        cancel: &AtomicBool,
+    ) -> SearchOutcome {
+        let content = ContentService::new(crate::content::ContentOptions::default());
+        let request = SearchRequest {
+            limit,
+            scope,
+            search_content: false,
+        };
+        execute_search(index, &content, text, &request, cancel)
+    }
+
     fn sample() -> Arc<IndexView> {
         Arc::new(IndexView::from_index(3, sample_index()))
     }
@@ -413,11 +561,11 @@ mod tests {
     fn empty_query_and_missing_index_give_no_items() {
         let no = AtomicBool::new(false);
         assert!(matches!(
-            execute_search(Some(sample()), "   ", 10, None, &no),
+            name_search(Some(sample()), "   ", 10, None, &no),
             SearchOutcome::Empty
         ));
         assert!(matches!(
-            execute_search(None, "فاتورة", 10, None, &no),
+            name_search(None, "فاتورة", 10, None, &no),
             SearchOutcome::Empty
         ));
     }
@@ -425,7 +573,7 @@ mod tests {
     #[test]
     fn invalid_query_reports_an_error_even_without_an_index() {
         let no = AtomicBool::new(false);
-        match execute_search(None, "szie:1", 10, None, &no) {
+        match name_search(None, "szie:1", 10, None, &no) {
             SearchOutcome::Invalid(e) => assert_eq!(e.kind, "UnknownFilter"),
             other => panic!("{other:?}"),
         }
@@ -435,7 +583,7 @@ mod tests {
     fn finds_and_cancels() {
         let ix = sample();
         let no = AtomicBool::new(false);
-        match execute_search(Some(Arc::clone(&ix)), "فاتورة 123", 10, None, &no) {
+        match name_search(Some(Arc::clone(&ix)), "فاتورة 123", 10, None, &no) {
             SearchOutcome::Hits {
                 items,
                 truncated,
@@ -451,7 +599,7 @@ mod tests {
         }
         let yes = AtomicBool::new(true);
         assert!(matches!(
-            execute_search(Some(ix), "فاتورة", 10, None, &yes),
+            name_search(Some(ix), "فاتورة", 10, None, &yes),
             SearchOutcome::Cancelled
         ));
     }
@@ -462,7 +610,7 @@ mod tests {
         let ix = sample();
         let no = AtomicBool::new(false);
         // `فاتورة` typed with the English layout active, plus a filter kept as is.
-        let s = match execute_search(Some(Arc::clone(&ix)), "thj,vm ext:pdf", 10, None, &no) {
+        let s = match name_search(Some(Arc::clone(&ix)), "thj,vm ext:pdf", 10, None, &no) {
             SearchOutcome::Hits {
                 items, suggestion, ..
             } => {
@@ -475,7 +623,7 @@ mod tests {
         assert_eq!(s.query, "فاتورة ext:pdf");
         assert_eq!(s.count, 1);
         // A typo: the fuzzy rewrite.
-        match execute_search(Some(Arc::clone(&ix)), "فتورة", 10, None, &no) {
+        match name_search(Some(Arc::clone(&ix)), "فتورة", 10, None, &no) {
             SearchOutcome::Hits {
                 items, suggestion, ..
             } => {
@@ -490,7 +638,7 @@ mod tests {
         }
         // Nothing close: no suggestion.
         assert!(matches!(
-            execute_search(Some(ix), "zzzzqqqq", 10, None, &no),
+            name_search(Some(ix), "zzzzqqqq", 10, None, &no),
             SearchOutcome::Hits {
                 suggestion: None,
                 ..
@@ -521,7 +669,7 @@ mod tests {
     fn an_id_from_a_search_is_rejected_after_a_reindex() {
         let ix = indexer();
         let no = AtomicBool::new(false);
-        let SearchOutcome::Hits { items, .. } = execute_search(ix.index(), "فاتورة", 10, None, &no)
+        let SearchOutcome::Hits { items, .. } = name_search(ix.index(), "فاتورة", 10, None, &no)
         else {
             panic!("expected hits");
         };
@@ -531,5 +679,353 @@ mod tests {
         ix.install(sample_index(), &[PathBuf::from("/data")])
             .unwrap();
         assert_eq!(resolve(&ix, id).unwrap_err(), STALE_ID_ERROR);
+    }
+}
+
+/// End-to-end content search: real files in temp folders, the real walk, the real scheduler
+/// and content index, through [`execute_search`] as the `search` command runs it.
+#[cfg(test)]
+mod content_search_tests {
+    use super::*;
+    use crate::content::test_options;
+    use crate::indexing::walk_options;
+    use crate::model::Matched;
+    use crate::results::decode_id;
+    use athrix_fs_index::{LiveIndex, WatchBatch, walk};
+    use std::fs;
+    use std::io::{Cursor, Write};
+    use std::path::Path;
+    use std::time::Duration;
+
+    const LONG: Duration = Duration::from_secs(60);
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("athrix-search-")
+            .tempdir()
+            .unwrap()
+    }
+
+    /// A minimal Word document whose body is `text`.
+    fn docx(text: &str) -> Vec<u8> {
+        let document = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+        let types = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#;
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in [
+            ("[Content_Types].xml", types),
+            ("_rels/.rels", rels),
+            ("word/document.xml", document.as_str()),
+        ] {
+            w.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    struct Fixture {
+        dirs: Vec<tempfile::TempDir>,
+        _app: tempfile::TempDir,
+        roots: Vec<PathBuf>,
+        live: LiveIndex,
+        content: Arc<ContentService>,
+        view: Arc<IndexView>,
+    }
+
+    impl Fixture {
+        /// One temp root per entry of `roots`, each with its `(name, bytes)` files; name and
+        /// content indexed.
+        fn new(roots: &[&[(&str, Vec<u8>)]]) -> Self {
+            let dirs: Vec<_> = roots.iter().map(|_| tmp()).collect();
+            for (dir, files) in dirs.iter().zip(roots) {
+                for (name, bytes) in files.iter() {
+                    fs::write(dir.path().join(name), bytes).unwrap();
+                }
+            }
+            let root_paths: Vec<PathBuf> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+            let opts = walk_options(&root_paths);
+            let live = LiveIndex::new(walk(&opts).unwrap(), &opts).unwrap();
+            let view = Arc::new(IndexView::new(1, live.snapshot(), &root_paths));
+            let app = tmp();
+            let content = ContentService::new(test_options());
+            content.configure(app.path());
+            content.base_ready(&view);
+            assert!(content.wait_idle(LONG));
+            Fixture {
+                dirs,
+                _app: app,
+                roots: root_paths,
+                live,
+                content,
+                view,
+            }
+        }
+
+        fn search(&self, text: &str, scope: Option<&Path>, search_content: bool) -> SearchOutcome {
+            let request = SearchRequest {
+                limit: 50,
+                scope: scope.map(|p| {
+                    SearchScope::parse(Some(&p.to_string_lossy()))
+                        .unwrap()
+                        .unwrap()
+                }),
+                search_content,
+            };
+            let no = AtomicBool::new(false);
+            execute_search(
+                Some(Arc::clone(&self.view)),
+                &self.content,
+                text,
+                &request,
+                &no,
+            )
+        }
+
+        fn items(&self, text: &str, scope: Option<&Path>, search_content: bool) -> Vec<ResultItem> {
+            match self.search(text, scope, search_content) {
+                SearchOutcome::Hits { items, .. } => items,
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+
+        /// Applies the paths to the live index and publishes a new view (generation 2+).
+        fn apply(&mut self, paths: &[PathBuf]) {
+            self.live.apply_paths(paths);
+            let generation = self.view.generation() + 1;
+            self.view = Arc::new(IndexView::new(
+                generation,
+                self.live.snapshot(),
+                &self.roots,
+            ));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.content.shutdown();
+        }
+    }
+
+    fn names(items: &[ResultItem]) -> Vec<&str> {
+        let mut v: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn js_slice(s: &str, (a, b): (usize, usize)) -> String {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        String::from_utf16(&units[a..b]).unwrap()
+    }
+
+    fn budget_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("تقرير 2024.docx", docx("ميزانية المشروع السنوية")),
+            ("خطة.txt", "هذه ميزانية الفريق للربع الأول".into()),
+            ("تقرير قديم.txt", "لا شيء مهم هنا".into()),
+            ("notes.txt", "hello world".into()),
+            ("ميزانية قديمة.txt", "ميزانية".into()),
+            ("ميزانية.png", "not text".into()),
+        ]
+    }
+
+    #[test]
+    fn content_filter_finds_documents_by_their_text() {
+        let f = Fixture::new(&[&budget_files()]);
+        let items = f.items("content:ميزانية", None, false);
+        assert_eq!(
+            names(&items),
+            vec!["تقرير 2024.docx", "خطة.txt", "ميزانية قديمة.txt"]
+        );
+        for item in &items {
+            assert_eq!(item.matched, Matched::Content, "{item:?}");
+            assert!(item.highlights.is_empty(), "no name part: {item:?}");
+            let snippet = item.snippet.as_ref().expect("a snippet");
+            assert!(!snippet.highlights.is_empty(), "{snippet:?}");
+            assert_eq!(js_slice(&snippet.text, snippet.highlights[0]), "ميزانية");
+            // The id resolves in the view the search used.
+            let (generation, entry) = decode_id(item.id).unwrap();
+            assert_eq!(generation, 1);
+            assert_eq!(f.view.name(entry), item.name);
+        }
+        // The Arabic synonym works the same.
+        assert_eq!(f.items("محتوى:ميزانية", None, false).len(), 3);
+    }
+
+    #[test]
+    fn name_and_content_are_anded() {
+        let f = Fixture::new(&[&budget_files()]);
+        let items = f.items("تقرير content:ميزانية", None, false);
+        assert_eq!(names(&items), vec!["تقرير 2024.docx"]);
+        let item = &items[0];
+        assert_eq!(item.matched, Matched::Both);
+        assert_eq!(js_slice(&item.name, item.highlights[0]), "تقرير");
+        assert!(item.snippet.is_some());
+        // Filters restrict the content part too.
+        assert_eq!(
+            names(&f.items("content:ميزانية ext:txt", None, false)),
+            vec!["خطة.txt", "ميزانية قديمة.txt"]
+        );
+        // Excluded content: name hits minus files containing the word.
+        assert_eq!(
+            names(&f.items("تقرير -content:ميزانية", None, false)),
+            vec!["تقرير قديم.txt"]
+        );
+    }
+
+    #[test]
+    fn a_drive_scope_restricts_content_hits() {
+        let a: Vec<(&str, Vec<u8>)> = vec![("budget-a.txt", "ميزانية".into())];
+        let b: Vec<(&str, Vec<u8>)> = vec![("budget-b.txt", "ميزانية".into())];
+        let f = Fixture::new(&[&a, &b]);
+        assert_eq!(f.items("content:ميزانية", None, false).len(), 2);
+        let scoped = f.items("content:ميزانية", Some(f.dirs[1].path()), false);
+        assert_eq!(names(&scoped), vec!["budget-b.txt"]);
+        let scoped = f.items("budget content:ميزانية", Some(f.dirs[0].path()), false);
+        assert_eq!(names(&scoped), vec!["budget-a.txt"]);
+        // A scope outside every root finds nothing.
+        let elsewhere = tmp();
+        assert!(
+            f.items("content:ميزانية", Some(elsewhere.path()), false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_content_unites_name_and_content_hits() {
+        let f = Fixture::new(&[&budget_files()]);
+        let items = f.items("ميزانية", None, true);
+        let matched = |name: &str| {
+            items
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from {items:?}"))
+                .matched
+        };
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert_eq!(matched("ميزانية قديمة.txt"), Matched::Both);
+        assert_eq!(matched("ميزانية.png"), Matched::Name);
+        assert_eq!(matched("خطة.txt"), Matched::Content);
+        assert_eq!(matched("تقرير 2024.docx"), Matched::Content);
+        // Found by both lists: first.
+        assert_eq!(items[0].name, "ميزانية قديمة.txt");
+        assert!(items[0].snippet.is_some());
+
+        // Without `searchContent`: the name fast path, names only.
+        let items = f.items("ميزانية", None, false);
+        assert_eq!(names(&items), vec!["ميزانية قديمة.txt", "ميزانية.png"]);
+        assert!(
+            items
+                .iter()
+                .all(|i| i.matched == Matched::Name && i.snippet.is_none())
+        );
+    }
+
+    #[test]
+    fn hits_follow_the_live_name_index() {
+        let mut f = Fixture::new(&[&budget_files()]);
+        let dir = f.dirs[0].path().to_path_buf();
+        // Deleted since it was indexed: the name index no longer has it, so it is dropped.
+        let gone = dir.join("خطة.txt");
+        fs::remove_file(&gone).unwrap();
+        f.apply(std::slice::from_ref(&gone));
+        let items = f.items("content:ميزانية", None, false);
+        assert_eq!(names(&items), vec!["تقرير 2024.docx", "ميزانية قديمة.txt"]);
+        // A new file (a delta entry of the live index), reported by the watcher.
+        let added = dir.join("جديد.md");
+        fs::write(&added, "ميزانية جديدة").unwrap();
+        f.apply(std::slice::from_ref(&added));
+        f.content
+            .files_changed(&WatchBatch::Changed(vec![added.clone()]));
+        assert!(f.content.wait_idle(LONG));
+        let items = f.items("content:جديدة", None, false);
+        assert_eq!(names(&items), vec!["جديد.md"]);
+        let (generation, entry) = decode_id(items[0].id).unwrap();
+        assert_eq!(generation, f.view.generation());
+        assert_eq!(f.view.path(entry), added);
+    }
+
+    #[test]
+    fn opens_boost_a_file_in_content_results() {
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("a.txt", "قرار اللجنة".into()),
+            ("b.txt", "قرار اللجنة".into()),
+            ("c.txt", "قرار اللجنة".into()),
+        ];
+        let f = Fixture::new(&[&files]);
+        let before = f.items("content:قرار", None, false);
+        assert_eq!(before.len(), 3);
+        let last = before.last().unwrap();
+        let (_, entry) = decode_id(last.id).unwrap();
+        let path = f.view.path(entry);
+        for _ in 0..3 {
+            f.content.record_open(&path.to_string_lossy());
+        }
+        let after = f.items("content:قرار", None, false);
+        assert_eq!(after[0].name, last.name, "{after:?}");
+    }
+
+    #[test]
+    fn plan_errors_and_cancellation() {
+        let content = ContentService::new(test_options());
+        let no = AtomicBool::new(false);
+        let request = SearchRequest {
+            limit: 10,
+            ..SearchRequest::default()
+        };
+        for (text, kind) in [
+            ("تقرير | content:عقد", "ContentInOr"),
+            ("!<content:عقد ext:pdf>", "NegatedContentGroup"),
+            ("-content:عقد", "OnlyExcludedContent"),
+            ("content:عقد szie:1", "UnknownFilter"),
+            ("sem:عقد content:x", "Unsupported"),
+        ] {
+            match execute_search(None, &content, text, &request, &no) {
+                SearchOutcome::Invalid(e) => assert_eq!(e.kind, kind, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        // Valid but no index yet: empty.
+        assert!(matches!(
+            execute_search(None, &content, "content:عقد", &request, &no),
+            SearchOutcome::Empty
+        ));
+
+        let f = Fixture::new(&[&budget_files()]);
+        let yes = AtomicBool::new(true);
+        assert!(matches!(
+            execute_search(
+                Some(Arc::clone(&f.view)),
+                &f.content,
+                "content:ميزانية",
+                &request,
+                &yes
+            ),
+            SearchOutcome::Cancelled
+        ));
+        // Truncation: more matches than the limit.
+        let one = SearchRequest {
+            limit: 1,
+            ..SearchRequest::default()
+        };
+        match execute_search(
+            Some(Arc::clone(&f.view)),
+            &f.content,
+            "content:ميزانية",
+            &one,
+            &no,
+        ) {
+            SearchOutcome::Hits {
+                items, truncated, ..
+            } => {
+                assert_eq!(items.len(), 1);
+                assert!(truncated);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
