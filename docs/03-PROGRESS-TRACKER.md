@@ -52,7 +52,7 @@
 
 | المرحلة | الحالة | التقدّم |
 |---|---|---|
-| M0 — الأساس | 🟦 | 2 / 7 |
+| M0 — الأساس | 🟦 | 3 / 7 |
 | M1 — بحث الأسماء | ⬜ | 0 / 9 |
 | M2 — ويندوز السريع (MFT/USN) | ⬜ | 0 / 6 |
 | M3 — العربية ولغة الاستعلام | ⬜ | 0 / 9 |
@@ -69,8 +69,8 @@
 | # | المهمة | الحالة | ملاحظات |
 |---|---|---|---|
 | 0.1 | إنشاء Cargo workspace بالهيكل المذكور في `01` §8.2 (crates فارغة + `lib.rs`) | ✅ | 11 crate باسم `athrix-*` + `athrix` (CLI). edition 2024، MSRV 1.85، `unsafe_code = deny` |
-| 0.2 | إنشاء تطبيق Tauri 2 في `apps/desktop` مع SolidJS/Svelte + TypeScript + Vite | ⬜ | قرار الإطار: ADR-003 |
-| 0.3 | ملف `tokens.css` من `02` §13 + تحميل الخطوط محليًا (IBM Plex Sans Arabic، Readex Pro، JetBrains Mono) | ⬜ | |
+| 0.2 | إنشاء تطبيق Tauri 2 في `apps/desktop` مع SolidJS/Svelte + TypeScript + Vite | ✅ | Tauri 2 + SolidJS + TS + Vite في `apps/desktop`، وعضو في الـ workspace. أمران: `app_info` و`normalize_preview` (مؤقت). CSP مضبوط |
+| 0.3 | ملف `tokens.css` من `02` §13 + تحميل الخطوط محليًا (IBM Plex Sans Arabic، Readex Pro، JetBrains Mono) | ⚠️ | `src/styles/tokens.css` كامل (فاتح/داكن). **الخطوط لم تُضمَّن بعد**، والأيقونات ما زالت أيقونات Tauri الافتراضية |
 | 0.4 | نظام i18n (ar/en) + تبديل `dir` + تبديل الثيم (فاتح/داكن/النظام) | ⬜ | |
 | 0.5 | CI على GitHub Actions: fmt + clippy + test + build (Windows أولًا) | ⬜ | |
 | 0.6 | `tracing` للسجلات + هيكل الأخطاء (`thiserror`) في `core` | ✅ | `athrix_core::Error` + `logging::init` (متغير `ATHRIX_LOG`) |
@@ -165,9 +165,9 @@
 
 ## 4. ▶️ الخطوة التالية (ابدأ من هنا)
 
-> **المهمة:** `0.2` — تطبيق Tauri 2 في `apps/desktop`.
-> **قبلها:** يحتاج قرار المستخدم: SolidJS أم Svelte 5 (التوصية: SolidJS). ثم `0.3` (tokens + الخطوط) و`0.4` (i18n + RTL + الثيم).
-> **ملاحظات:** المشروع ليس مستودع git بعد. لا يوجد حقل `repository` ولا ترخيص حتى يُحسم ADR-007.
+> **المهمة:** إكمال `0.3` — تضمين الخطوط محليًا (IBM Plex Sans Arabic، Readex Pro، JetBrains Mono، رخصة OFL) + أيقونات التطبيق من `public/athrix.svg` (`npm run tauri icon`).
+> **بعدها:** `0.4` (i18n ar/en + `dir` + تبديل الثيم) ثم `0.5` (CI).
+> **التشغيل:** `cd apps/desktop && npm install && npm run tauri dev`.
 
 *(حدّث هذا القسم في نهاية كل جلسة ليشير إلى المهمة التالية بالضبط.)*
 
@@ -176,6 +176,13 @@
 ## 5. 📜 سجل الجلسات (الأحدث في الأعلى)
 
 ```
+### [2026-11-21] — وكيل التنفيذ (2)
+- المهام: 0.2 ⇠ ✅، 0.3 ⇠ ⚠️ جزئيًا.
+- المُنجَز: المستودع على GitHub (samt-qa/Athrix، خاص). تطبيق Tauri 2 + SolidJS بشاشة مبدئية بهوية Athrix (RTL، tokens التصميم، شعار SVG) تستدعي `normalize_preview` من Rust.
+- المُتحقَّق منه: `npm run typecheck` و`npm run build` نظيفان؛ `cargo build`/`clippy -D warnings`/`fmt --check` نظيفة؛ 7 اختبارات ناجحة؛ `npm run tauri dev` يبني ويشغّل `athrix-desktop.exe`.
+- لم يُتحقَّق منه: شكل النافذة وعمل الربط من الواجهة إلى Rust بصريًا (لم يُسمح بلقطة شاشة).
+- التالي: إكمال 0.3.
+
 ### [2026-11-21] — وكيل التنفيذ (1)
 - المهام: 0.1 ⇠ ✅، 0.6 ⇠ ✅، 3.1 ⇠ ⚠️ جزئيًا.
 - المُنجَز: Cargo workspace بـ 11 crate (8 منها هياكل فارغة موثّقة)، `athrix-core` (الأخطاء والسجلات)، `athrix-text-ar` فوق nass 0.4، و CLI مبدئي (`athrix --version`، `athrix normalize <نص>`).

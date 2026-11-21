@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.0.1"
@@ -21,6 +21,13 @@ athrix-content-index = { path = "crates/content-index" }
 athrix-semantic = { path = "crates/semantic" }
 athrix-ranking = { path = "crates/ranking" }
 athrix-store = { path = "crates/store" }
+
+# Desktop app
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # External
 nass = "0.4"

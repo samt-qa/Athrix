@@ -14,6 +14,7 @@
 | `crates/extract` · `content-index` | استخراج النص وفهرسة المحتوى (Tantivy) |
 | `crates/semantic` · `ranking` · `store` · `daemon` | البحث الدلالي، الترتيب، التخزين، الخدمة الخلفية |
 | `crates/cli` | الأمر `athrix` |
+| `apps/desktop` | تطبيق سطح المكتب (Tauri 2 + SolidJS) |
 | `docs/` | البحث، نظام التصميم، متتبّع التقدّم |
 
 ## التطوير
@@ -22,4 +23,9 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p athrix-cli -- normalize "مُحَاضَرَةُ الفِقْهِ"
+
+# تطبيق سطح المكتب
+cd apps/desktop
+npm install
+npm run tauri dev
 ```
