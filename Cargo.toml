@@ -8,6 +8,8 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Samt Software"]
 repository = "https://github.com/samt-qa/Athrix"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/samt-qa/Athrix"
 publish = false
 
 [workspace.dependencies]

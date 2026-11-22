@@ -1,0 +1,27 @@
+name: اقتراح ميزة · Feature request
+description: فكرة تجعل أثر أفضل. An idea to make Athrix better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: ما المشكلة التي تحلّها؟ · What problem does it solve?
+      description: ابدأ بالحاجة لا بالحل. Start with the need, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: الحل المقترح · Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: بدائل فكّرت فيها · Alternatives considered
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: الخصوصية · Privacy
+      options:
+        - label: الاقتراح لا يتطلب اتصالًا بالإنترنت، أو أوضحتُ لماذا يحتاجه. The idea works offline, or I explained why it needs the network.

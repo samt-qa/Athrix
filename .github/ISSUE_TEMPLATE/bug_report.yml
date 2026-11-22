@@ -1,0 +1,57 @@
+name: بلاغ عن خطأ · Bug report
+description: شيء لا يعمل كما ينبغي. Something doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        شكرًا على البلاغ. اكتب بالعربية أو بالإنجليزية.
+        Thanks for the report. Arabic or English are both fine.
+  - type: textarea
+    id: what
+    attributes:
+      label: ماذا حدث؟ · What happened?
+      description: وصف قصير وواضح. A short, clear description.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: خطوات إعادة المشكلة · Steps to reproduce
+      placeholder: |
+        1. ابحث عن ...
+        2. اضغط ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: ما المتوقَّع؟ · What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: query
+    attributes:
+      label: نص البحث إن وُجد · The search query, if any
+      placeholder: "مثال: تقرير ext:pdf"
+  - type: input
+    id: version
+    attributes:
+      label: إصدار أثر · Athrix version
+      description: من الإعدادات ← حول. Settings → About.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: نظام التشغيل · Operating system
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: السجلات أو لقطات الشاشة · Logs or screenshots
+      description: احذف أي مسارات أو أسماء ملفات خاصة قبل اللصق. Remove private paths or file names before pasting.
+      render: text

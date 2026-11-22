@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ثغرة أمنية · Security vulnerability
+    url: https://github.com/samt-qa/Athrix/security/advisories/new
+    about: أبلغ عن الثغرات بشكل خاص، لا في Issue عام. Report vulnerabilities privately, not in a public issue.
+  - name: ادعم المشروع · Support the project
+    url: https://paypal.me/SamtSoftware
+    about: إن أفادك أثر وأردت دعم تطويره. If Athrix helps you and you want to support its development.
