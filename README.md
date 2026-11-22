@@ -121,11 +121,14 @@ npm run tauri build    # مثبّت NSIS في target/release/bundle/nsis
 
 المساهمات مرحّب بها. اقرأ [`CONTRIBUTING.md`](CONTRIBUTING.md) قبل البدء، والتزم بـ [ميثاق السلوك](CODE_OF_CONDUCT.md). للإبلاغ عن ثغرة أمنية راجع [`SECURITY.md`](SECURITY.md) ولا تفتح Issue عامًا.
 
-## ادعم المشروع
+## ☕ ادعم المشروع / Support the project
 
-أثر مجاني ومفتوح المصدر. إن أفادك وأردت دعم تطويره:
+أثر مجاني ومفتوح المصدر. إذا أفادك هذا المشروع، يمكنك دعم تطويره عبر PayPal.
+If this project helps you, you can support its development via PayPal.
 
-<a href="https://paypal.me/SamtSoftware"><img src="https://img.shields.io/badge/ادعم_المشروع-PayPal-00457C.svg?logo=paypal&style=for-the-badge" alt="Donate via PayPal"></a>
+[![PayPal](https://img.shields.io/badge/PayPal-Support-00457C?logo=paypal&logoColor=white&style=for-the-badge)](https://paypal.me/SamtSoftware)
+
+👉 https://paypal.me/SamtSoftware
 
 ## الترخيص / License
 
