@@ -29,3 +29,13 @@ cd apps/desktop
 npm install
 npm run tauri dev
 ```
+
+
+## ☕ ادعم المشروع / Support the project
+
+إذا أفادك هذا المشروع، يمكنك دعم تطويره عبر PayPal.
+If this project helps you, you can support its development via PayPal.
+
+[![PayPal](https://img.shields.io/badge/PayPal-Support-00457C?logo=paypal&logoColor=white)](https://paypal.me/SamtSoftware)
+
+👉 https://paypal.me/SamtSoftware
