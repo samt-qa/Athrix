@@ -91,3 +91,40 @@ proptest! {
         prop_assert!(!hl.is_empty(), "no highlight of {:?} in {:?}", w, name);
     }
 }
+
+proptest! {
+    /// Scans skip names without the rarest characters of a fuzzy term (and evaluate the rest):
+    /// a search, ranked or unordered, finds exactly the entries the per-entry check accepts.
+    #[test]
+    fn skipping_scans_find_every_match(
+        names in prop::collection::vec(name(), 1..300),
+        w in fuzzy_word(),
+        w2 in fuzzy_word(),
+        long in "[a-z]{9,12}",
+        shape in 0usize..5,
+    ) {
+        let mut b = IndexBuilder::new();
+        let dir = EntryMeta { is_dir: true, ..Default::default() };
+        let root = b.push(None, "/r", dir);
+        for n in &names {
+            b.push(Some(root), n, EntryMeta::default());
+        }
+        let ix = b.finish();
+        let text = match shape {
+            0 => format!("fuzzy:{w}"),
+            1 => format!("fuzzy: {w} {w2}"),
+            2 => format!("fuzzy:{w} | fuzzy:{w2}"),
+            3 => format!("fuzzy:{long}"),
+            _ => format!("fuzzy:{long} | {w2}"),
+        };
+        let q = compile(&text).expect("fuzzy query parses");
+        let cancel = AtomicBool::new(false);
+        let expected: Vec<u32> = (0..ix.len() as u32).filter(|&id| ix.is_match(&q, id)).collect();
+        let mut ranked = ix.search(&q, usize::MAX, &cancel).unwrap();
+        ranked.sort_unstable();
+        prop_assert_eq!(&ranked, &expected, "{}", text);
+        let mut unordered = ix.search(&q.unordered(), usize::MAX, &cancel).unwrap();
+        unordered.sort_unstable();
+        prop_assert_eq!(&unordered, &expected, "{} unordered", text);
+    }
+}

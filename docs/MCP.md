@@ -62,10 +62,12 @@ claude mcp add athrix -- "C:\Users\<you>\AppData\Local\Athrix\athrix-mcp.exe"
 ### خيارات سطر الأوامر
 
 ```text
-athrix-mcp [--data-dir <dir>] [--log-file <file> | --no-log]
+athrix-mcp [--data-dir <dir>] [--log-file <file> | --no-log] [--idle-release <seconds>]
 ```
 
 `--data-dir` مجلد بيانات أثر (الافتراضي `%APPDATA%\com.samt.athrix`)، مفيد للاختبار.
+`--idle-release` يحرّر فهرس الأسماء من الذاكرة بعد هذا العدد من الثواني بلا بحث (الافتراضي 300 أي خمس دقائق؛ `0` يبقيه
+محمّلًا). البحث التالي يعيد تحميله في أقل من ثانية عادةً.
 
 ## الأدوات
 
@@ -87,7 +89,11 @@ athrix-mcp [--data-dir <dir>] [--log-file <file> | --no-log]
 - البروتوكول: JSON-RPC 2.0 عبر stdio، رسالة في كل سطر. الإصدارات: `2025-11-25` و`2025-06-18` و`2025-03-26`
   و`2024-11-05` (يُفاوَض عليها في `initialize`). المدعوم: `initialize` و`ping` و`tools/list` و`tools/call`
   والإشعارات `notifications/initialized` و`notifications/cancelled`.
-- البيانات: لقطة فهرس الأسماء `index\names.snap` (تُحمَّل عند أول بحث وتُعاد عند تغيّرها؛ تستهلك ذاكرة بحجمها تقريبًا)،
+- البيانات: لقطة فهرس الأسماء `index\names.snap`، تُقرأ عند أول بحث وتُعاد عند تغيّرها أو تغيّر المجلدات المسموح بها.
+  تُقرأ متدفقة ولا يُحتفظ إلا بالمجلدات المسموح بها وما تحتها (والمجلدات المؤدية إليها)، فالذاكرة بحجم الجزء المسموح لا
+  بحجم اللقطة كلها؛ وتُحرَّر بعد خمس دقائق بلا بحث (`--idle-release`). مثال على لقطة اصطناعية من 6 ملايين مدخل (632 م.ب)
+  مع 5% منها مسموحة: الذروة 60 م.ب بدل 619، وبعد الخمول 2 م.ب بدل 612. إن سُمح بكل جذور اللقطة تُحمَّل كاملة كما كانت
+  (ثم تُحرَّر عند الخمول).
   وفهرس المحتوى `content\` (Tantivy) يُفتح للقراءة فقط عند كل استدعاء دون قفل الكاتب، فيبقى أثر يكتب فيه.
 - الإعداد: `%APPDATA%\com.samt.athrix\mcp.json`:
   `{ "enabled": false, "allowedFolders": [], "allowContentRead": false, "maxResults": 50 }`.
@@ -123,3 +129,9 @@ Athrix's indexes.
 
 Protocol: JSON-RPC 2.0 over stdio (versions 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05): `initialize`, `ping`,
 `tools/list`, `tools/call`. Settings file: `<app_data>/mcp.json`.
+
+Memory: the name snapshot is streamed and only the allowed folders, everything under them and the folders leading to
+them are kept, so memory follows the allowed part rather than the whole snapshot; it is freed after 5 minutes without a
+search (`--idle-release <seconds>`, `0` keeps it). On a synthetic 6-million-entry snapshot (632 MB) with 5 % allowed:
+peak 60 MB instead of 619 MB, 2 MB when idle instead of 612 MB. When every root of the snapshot is allowed it is loaded
+whole, as before, and still freed when idle.

@@ -16,7 +16,9 @@
 //! same roots, if there is one, and also remembered while the walk runs; once the walk's index
 //! is installed, the remembered paths are applied to it too, so a change made during a long
 //! walk is not lost whether or not the walk saw it. A [`WatchBatch::RescanNeeded`] queues a
-//! new walk of the watched roots through the same queue (latest wins).
+//! new walk of the watched roots through the same queue (latest wins). Roots on removable
+//! drives are *polled* (scanned every [`POLL_INTERVAL`] or so) instead of watched by the OS: an
+//! OS watch keeps a handle open on the drive, and Windows then refuses to "safely remove" it.
 //!
 //! **Generations and views.** Every snapshot the app publishes (walk, snapshot load, applied
 //! batch, compaction) becomes an [`IndexView`] with a new 21-bit generation. Result ids carry
@@ -51,6 +53,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
+use athrix_fs_index::watch::PollConfig;
 use athrix_fs_index::{
     ApplyStats, Change, EntryId, FileIndex, IndexSnapshot, LiveIndex, WalkOptions, WatchBatch,
     WatchConfig, Watcher, walk,
@@ -62,33 +65,6 @@ use crate::roots::{key_has_prefix, path_key};
 mod snapshot_store;
 
 pub use snapshot_store::SnapshotStore;
-
-/// Folder names never indexed (matched against each entry's name, case-insensitive on Windows).
-///
-/// Besides the usual noise (`.git`, `node_modules`), this skips system folders that only matter
-/// when whole drives are indexed: the recycle bin, `System Volume Information`, and Windows'
-/// update / reset staging folders (`$WinREAgent`, `$Windows.~BT`, `$Windows.~WS`, `$SysReset`),
-/// which hold hundreds of thousands of copies of system files nobody searches for.
-pub const DEFAULT_EXCLUDED_NAMES: [&str; 8] = [
-    ".git",
-    "node_modules",
-    "$RECYCLE.BIN",
-    "System Volume Information",
-    "$WinREAgent",
-    "$Windows.~BT",
-    "$Windows.~WS",
-    "$SysReset",
-];
-
-/// Path globs never indexed, under any root:
-/// - the per-user temp folder (`AppData\Local\Temp`);
-/// - the Windows component store (`Windows\WinSxS`): ~100k hard-linked copies of system files,
-///   often a tenth of a system drive's entries, never what a user is looking for.
-pub const DEFAULT_EXCLUDED_PATH_GLOBS: [&str; 2] = ["**/AppData/Local/Temp", "**/Windows/WinSxS"];
-
-/// Pseudo file systems skipped when `/` is indexed (Linux): `/proc`, `/sys`, `/dev`. Not used on
-/// Windows.
-pub const UNIX_EXCLUDED_PREFIXES: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 /// Bits of an index generation. Generations wrap within this width so result ids
 /// (`generation << 32 | entry`) stay below 2^53, the largest integer JavaScript holds exactly.
@@ -458,7 +434,18 @@ pub struct Indexer {
     listener: ListenerSlot,
     observer: ObserverSlot,
     watch_config: WatchConfig,
+    /// Picks the watched roots to poll instead of watching them (see [`PollPolicy`]) and how
+    /// often; unset means [`crate::volumes::roots_on_removable_drives`] every
+    /// [`POLL_INTERVAL`].
+    poll_policy: OnceLock<(PollPolicy, Duration)>,
 }
+
+/// Picks, among the roots about to be watched, those to poll instead (no handle kept open, so
+/// the drive can be ejected safely; see [`athrix_fs_index::watch`]).
+pub type PollPolicy = fn(&[PathBuf]) -> Vec<PathBuf>;
+
+/// How often polled roots (removable drives) are scanned for changes, at most.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 impl Indexer {
     /// An indexer with no index (`idle`) and no snapshot store.
@@ -1066,16 +1053,41 @@ impl Indexer {
         }
     }
 
+    /// Sets which watched roots are polled instead of watched by the OS, and how often (the
+    /// default polls the roots on removable drives every [`POLL_INTERVAL`]). Only the first
+    /// call has an effect.
+    pub fn set_poll_policy(&self, policy: PollPolicy, interval: Duration) {
+        let _ = self.poll_policy.set((policy, interval));
+    }
+
     fn start_watcher(self: &Arc<Self>, roots: &[PathBuf], token: u64) {
         let weak = Arc::downgrade(self);
-        let started = Watcher::start(&walk_options(roots), self.watch_config, move |batch| {
-            if let Some(this) = weak.upgrade() {
-                this.on_batch(token, batch);
-            }
-        });
+        let (policy, interval) = self.poll_policy.get().copied().unwrap_or((
+            crate::volumes::roots_on_removable_drives as PollPolicy,
+            POLL_INTERVAL,
+        ));
+        // An OS watch holds a handle on its root: Windows then refuses to eject the drive.
+        let poll = PollConfig {
+            roots: policy(roots),
+            interval,
+        };
+        let started = Watcher::start_with_polling(
+            &walk_options(roots),
+            self.watch_config,
+            &poll,
+            move |batch| {
+                if let Some(this) = weak.upgrade() {
+                    this.on_batch(token, batch);
+                }
+            },
+        );
         match started {
             Ok(watcher) => {
-                tracing::info!(roots = ?watcher.watched_roots(), "watching for changes");
+                tracing::info!(
+                    roots = ?watcher.watched_roots(),
+                    polled = ?watcher.polled_roots(),
+                    "watching for changes"
+                );
                 let stale = {
                     let mut core = self.core();
                     if core.watch_token == token {
@@ -1449,21 +1461,10 @@ fn root_strings(roots: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// Walk options for `roots` with the default exclusions from the IPC contract.
+/// Walk options for `roots` with the default exclusions from the IPC contract (the shared list
+/// of [`athrix_fs_index::exclude`], also used by the CLI and the content daemon).
 pub fn walk_options(roots: &[PathBuf]) -> WalkOptions {
-    let mut opts = WalkOptions::new(roots.iter().cloned());
-    for name in DEFAULT_EXCLUDED_NAMES {
-        opts = opts.exclude_glob(name);
-    }
-    for glob in DEFAULT_EXCLUDED_PATH_GLOBS {
-        opts = opts.exclude_glob(glob);
-    }
-    if cfg!(unix) {
-        for prefix in UNIX_EXCLUDED_PREFIXES {
-            opts = opts.exclude_prefix(prefix);
-        }
-    }
-    opts
+    WalkOptions::new(roots.iter().cloned()).with_default_exclusions()
 }
 
 #[cfg(test)]
@@ -1892,6 +1893,49 @@ mod tests {
             "the deleted file is gone"
         );
         assert!(eventually(|| indexer.status().entries == 5));
+    }
+
+    #[test]
+    fn a_polled_root_keeps_the_index_current_and_goes_offline_when_removed() {
+        let fixed = drive_with("fixed-file.txt");
+        let usb_parent = tempfile::tempdir().unwrap();
+        let usb = usb_parent.path().join("usb");
+        fs::create_dir_all(&usb).unwrap();
+        fs::write(usb.join("usb-file.txt"), b"x").unwrap();
+        let roots = vec![fixed.path().to_path_buf(), usb.clone()];
+        let indexer = Indexer::new();
+        // The second root stands for a removable drive.
+        indexer.set_poll_policy(
+            |roots| {
+                roots
+                    .iter()
+                    .filter(|r| r.ends_with("usb"))
+                    .cloned()
+                    .collect()
+            },
+            Duration::from_millis(100),
+        );
+        let indexer = Arc::new(indexer);
+        let events = run_here(&indexer, &roots, false);
+        assert_eq!(states(&events), [IndexState::Ready]);
+        assert!(eventually(|| indexer.watched_roots().len() == 2));
+        assert_eq!(
+            indexer.core().watcher.as_ref().unwrap().polled_roots(),
+            std::slice::from_ref(&usb)
+        );
+
+        fs::write(usb.join("usb-new.txt"), b"x").unwrap();
+        assert!(
+            eventually(|| finds(&indexer.index().unwrap(), "usb-new")),
+            "a change on the polled root is found"
+        );
+
+        // Pulled out before the drive monitor noticed: offline, not deleted, no re-walk.
+        fs::remove_dir_all(&usb).unwrap();
+        assert!(eventually(|| indexer.offline_roots() == [usb.clone()]));
+        assert!(!finds(&indexer.index().unwrap(), "usb-file"));
+        assert!(finds(&indexer.index().unwrap(), "fixed-file"));
+        assert_eq!(indexer.watched_roots(), [fixed.path().to_path_buf()]);
     }
 
     /// A folder holding one file named `name`.

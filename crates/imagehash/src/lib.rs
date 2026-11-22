@@ -27,7 +27,7 @@ mod group;
 mod phash;
 
 pub use batch::{Candidate, HashRun, hash_all, hash_threads};
-pub use cache::{CACHE_FILE, CacheError, CachedHash, HashCache};
+pub use cache::{CACHE_FILE, CacheError, CachedHash, HashCache, PruneLimits, PruneReport};
 pub use decode::{
     HashError, IMAGE_EXTENSIONS, MAX_FILE_BYTES, hash_bytes, hash_file, hash_image,
     is_image_extension,

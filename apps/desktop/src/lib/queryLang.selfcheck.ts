@@ -4,6 +4,7 @@ import { applyCompletion, complete, type Completion } from "./autocomplete.ts";
 import { filterName, kindOf, namedDate, normalizeWord, tokenize, type Token } from "./queryLang.ts";
 import { findMatches, queryTerms } from "./textMatch.ts";
 import { highlightSyntax } from "./syntax.ts";
+import { mockInterpret } from "./mockInterpret.ts";
 
 declare const process: { exit(code: number): never };
 
@@ -135,10 +136,10 @@ eq("مح → محتوى", labels(at("مح")), ["محتوى:"]);
 // ---- preview: query words and Arabic-tolerant matches (task 4.9) ----
 {
   eq("terms: words, phrase, content:, not negated or filters", queryTerms('تقرير "Annual Plan" -draft ext:pdf content:ميزانية !x'),
-    ["annual plan", "ميزانية", "تقرير"]);
+    ["annual plan", "ميزانيه", "تقرير"]);
   eq("terms: wildcard splits", queryTerms("rep*rt"), ["rep", "rt"]);
   eq("terms: negated content: skipped", queryTerms("ext:docx -content:مسودة !محتوى:قديم تقرير"), ["تقرير"]);
-  eq("terms: quoted content: is a phrase", queryTerms('content:"عقد الإيجار" محتوى:ميزانية'), ["عقد الايجار", "ميزانية"]);
+  eq("terms: quoted content: is a phrase", queryTerms('content:"عقد الإيجار" محتوى:ميزانية'), ["عقد الايجار", "ميزانيه"]);
   eq("terms: negated word then content:", queryTerms("-x content:y"), ["y"]);
   eq("terms: normalized (hamza, harakat)", queryTerms("أُصول"), ["اصول"]);
   const text = "مقدمة: التَّقْرِيرُ السنوي\nReport and REPORT";
@@ -159,6 +160,27 @@ eq("مح → محتوى", labels(at("مح")), ["محتوى:"]);
     ["kw:def", 'str:"""doc\n    more"""', "kw:return", "num:0x1F", "com:# hex"]);
   eq("sql is caseless", highlightSyntax("SELECT 1", "sql").map((x) => x.cls), ["kw", "num"]);
   eq("identifiers with digits are not numbers", highlightSyntax("x1 = 2", "c").map((x) => x.cls), ["num"]);
+}
+
+// ---- natural language: the mock interpreter agrees with Rust on these (crates/query/tests/natural.rs) ----
+{
+  const q = (text: string) => mockInterpret(text)?.query ?? null;
+  eq("nl: modified by default", q("ملفات PDF من الأسبوع الماضي"), "ext:pdf dm:lastweek");
+  eq("nl: created (harakat)", q("ملفات أُنشئت أمس"), "dm:yesterday");
+  eq("nl: created + preposition", q("صور أنشأتها من الشهر الماضي"), "type:image dm:lastmonth");
+  eq("nl: opened", q("files opened yesterday"), "dm:yesterday");
+  eq("nl: accessed from", q("documents accessed from last week"), "type:doc dm:lastweek");
+  eq("nl: large files", q("ملفات كبيرة"), "size:>100mb");
+  eq("nl: huge files", q("الملفات الضخمة"), "size:>1gb");
+  eq("nl: large before a kind", q("large videos"), "size:>100mb type:video");
+  eq("nl: small images", q("small images"), "size:<100kb type:image");
+  eq("nl: very large", q("very large files"), "size:>1gb");
+  eq("nl: empty", q("ملفات فارغة"), "size:empty");
+  eq("nl: size word alone is a name", q("big report"), null);
+  eq("nl: plain names left alone", q("تقرير المبيعات"), null);
+  eq("nl: filter syntax left alone", q("ext:pdf from last week"), null);
+  const it = mockInterpret("ملفات أُنشئت أمس");
+  eq("nl: parts cover the words", it?.parts.map((p) => [p.role, p.output]), [["ignored", ""], ["date", "dm:yesterday"]]);
 }
 
 if (failures) {

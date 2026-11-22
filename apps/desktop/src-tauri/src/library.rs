@@ -12,8 +12,7 @@ use athrix_store::{Favorite, HistoryEntry, SavedSearch, Store, StoreError};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::commands::STALE_ID_ERROR;
-use crate::results::decode_id;
+use crate::commands::resolve_entry;
 use crate::state::AppState;
 
 /// File name of the library database in the app data folder.
@@ -144,23 +143,16 @@ pub async fn favorite_list(library: State<'_, Library>) -> Result<Vec<Favorite>,
     with_store(&library, Store::favorite_list).await
 }
 
-/// Adds the entry of result `id` to the favorites (resolved like `open_entry`; a stale id
-/// rejects with [`STALE_ID_ERROR`]).
+/// Adds the entry of result `id` to the favorites (resolved with `commands::resolve_entry` like
+/// `open_entry`; a stale id rejects with [`crate::commands::STALE_ID_ERROR`]).
 #[tauri::command]
 pub async fn favorite_add(
     state: State<'_, AppState>,
     library: State<'_, Library>,
     id: u64,
 ) -> Result<Favorite, String> {
-    // Same resolution as `commands::resolve_entry`: only the id's own view, never another.
-    if state.indexer.index().is_none() {
-        return Err("the index is not ready yet".to_owned());
-    }
-    let (generation, entry) = decode_id(id).ok_or_else(|| format!("invalid result id {id}"))?;
-    let (path, is_dir) = match state.indexer.view(generation) {
-        Some(view) if view.has_entry(entry) => (view.path(entry), view.meta(entry).is_dir),
-        _ => return Err(STALE_ID_ERROR.to_owned()),
-    };
+    let (view, entry) = resolve_entry(&state.indexer, id)?;
+    let (path, is_dir) = (view.path(entry), view.meta(entry).is_dir);
     with_store(&library, move |s| s.favorite_add(&path, is_dir)).await
 }
 

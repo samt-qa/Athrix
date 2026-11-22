@@ -13,6 +13,11 @@
 //! in parallel on the blocking pool, cancelled by a newer search, and bounded by
 //! [`TIME_BUDGET`]: past it the answer lists what was compared so far with
 //! `similarIncomplete: true`, and searching again continues where the cache left off.
+//!
+//! Pictures are hashed upright (their EXIF orientation applied), so a phone photo turned by
+//! its EXIF tag matches its upright copy. After a search the cache is pruned in the background
+//! (rows of deleted or resized files and of older hash versions, [`HashCache::prune`]), at
+//! most once every [`PRUNE_EVERY`].
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use athrix_fs_index::EntryId;
 use athrix_imagehash::{
-    Candidate, GROUP_MAX_DISTANCE, HashCache, HashRun, IMAGE_EXTENSIONS, ImageHash,
+    Candidate, GROUP_MAX_DISTANCE, HashCache, HashRun, IMAGE_EXTENSIONS, ImageHash, PruneLimits,
     REFERENCE_MAX_DISTANCE, group_similar, hash_all, hash_threads, is_image_extension,
     similarity_percent,
 };
@@ -44,6 +49,9 @@ pub const TIME_BUDGET: Duration = Duration::from_secs(8);
 
 /// Rows `find_similar` returns when the UI gives no `limit`.
 pub const DEFAULT_LIMIT: usize = 1000;
+
+/// Least time between two background prunes of the hash cache.
+pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// Where the cache lives (set at start-up) and the cache once opened.
 static CACHE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -74,6 +82,35 @@ fn cache() -> Option<Arc<HashCache>> {
         }
     }
     slot.clone()
+}
+
+/// When the last background prune started.
+static LAST_PRUNE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Prunes `cache` on a background thread, unless a prune ran less than [`PRUNE_EVERY`] ago.
+fn prune_later(cache: Arc<HashCache>) {
+    {
+        let mut last = LAST_PRUNE.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|t| t.elapsed() < PRUNE_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let spawned = std::thread::Builder::new()
+        .name("phash-cache-prune".to_owned())
+        .spawn(move || match cache.prune(&PruneLimits::default()) {
+            Ok(r) => tracing::debug!(
+                checked = r.checked,
+                removed = r.removed,
+                wrapped = r.wrapped,
+                vacuumed = r.vacuumed,
+                "image hash cache pruned"
+            ),
+            Err(e) => tracing::warn!(error = %e, "cannot prune the image hash cache"),
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot start the image hash cache prune");
+    }
 }
 
 /// Results of a similar-image search.
@@ -334,8 +371,12 @@ fn hash_ids(
     let list = candidates(view, ids, cancel)?;
     let cache = cache();
     let deadline = Instant::now() + TIME_BUDGET;
-    hash_all(cache.as_deref(), &list, cancel, deadline, hash_threads())
-        .ok_or(SimilarFailure::Search(SearchFailure::Cancelled))
+    let run = hash_all(cache.as_deref(), &list, cancel, deadline, hash_threads())
+        .ok_or(SimilarFailure::Search(SearchFailure::Cancelled))?;
+    if let Some(cache) = cache {
+        prune_later(cache);
+    }
+    Ok(run)
 }
 
 fn summary(run: &HashRun, groups: usize, found: usize) -> SimilarSummary {

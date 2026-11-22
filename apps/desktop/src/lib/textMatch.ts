@@ -4,12 +4,18 @@
 // field as the user types (no extra IPC round trip per keystroke), and the result is UTF-16
 // ranges into the very string being rendered. The normalization approximates nass's name
 // normalization (case, harakat, tatweel, hamza forms of alef, alef maqsura, Arabic-Indic
-// digits); it is the same one the mock backend uses for names. Offsets map back to the original
+// digits, and the name folds ة → ه, ؤ → و, ئ → ي that content search also applies); it is the
+// same one the mock backend uses for names. Every fold is one UTF-16 unit for one, so the map
+// stays exact. Offsets map back to the original
 // text, so a match covers its diacritics too.
 import type { Range16 } from "./api";
 import { tokenize, type Token } from "./queryLang.ts";
 
-const HAMZA: Record<string, string> = { "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي" };
+const HAMZA: Record<string, string> = {
+  "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي",
+  // Name search folds (athrix_text_ar::normalize_name_into); the standalone hamza ء is kept.
+  "ة": "ه", "ؤ": "و", "ئ": "ي",
+};
 
 /** Harakat, Quranic marks, superscript alef and tatweel: dropped by the normalization. */
 export const isMark = (code: number) => (code >= 0x064b && code <= 0x065f) || code === 0x0670 || code === 0x0640;

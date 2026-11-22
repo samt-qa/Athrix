@@ -522,7 +522,7 @@ mod tests {
         assert!(one.is_dir && !one.is_symlink && one.size == 0);
         let doc = find("مُحَاضَرَة.docx");
         let i = tree_index("مُحَاضَرَة.docx");
-        assert_eq!(ix.normalized_name(doc), "محاضرة docx");
+        assert_eq!(ix.normalized_name(doc), "محاضره docx");
         assert_eq!(ix.meta(doc).size, u64::from(i) * 10);
         assert_eq!(ix.meta(doc).modified, Some(1_700_000_000 + i64::from(i)));
         assert!(!ix.meta(doc).is_symlink);

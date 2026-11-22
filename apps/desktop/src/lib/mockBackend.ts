@@ -1061,7 +1061,7 @@ function search(
     if (clauses.length) {
       return done([], false, {
         kind: "DupeWithContent", start: 0, end: query.length, suggestion: null,
-        message: "`dupe:` cannot be combined with `content:` yet",
+        message: "the mock backend has no content index for `dupe:` + `content:` (the app supports it)",
       });
     }
     return mockDupes(hits, query, scope, limit, withSuggestion, done);

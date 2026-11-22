@@ -19,10 +19,10 @@
 use std::path::{Path, PathBuf};
 
 use athrix_ntfs::drives::{DriveProbe, DriveType, probe_drives};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What kind of storage a volume is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VolumeKind {
     /// An internal (non-removable) disk. Indexed by default.
@@ -136,6 +136,39 @@ fn drive_type_code(kind: DriveType) -> u8 {
         DriveType::CdRom => 4,
         DriveType::RamDisk => 5,
     }
+}
+
+/// The roots of `roots` that lie on a removable drive (USB stick, memory card) right now:
+/// the roots to poll for changes rather than watch, so no handle stays open on the drive and
+/// Windows can eject it safely (see [`athrix_fs_index::watch`]). Empty outside Windows, where
+/// watching does not prevent unmounting. A cheap probe (no disk access).
+pub fn roots_on_removable_drives(roots: &[PathBuf]) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        roots_on_kind(roots, &probe_drives(), DriveType::Removable)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The roots of `roots` whose drive letter is one of `probed` with kind `kind`.
+fn roots_on_kind(roots: &[PathBuf], probed: &[DriveProbe], kind: DriveType) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter(|root| {
+            let s = root.to_string_lossy();
+            let b = s.as_bytes();
+            b.len() >= 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && probed.iter().any(|p| {
+                    p.kind == kind
+                        && p.root
+                            .get(..2)
+                            .is_some_and(|r| r.eq_ignore_ascii_case(&s[..2]))
+                })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Lists the volumes of this computer, sorted by path (drive letter on Windows). May block for
@@ -398,6 +431,41 @@ mod tests {
             (found[1].name.as_str(), found[1].kind),
             ("Z:", VolumeKind::Network)
         );
+    }
+
+    #[test]
+    fn roots_on_removable_drives_are_polled() {
+        let probed = [
+            DriveProbe {
+                root: "C:\\".into(),
+                kind: DriveType::Fixed,
+                serial: Some(1),
+            },
+            DriveProbe {
+                root: "E:\\".into(),
+                kind: DriveType::Removable,
+                serial: Some(2),
+            },
+        ];
+        let roots = [
+            PathBuf::from("C:\\"),
+            PathBuf::from("e:\\Photos"),
+            PathBuf::from("E:\\"),
+            PathBuf::from("F:\\"),
+            PathBuf::from("/media/usb"),
+            PathBuf::from("\\\\server\\share"),
+        ];
+        assert_eq!(
+            roots_on_kind(&roots, &probed, DriveType::Removable),
+            [PathBuf::from("e:\\Photos"), PathBuf::from("E:\\")]
+        );
+        // The system drive is never removable.
+        if cfg!(windows) {
+            let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+            assert!(roots_on_removable_drives(&[PathBuf::from(format!("{system}\\"))]).is_empty());
+        } else {
+            assert!(roots_on_removable_drives(&roots).is_empty());
+        }
     }
 
     #[test]

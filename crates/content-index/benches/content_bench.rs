@@ -302,10 +302,23 @@ fn long_documents(rng: &mut Rng) {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+    // Several words rarely all within one snippet: the snippet scans past the first window
+    // with a match for a fuller cluster (bounded, see `snippet.rs`).
+    let scattered: Vec<String> = ["السيبراني الضريبة", "السيبراني الضريبة المستأجر"]
+        .iter()
+        .cycle()
+        .take(10)
+        .map(|s| (*s).to_owned())
+        .collect();
     timed("long: top 804 (no snippets)", &queries, |q| {
         idx.search(q, 804).unwrap().len()
     });
     timed("long: snippets of the best 30", &queries, |q| {
+        let hits = idx.search(q, 30).unwrap();
+        let shown: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        idx.snippets(q, &shown).unwrap().len()
+    });
+    timed("long: snippets of 30, scattered words", &scattered, |q| {
         let hits = idx.search(q, 30).unwrap();
         let shown: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         idx.snippets(q, &shown).unwrap().len()

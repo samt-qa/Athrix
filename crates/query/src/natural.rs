@@ -32,13 +32,38 @@
 //! | named dates | «اليوم»، «أمس»، «هذا الأسبوع»، «الأسبوع الماضي»، «الشهر الماضي»، «السنة الماضية», "today", "last week", "this year" | `dm:today`, `dm:lastweek`… |
 //! | years, months | «في 2024»، «سنة ٢٠٢٣»، «مارس 2025», "in 2024", "since 2023", "before 2020", "march 2025" | `dm:2024`, `dm:>=2023`, `dm:<2020`, `dm:2025-03` |
 //! | relative (needs today) | «قبل 3 أيام»، «منذ شهرين»، «آخر 7 أيام»، «أقدم من سنة», "3 days ago", "last 7 days", "past 2 weeks", "older than 30 days" | `dm:2026-11-19`, `dm:>=2026-09-22`, `dm:<2025-11-22`… |
+//! | date kind | «أُنشئت»/«أنشأتها»/«المنشأة», "created" (`dc:`); «فُتحت»/«فتحتها»/«استُخدمت», "opened"/"accessed" (`da:`), just before the date: «صور أنشأتها الشهر الماضي», "files opened yesterday" | `dc:lastmonth`, `da:yesterday` (otherwise `dm:`) |
 //! | sizes | «أكبر من 5 ميجا»، «أقل من ٢٠٠ ك»، «بين 1 و 5 جيجا», "bigger than 2mb", "under 500 kb", "at least 1gb" | `size:>5mb`, `size:<200kb`, `size:1gb..5gb`, `size:>=1gb` |
+//! | size words (next to a kind or «ملفات»/"files") | «ملفات كبيرة», «الملفات الضخمة», «صور صغيرة», «ملفات فارغة», "large files", "huge videos", "small images", "tiny files", "empty files" | see [size words](#size-words) |
 //! | content | «تحتوي على عقد الإيجار»، «فيها كلمة ميزانية»، «عن الضرائب» (after a kind), "containing budget", "that mention invoice", "with the text …" | `content:"عقد الإيجار"`, `content:budget` |
 //! | location | «في مجلد التنزيلات»، «على القرص D», "in folder Downloads", "in the Projects folder", "on drive D", "on D:" | `infolder:التنزيلات`, `infolder:D:` |
 //!
 //! Arabic matching ignores hamza forms, ى/ي, ة/ه, tatweel and harakat, and accepts
-//! Arabic-Indic digits. Dates always use `dm:` (modified): "created" is read as a filler word,
-//! because the name index does not support `dc:` yet.
+//! Arabic-Indic digits.
+//!
+//! # Date kinds
+//!
+//! Dates use `dm:` (modified) unless a creation or access word comes right before the date
+//! (possibly with a preposition between): «الملفات التي أُنشئت في 2024» → `dc:2024`, "photos I
+//! opened last week" → `da:lastweek`. A creation/access word with no date after it is dropped
+//! like any filler. Note that an executor may not support `dc:`/`da:` (the name index rejects
+//! them with a clear "not supported yet" error); the suggestion still says what was asked.
+//!
+//! # Size words
+//!
+//! Size adjectives without a number are read only next to a kind or «ملفات»/"files" (before
+//! or after it), so a name such as "big report" is left alone. The thresholds build on the
+//! named sizes of `size:` (Everything's ladder, see [`crate::parse`]): Everything's own
+//! `size:large` is the 1-16 MB band, too narrow for what people mean by "large files", so
+//! open-ended bounds are used instead:
+//!
+//! | words | output | meaning |
+//! |---|---|---|
+//! | «كبيرة», «كبير», «كبار», "large", "big" | `size:>100mb` | above 100 MB |
+//! | «ضخمة», «كبيرة جدا», "huge", "very large", "massive" | `size:>1gb` | above 1 GB |
+//! | «صغيرة», «صغير», «صغار», "small" | `size:<100kb` | under 100 KB (Everything's `tiny` + `small`) |
+//! | «صغيرة جدا», "tiny", "very small" | `size:tiny` | 10 KB or less |
+//! | «فارغة», «فارغ», "empty" | `size:empty` | 0 bytes |
 
 use crate::ast::{CalendarDate, Expr, ExprKind, Span};
 use crate::lexicon::{ascii_digits, normalize_word};
@@ -58,12 +83,26 @@ pub struct InterpretOptions {
     /// are not recognised and stay as words. Named periods («الأسبوع الماضي» → `dm:lastweek`)
     /// do not need it: the executor resolves them.
     pub today: Option<CalendarDate>,
+    /// Whether the executor can filter by creation / access date. When `false` (the default)
+    /// a creation or access word («أُنشئت», "opened") is still understood, but the date becomes
+    /// `dm:`, because the name index stores only modification times and would reject `dc:` /
+    /// `da:`. Set it when the query will run on an engine that supports them.
+    pub date_kinds: bool,
 }
 
 impl InterpretOptions {
     /// Options with today's date set.
     pub const fn with_today(today: CalendarDate) -> Self {
-        InterpretOptions { today: Some(today) }
+        InterpretOptions {
+            today: Some(today),
+            date_kinds: false,
+        }
+    }
+
+    /// The same options, with `dc:` / `da:` output allowed (see [`InterpretOptions::date_kinds`]).
+    pub const fn with_date_kinds(mut self) -> Self {
+        self.date_kinds = true;
+        self
     }
 }
 
@@ -72,7 +111,7 @@ impl InterpretOptions {
 pub enum PartRole {
     /// A file kind (`ext:` / `type:`).
     Kind,
-    /// A date (`dm:`).
+    /// A date (`dm:`, or `dc:` / `da:` after a creation / access word).
     Date,
     /// A size (`size:`).
     Size,
@@ -145,7 +184,11 @@ pub fn interpret_with(text: &str, options: &InterpretOptions) -> Option<Interpre
         return None;
     }
     let today = options.today.and_then(Day::from_calendar);
-    let cx = Cx { toks: &toks, today };
+    let cx = Cx {
+        toks: &toks,
+        today,
+        date_kinds: options.date_kinds,
+    };
 
     let mut hits: Vec<(usize, Hit)> = Vec::new();
     let mut seen_kind_or_files = false;
@@ -160,6 +203,7 @@ pub fn interpret_with(text: &str, options: &InterpretOptions) -> Option<Interpre
         let after_files = files_end == Some(i);
         let hit = cx
             .size_at(i)
+            .or_else(|| cx.size_word_at(i, seen_kind_or_files))
             .or_else(|| cx.date_at(i))
             .or_else(|| cx.location_at(i))
             .or_else(|| cx.content_at(i, seen_kind_or_files))
@@ -465,6 +509,10 @@ const FILLERS: &[&str] = &[
     "أنشئت",
     "المنشأة",
     "إنشاؤها",
+    "أنشأتها",
+    "فتحت",
+    "فتحتها",
+    "المفتوحة",
     "حجمها",
     "حجمه",
     "بحجم",
@@ -515,6 +563,9 @@ const FILLERS: &[&str] = &[
     "updated",
     "saved",
     "created",
+    "opened",
+    "accessed",
+    "i",
     "sized",
     "size",
     "with size",
@@ -700,33 +751,94 @@ const NAMED_DATES: &[(&str, &str)] = &[
     ("previous year", "lastyear"),
 ];
 
-/// Words that may introduce a date ("from last week", «من الشهر الماضي»).
+/// Words that may introduce a date ("from last week", «من الشهر الماضي»), after an optional
+/// [`DATE_FIELDS`] word.
 const DATE_PREPS: &[&str] = &[
     "من",
     "في",
     "خلال",
     "بتاريخ",
-    "عدلت",
-    "المعدلة",
-    "معدلة",
-    "تم تعديلها",
     "from",
     "in",
     "during",
     "on",
     "of",
     "dated",
-    "modified",
-    "edited",
-    "changed",
-    "updated",
-    "created",
-    "saved",
-    "modified in",
-    "modified on",
-    "edited in",
-    "created in",
-    "created on",
+];
+
+/// Which date a filter compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateField {
+    /// `dm:` (the default).
+    Modified,
+    /// `dc:`
+    Created,
+    /// `da:`
+    Accessed,
+}
+
+impl DateField {
+    const fn filter(self) -> &'static str {
+        match self {
+            DateField::Modified => "dm",
+            DateField::Created => "dc",
+            DateField::Accessed => "da",
+        }
+    }
+}
+
+/// Words that say which date is meant, right before the date or its preposition
+/// («أُنشئت في 2024», "opened last week"). Arabic harakat are ignored, so «أُنشئت» = «أنشئت».
+const DATE_FIELDS: &[(&str, DateField)] = &[
+    ("عدلت", DateField::Modified),
+    ("عدلتها", DateField::Modified),
+    ("عدلته", DateField::Modified),
+    ("المعدلة", DateField::Modified),
+    ("معدلة", DateField::Modified),
+    ("تم تعديلها", DateField::Modified),
+    ("تم تعديله", DateField::Modified),
+    ("تعديلها", DateField::Modified),
+    ("حفظت", DateField::Modified),
+    ("حفظتها", DateField::Modified),
+    ("المحفوظة", DateField::Modified),
+    ("modified", DateField::Modified),
+    ("last modified", DateField::Modified),
+    ("edited", DateField::Modified),
+    ("changed", DateField::Modified),
+    ("updated", DateField::Modified),
+    ("saved", DateField::Modified),
+    ("أنشئت", DateField::Created),
+    ("أنشئ", DateField::Created),
+    ("أنشأت", DateField::Created),
+    ("أنشأتها", DateField::Created),
+    ("أنشأته", DateField::Created),
+    ("المنشأة", DateField::Created),
+    ("منشأة", DateField::Created),
+    ("المنشأ", DateField::Created),
+    ("تم إنشاؤها", DateField::Created),
+    ("تم إنشاؤه", DateField::Created),
+    ("تم انشاء", DateField::Created),
+    ("إنشاؤها", DateField::Created),
+    ("إنشائها", DateField::Created),
+    ("created", DateField::Created),
+    ("فتحت", DateField::Accessed),
+    ("فتحتها", DateField::Accessed),
+    ("فتحته", DateField::Accessed),
+    ("المفتوحة", DateField::Accessed),
+    ("تم فتحها", DateField::Accessed),
+    ("تم فتحه", DateField::Accessed),
+    ("استخدمت", DateField::Accessed),
+    ("استخدمتها", DateField::Accessed),
+    ("استخدمته", DateField::Accessed),
+    ("المستخدمة", DateField::Accessed),
+    ("تم استخدامها", DateField::Accessed),
+    ("opened", DateField::Accessed),
+    ("last opened", DateField::Accessed),
+    ("accessed", DateField::Accessed),
+    ("last accessed", DateField::Accessed),
+    ("used", DateField::Accessed),
+    ("last used", DateField::Accessed),
+    ("viewed", DateField::Accessed),
 ];
 
 /// "Since" / "before" / "after" a year.
@@ -931,6 +1043,51 @@ const SIZE_OPS: &[(&str, &str)] = &[
 
 const THAN: &[&str] = &["من", "عن", "than"];
 
+/// Size words without a number (see the [module docs](self#size-words)): phrase → `size:`
+/// value. Read only next to a kind or «ملفات»/"files".
+const SIZE_WORDS: &[(&str, &str)] = &[
+    ("كبيرة", ">100mb"),
+    ("الكبيرة", ">100mb"),
+    ("كبير", ">100mb"),
+    ("الكبير", ">100mb"),
+    ("كبار", ">100mb"),
+    ("الكبار", ">100mb"),
+    ("كبيرة الحجم", ">100mb"),
+    ("الكبيرة الحجم", ">100mb"),
+    ("large", ">100mb"),
+    ("big", ">100mb"),
+    ("ضخمة", ">1gb"),
+    ("الضخمة", ">1gb"),
+    ("ضخم", ">1gb"),
+    ("الضخم", ">1gb"),
+    ("كبيرة جدا", ">1gb"),
+    ("الكبيرة جدا", ">1gb"),
+    ("كبير جدا", ">1gb"),
+    ("huge", ">1gb"),
+    ("massive", ">1gb"),
+    ("enormous", ">1gb"),
+    ("very large", ">1gb"),
+    ("very big", ">1gb"),
+    ("صغيرة", "<100kb"),
+    ("الصغيرة", "<100kb"),
+    ("صغير", "<100kb"),
+    ("الصغير", "<100kb"),
+    ("صغار", "<100kb"),
+    ("الصغار", "<100kb"),
+    ("صغيرة الحجم", "<100kb"),
+    ("small", "<100kb"),
+    ("صغيرة جدا", "tiny"),
+    ("الصغيرة جدا", "tiny"),
+    ("صغير جدا", "tiny"),
+    ("tiny", "tiny"),
+    ("very small", "tiny"),
+    ("فارغة", "empty"),
+    ("الفارغة", "empty"),
+    ("فارغ", "empty"),
+    ("الفارغ", "empty"),
+    ("empty", "empty"),
+];
+
 const BETWEEN: &[&str] = &["بين", "ما بين", "between"];
 const AND: &[&str] = &["و", "and", "to", "إلى", "الى"];
 
@@ -1092,6 +1249,8 @@ const NUMBER_WORDS: &[(&str, u32)] = &[
 struct Cx<'t, 'a> {
     toks: &'t [Tok<'a>],
     today: Option<Day>,
+    /// `dc:` / `da:` may be produced (otherwise every date is `dm:`).
+    date_kinds: bool,
 }
 
 impl Cx<'_, '_> {
@@ -1178,6 +1337,24 @@ impl Cx<'_, '_> {
         ))
     }
 
+    /// A size word without a number («ملفات كبيرة», "large files"): only after a kind or
+    /// «ملفات»/"files" (`has_context`) or right before one.
+    fn size_word_at(&self, i: usize, has_context: bool) -> Option<Hit> {
+        let (n, value) = self.longest(i, SIZE_WORDS)?;
+        let next_is_kind =
+            self.longest_word(i + n, FILES_WORDS).is_some() || self.kind_word(i + n).is_some();
+        if !(has_context || next_is_kind) {
+            return None;
+        }
+        parse_size(value).ok()?;
+        Some(Hit::new(
+            n,
+            PartRole::Size,
+            format!("size:{value}"),
+            Strength::Strong,
+        ))
+    }
+
     /// A number at `i` with an optional unit (attached or in the next word): (digits, unit,
     /// tokens).
     fn number_unit(&self, i: usize) -> Option<(String, Option<&'static str>, usize)> {
@@ -1208,17 +1385,33 @@ impl Cx<'_, '_> {
     // -- dates ------------------------------------------------------------------------------
 
     fn date_at(&self, i: usize) -> Option<Hit> {
-        // Without a preposition first, then after the longest preposition that leads to a date.
-        if let Some(h) = self.date_body(i, false) {
+        // Without a preposition first.
+        if let Some(h) = self.date_body(i, false, DateField::Modified) {
             return Some(h);
         }
-        let n = self.longest_word(i, DATE_PREPS)?;
-        let mut h = self.date_body(i + n, true)?;
-        h.len += n;
+        // Then after a date-kind word («أُنشئت», "opened"), with or without a preposition.
+        let (f, field) = self
+            .longest(i, DATE_FIELDS)
+            .unwrap_or((0, DateField::Modified));
+        let field = if self.date_kinds {
+            field
+        } else {
+            DateField::Modified
+        };
+        if f > 0 {
+            if let Some(mut h) = self.date_body(i + f, true, field) {
+                h.len += f;
+                return Some(h);
+            }
+        }
+        // Then after the longest preposition that leads to a date.
+        let n = self.longest_word(i + f, DATE_PREPS)?;
+        let mut h = self.date_body(i + f + n, true, field)?;
+        h.len += f + n;
         Some(h)
     }
 
-    fn date_body(&self, i: usize, after_prep: bool) -> Option<Hit> {
+    fn date_body(&self, i: usize, after_prep: bool, field: DateField) -> Option<Hit> {
         let strong_if = |s: bool| {
             if s { Strength::Strong } else { Strength::Weak }
         };
@@ -1227,7 +1420,7 @@ impl Cx<'_, '_> {
             Some(Hit::new(
                 len,
                 PartRole::Date,
-                format!("dm:{value}"),
+                format!("{}:{value}", field.filter()),
                 strength,
             ))
         };
@@ -1241,7 +1434,7 @@ impl Cx<'_, '_> {
             return date(n, value.to_owned(), strong_if(after_prep || n > 1));
         }
         // Relative: «قبل 3 أيام», «آخر أسبوع», "3 days ago", "older than a year".
-        if let Some(h) = self.relative_at(i) {
+        if let Some(h) = self.relative_at(i, field) {
             return Some(h);
         }
         // «في عام 2024», "in year 2024"
@@ -1292,7 +1485,7 @@ impl Cx<'_, '_> {
         None
     }
 
-    fn relative_at(&self, i: usize) -> Option<Hit> {
+    fn relative_at(&self, i: usize, field: DateField) -> Option<Hit> {
         let today = self.today?;
         let make = |len: usize, rel: Rel, count: u32, unit: Unit| -> Option<Hit> {
             let value = relative_value(today, rel, count, unit)?;
@@ -1300,7 +1493,7 @@ impl Cx<'_, '_> {
             Some(Hit::new(
                 len,
                 PartRole::Date,
-                format!("dm:{value}"),
+                format!("{}:{value}", field.filter()),
                 Strength::Strong,
             ))
         };
@@ -1677,7 +1870,7 @@ impl Day {
     }
 }
 
-/// The `dm:` value for a relative phrase, or `None` if it falls outside years 1-9999.
+/// The date value (`dm:`/`dc:`/`da:`) for a relative phrase, or `None` if it falls outside years 1-9999.
 fn relative_value(today: Day, rel: Rel, count: u32, unit: Unit) -> Option<String> {
     let count = count.min(100_000);
     let back = |n: u32| -> Option<Day> {

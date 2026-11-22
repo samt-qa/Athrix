@@ -8,11 +8,12 @@
 //! 2. **fuzzy**: the same query with the `fuzzy:` switch in front (every plain word fuzzy).
 //!
 //! Each candidate is one more search with the same scope, limit and cancel flag, without
-//! building result rows.
+//! building result rows. It only counts matches (up to `limit`), so it runs unordered
+//! ([`athrix_fs_index::Query::unordered`]): the probe stops as soon as `limit` matches exist
+//! anywhere in the index, instead of ranking the whole index (fuzzy) or scanning it in order.
 //!
 //! Not part of `search`: the UI asks `search_suggest` after an empty result (and a short
-//! pause), so these probes (the fuzzy one scans and ranks the whole index) never delay the
-//! empty answer of the keystroke.
+//! pause), so these probes never delay the empty answer of the keystroke.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -50,7 +51,7 @@ pub fn suggest(
         let Ok(compiled) = compile_query(&candidate) else {
             continue;
         };
-        let count = count_matches(view, &compiled.query, limit, scope, cancel)?;
+        let count = count_matches(view, &compiled.query.unordered(), limit, scope, cancel)?;
         if count > 0 {
             return Ok(Some(SearchSuggestion {
                 query: candidate,

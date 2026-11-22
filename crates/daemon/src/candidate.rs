@@ -47,8 +47,10 @@ pub struct CandidateFilter {
     /// Files larger than this are not extracted (default 64 MiB, the extractor's own input
     /// limit).
     pub max_size: u64,
-    /// Folder names skipped wherever they appear (default: `AppData`, `node_modules`,
-    /// `__pycache__`, `$Recycle.Bin`, ...).
+    /// Folder names skipped wherever they appear, lowercase (default: the name index's
+    /// default exclusions, [`athrix_fs_index::exclude::DEFAULT_EXCLUDED_NAMES`] — `.git`,
+    /// `node_modules`, `$Recycle.Bin`, `System Volume Information`, the Windows staging
+    /// folders — plus `AppData`, `__pycache__`, ...).
     pub excluded_dir_names: Vec<String>,
     /// Folder names skipped only right below a drive or file-system root (default:
     /// `Windows`, `Program Files`, `ProgramData`, `Recovery`, ...), so a user folder that
@@ -60,16 +62,17 @@ pub struct CandidateFilter {
     pub skip_dot_files: bool,
 }
 
-const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+/// Folder names the content index skips on top of the name index's defaults
+/// ([`athrix_fs_index::exclude::DEFAULT_EXCLUDED_NAMES`]): application data and package
+/// caches hold no documents worth reading.
+const CONTENT_EXCLUDED_DIRS: &[&str] = &[
     "appdata",
-    "node_modules",
     "__pycache__",
-    "$recycle.bin",
-    "system volume information",
     "bower_components",
     "site-packages",
 ];
 
+/// Folder names skipped right below a drive root: the system and program folders.
 const DEFAULT_EXCLUDED_ROOT_DIRS: &[&str] = &[
     "windows",
     "program files",
@@ -78,12 +81,20 @@ const DEFAULT_EXCLUDED_ROOT_DIRS: &[&str] = &[
     "recovery",
     "perflogs",
     "msocache",
-    "$windows.~bt",
-    "$windows.~ws",
-    "$winreagent",
-    "$sysreset",
     "config.msi",
 ];
+
+/// The default [`CandidateFilter::excluded_dir_names`]: the name index's default exclusions
+/// (shared with the app and the CLI) plus [`CONTENT_EXCLUDED_DIRS`], lowercase.
+fn default_excluded_dir_names() -> Vec<String> {
+    let mut names: Vec<String> = athrix_fs_index::exclude::DEFAULT_EXCLUDED_NAMES
+        .iter()
+        .chain(CONTENT_EXCLUDED_DIRS)
+        .map(|s| s.to_lowercase())
+        .collect();
+    names.dedup();
+    names
+}
 
 const JUNK_SUFFIXES: &[&str] = &[
     ".tmp",
@@ -99,10 +110,7 @@ impl Default for CandidateFilter {
     fn default() -> Self {
         CandidateFilter {
             max_size: 64 * 1024 * 1024,
-            excluded_dir_names: DEFAULT_EXCLUDED_DIRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            excluded_dir_names: default_excluded_dir_names(),
             excluded_root_dirs: DEFAULT_EXCLUDED_ROOT_DIRS
                 .iter()
                 .map(|s| s.to_string())
@@ -261,6 +269,16 @@ mod tests {
         assert!(f.is_excluded_dir(&r.join("repo/.git/objects")));
         assert!(!f.is_excluded_dir(&r.join("Users/a/Documents/Windows")));
         assert!(!f.is_excluded_dir(&r.join("Users/a/Documents")));
+        // The shared defaults, wherever they appear.
+        assert!(f.is_excluded_dir(&r.join("$Recycle.Bin").join("S-1-5")));
+        assert!(f.is_excluded_dir(&r.join("System Volume Information")));
+        assert!(f.is_excluded_dir(&r.join("$WinREAgent").join("Scratch")));
+        for name in athrix_fs_index::exclude::DEFAULT_EXCLUDED_NAMES {
+            assert!(
+                f.excluded_dir_names.contains(&name.to_lowercase()),
+                "{name} shared with the name index"
+            );
+        }
     }
 
     #[test]

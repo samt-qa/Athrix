@@ -12,8 +12,8 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, Weak};
+use std::time::{Duration, Instant};
 
 use athrix_extract::WorkerPool;
 use serde_json::{Value, json};
@@ -50,6 +50,9 @@ documents, file_info for one path, read_text to read a document (only if the use
 Everything is read-only and limited to the folders the user allowed in Athrix → Settings → MCP; \
 the index may lag the disk by a few minutes.";
 
+/// Default of [`ServerOptions::idle_release`]: five minutes.
+pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(5 * 60);
+
 /// Where the server finds its data.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -57,6 +60,21 @@ pub struct ServerOptions {
     pub data_dir: PathBuf,
     /// Where calls are logged (`None`: not logged).
     pub log_file: Option<PathBuf>,
+    /// Free the loaded name snapshot after this long without a search (`None`: keep it).
+    /// A timer thread checks a few times per period; the next search loads it again.
+    pub idle_release: Option<Duration>,
+}
+
+impl ServerOptions {
+    /// Options for `data_dir`, logging to `log_file`, releasing memory after
+    /// [`DEFAULT_IDLE_RELEASE`].
+    pub fn new(data_dir: PathBuf, log_file: Option<PathBuf>) -> ServerOptions {
+        ServerOptions {
+            data_dir,
+            log_file,
+            idle_release: Some(DEFAULT_IDLE_RELEASE),
+        }
+    }
 }
 
 /// The MCP server state. Feed it lines with [`Server::handle_line`] or run it over streams
@@ -64,19 +82,29 @@ pub struct ServerOptions {
 pub struct Server {
     options: ServerOptions,
     log: CallLog,
-    names: Names,
+    /// Shared with the idle timer thread, which frees it when searches stop.
+    names: Arc<Mutex<Names>>,
     worker: OnceLock<WorkerPool>,
 }
 
 impl Server {
     /// A server over `options`.
     pub fn new(options: ServerOptions) -> Server {
+        let names = Arc::new(Mutex::new(Names::default()));
+        if let Some(idle) = options.idle_release {
+            spawn_idle_release(Arc::downgrade(&names), idle);
+        }
         Server {
             log: CallLog::new(options.log_file.clone()),
             options,
-            names: Names::default(),
+            names,
             worker: OnceLock::new(),
         }
+    }
+
+    /// Whether the name snapshot is in memory (for tests and diagnostics).
+    pub fn names_loaded(&self) -> bool {
+        lock(&self.names).is_loaded()
     }
 
     /// Reads messages from `input` line by line until it ends, writing each answer as one line
@@ -208,14 +236,19 @@ impl Server {
             return Ok(tool_error(DISABLED_MESSAGE));
         }
 
+        let mut names = lock(&self.names);
         let mut ctx = Ctx {
             data_dir: &self.options.data_dir,
             config: &config,
             guard: &guard,
-            names: &mut self.names,
+            names: &mut names,
             worker: &self.worker,
         };
         let outcome = tools::call(&mut ctx, name, &args);
+        if names.is_loaded() {
+            names.touch();
+        }
+        drop(names);
         let millis = started.elapsed().as_millis();
         Ok(match outcome {
             Ok(out) => {
@@ -234,6 +267,39 @@ impl Server {
             }
         })
     }
+}
+
+fn lock(names: &Mutex<Names>) -> std::sync::MutexGuard<'_, Names> {
+    // A panic inside a call leaves nothing half-updated that matters: at worst a snapshot
+    // is loaded again.
+    names.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Starts the thread that frees `names` after `idle` without a search. It ends once the
+/// server is dropped.
+fn spawn_idle_release(names: Weak<Mutex<Names>>, idle: Duration) {
+    let tick = (idle / 4).clamp(Duration::from_millis(50), Duration::from_secs(30));
+    let spawned = std::thread::Builder::new()
+        .name("athrix-mcp-idle".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(tick);
+                let Some(names) = names.upgrade() else {
+                    break;
+                };
+                // Never wait behind a running search.
+                let guard = match names.try_lock() {
+                    Ok(n) => Some(n),
+                    Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                    Err(TryLockError::WouldBlock) => None,
+                };
+                if let Some(mut n) = guard {
+                    n.release_if_idle(idle);
+                }
+            }
+        });
+    // Without the thread the snapshot simply stays loaded, as before.
+    drop(spawned);
 }
 
 fn initialize(params: &Value) -> Value {

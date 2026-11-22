@@ -8,23 +8,36 @@
 //! `<app_data>/hashes/dupes.sqlite3`, keyed by path, size and modification time, so the next
 //! `dupe:` search (or "continue the scan" after an incomplete one) reads only new files.
 //!
+//! With `content:` (`dupe: content:عقد ext:pdf`) the candidates are the files the content
+//! search finds instead ([`dupe_search_with`]), at most [`CONTENT_CANDIDATES`] of them:
+//! byte-identical files have the same text, so a copy of a match matches too (when the content
+//! index holds it). Rows keep the `matched` part and snippet the content search gave them.
+//!
 //! Results are the members of each group, adjacent, biggest wasted space first; each row
 //! carries `dupeGroup` / `dupeCount` and the response a [`DupeSummary`].
+//!
+//! After a search the cache is pruned in the background (rows of deleted or resized files,
+//! [`HashCache::prune`]), at most once every [`PRUNE_EVERY`] and within
+//! [`athrix_dedupe::PruneLimits`]' default bounds.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use athrix_dedupe::{Candidate, HashCache, Options};
+use athrix_dedupe::{Candidate, HashCache, Options, PruneLimits};
 use athrix_fs_index::EntryId;
-use athrix_query::{Expr, ExprKind, FilterName, FilterValue, PlanOptions, Query as AstQuery};
+use athrix_query::{
+    Expr, ExprKind, FilterName, FilterValue, PlanOptions, Query as AstQuery, SearchPlan,
+};
 use tauri::{AppHandle, Manager};
 
-use crate::indexing::IndexView;
+use crate::content::ContentService;
+use crate::indexing::{GENERATION_MASK, IndexView};
 use crate::model::{DupeSummary, QueryError, ResultItem};
-use crate::query::{compile_ast, utf16_offset};
-use crate::results::{SearchFailure, SearchScope, build_item, search_ids};
+use crate::query::{CompiledQuery, compile_ast, map_plan_error, utf16_offset};
+use crate::results::{SearchFailure, SearchScope, build_item, decode_id, search_ids};
 use crate::roots::path_key;
 
 /// Folder under the app data dir holding the hash cache.
@@ -38,6 +51,12 @@ pub const TIME_BUDGET: Duration = Duration::from_secs(6);
 
 /// Byte budget of one `dupe:` search (cache hits are free).
 pub const BYTE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Most content matches a `dupe: content:` search looks for duplicates among.
+pub const CONTENT_CANDIDATES: usize = 10_000;
+
+/// Least time between two background prunes of the hash cache.
+pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// Where the cache lives (set at start-up) and the cache once opened.
 static CACHE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -68,6 +87,35 @@ fn cache() -> Option<Arc<HashCache>> {
         }
     }
     slot.clone()
+}
+
+/// When the last background prune started.
+static LAST_PRUNE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Prunes `cache` on a background thread, unless a prune ran less than [`PRUNE_EVERY`] ago.
+fn prune_later(cache: Arc<HashCache>) {
+    {
+        let mut last = LAST_PRUNE.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|t| t.elapsed() < PRUNE_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let spawned = std::thread::Builder::new()
+        .name("dupe-cache-prune".to_owned())
+        .spawn(move || match cache.prune(&PruneLimits::default()) {
+            Ok(r) => tracing::debug!(
+                checked = r.checked,
+                removed = r.removed,
+                wrapped = r.wrapped,
+                vacuumed = r.vacuumed,
+                "duplicate hash cache pruned"
+            ),
+            Err(e) => tracing::warn!(error = %e, "cannot prune the duplicate hash cache"),
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot start the duplicate hash cache prune");
+    }
 }
 
 /// Results of a `dupe:` search.
@@ -160,8 +208,8 @@ fn dupe_error(text: &str, e: &Expr, kind: &str, message: &str) -> QueryError {
     }
 }
 
-/// Runs a `dupe:` search: `rest` (the query without `dupe:`, see [`split_dupe`]) picks the
-/// candidates under `scope`; returns the duplicate groups among them, at most `limit` rows.
+/// Runs a `dupe:` search on names only: [`dupe_search_with`] without a content service, so
+/// `content:` in `rest` is an error of kind `DupeWithContent`.
 pub fn dupe_search(
     view: &IndexView,
     text: &str,
@@ -170,21 +218,42 @@ pub fn dupe_search(
     scope: Option<&SearchScope>,
     cancel: &AtomicBool,
 ) -> Result<DupeHits, DupeFailure> {
-    // Content filters need the content index, which has no notion of duplicates yet.
-    if let Ok(plan) = athrix_query::plan(rest, &PlanOptions::default()) {
-        if plan.uses_content() {
+    dupe_search_with(view, None, text, rest, limit, scope, cancel)
+}
+
+/// Runs a `dupe:` search: `rest` (the query without `dupe:`, see [`split_dupe`]) picks the
+/// candidates under `scope`, through `content` when it uses `content:`; returns the duplicate
+/// groups among them, at most `limit` rows.
+pub fn dupe_search_with(
+    view: &IndexView,
+    content: Option<&ContentService>,
+    text: &str,
+    rest: &AstQuery,
+    limit: usize,
+    scope: Option<&SearchScope>,
+    cancel: &AtomicBool,
+) -> Result<DupeHits, DupeFailure> {
+    let plan = athrix_query::plan(rest, &PlanOptions::default())
+        .map_err(|e| DupeFailure::Invalid(map_plan_error(text, &e)))?;
+    let (ids, mut rows) = if plan.uses_content() {
+        let Some(content) = content else {
             return Err(DupeFailure::Invalid(QueryError {
-                message: "`dupe:` cannot be combined with `content:` yet".to_owned(),
+                message: "`dupe:` with `content:` needs the content index".to_owned(),
                 kind: "DupeWithContent".to_owned(),
                 start: 0,
                 end: text.encode_utf16().count(),
                 suggestion: None,
             }));
-        }
-    }
-    let query = compile_ast(text, rest).map_err(DupeFailure::Invalid)?;
-    let all = view.id_bound().saturating_add(1);
-    let ids = search_ids(view, &query.query, all, scope, cancel).map_err(DupeFailure::Search)?;
+        };
+        let (ids, rows) = content_candidates(view, content, text, &plan, scope, cancel)?;
+        (ids, Rows::Built(rows))
+    } else {
+        let query = compile_ast(text, rest).map_err(DupeFailure::Invalid)?;
+        let all = view.id_bound().saturating_add(1);
+        let ids =
+            search_ids(view, &query.query, all, scope, cancel).map_err(DupeFailure::Search)?;
+        (ids, Rows::Query(query))
+    };
     let (ids, candidates) = candidates(view, ids, cancel).map_err(DupeFailure::Search)?;
     let cache = cache();
     let options = Options {
@@ -194,6 +263,9 @@ pub fn dupe_search(
     };
     let report = athrix_dedupe::find_duplicates(&candidates, cache.as_deref(), &options, cancel)
         .map_err(|_| DupeFailure::Search(SearchFailure::Cancelled))?;
+    if let Some(cache) = cache {
+        prune_later(cache);
+    }
     let mut items = Vec::new();
     let mut truncated = false;
     let generation = view.generation();
@@ -208,7 +280,14 @@ pub fn dupe_search(
             if cancel.load(Ordering::Relaxed) {
                 return Err(DupeFailure::Search(SearchFailure::Cancelled));
             }
-            let mut item = build_item(view, generation, ids[m], &query);
+            let id = ids[m];
+            let mut item = match &mut rows {
+                Rows::Query(query) => build_item(view, generation, id, query),
+                Rows::Built(built) => match built.remove(&id) {
+                    Some(item) => item,
+                    None => continue,
+                },
+            };
             item.dupe_group = Some(group_id);
             item.dupe_count = Some(count);
             items.push(item);
@@ -226,6 +305,60 @@ pub fn dupe_search(
         truncated,
         summary,
     })
+}
+
+/// How result rows are made: from the name query, or already built by the content search.
+enum Rows {
+    Query(CompiledQuery),
+    Built(HashMap<EntryId, ResultItem>),
+}
+
+/// The entries the content search finds for `plan` (at most [`CONTENT_CANDIDATES`]), and
+/// their rows (with `matched` and, for the first ones, a snippet).
+fn content_candidates(
+    view: &IndexView,
+    content: &ContentService,
+    text: &str,
+    plan: &SearchPlan,
+    scope: Option<&SearchScope>,
+    cancel: &AtomicBool,
+) -> Result<(Vec<EntryId>, HashMap<EntryId, ResultItem>), DupeFailure> {
+    let name = match plan {
+        SearchPlan::NameAndContent { name, .. } => name.as_ref(),
+        SearchPlan::NameOrContent { name, .. } => Some(name),
+        SearchPlan::Name(_) | SearchPlan::Empty => None,
+    };
+    let name_query = name
+        .map(|q| compile_ast(text, q))
+        .transpose()
+        .map_err(DupeFailure::Invalid)?;
+    let hits = content
+        .search(
+            view,
+            plan,
+            name_query.as_ref(),
+            CONTENT_CANDIDATES,
+            scope,
+            cancel,
+        )
+        .map_err(DupeFailure::Search)?;
+    if hits.truncated {
+        tracing::debug!(
+            limit = CONTENT_CANDIDATES,
+            "dupe: with content: looks at the first content matches only"
+        );
+    }
+    let generation = view.generation() & GENERATION_MASK;
+    let mut ids = Vec::with_capacity(hits.items.len());
+    let mut rows = HashMap::with_capacity(hits.items.len());
+    for item in hits.items {
+        if let Some((g, id)) = decode_id(item.id) {
+            if g == generation && rows.insert(id, item).is_none() {
+                ids.push(id);
+            }
+        }
+    }
+    Ok((ids, rows))
 }
 
 /// The files among `ids` that may have a copy: not folders, not empty, and of a size shared
@@ -381,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn content_with_dupe_is_rejected() {
+    fn content_without_a_content_service_is_an_error() {
         let (_dir, view) = fixture();
         let text = "dupe: content:x";
         let ast = athrix_query::parse(text).unwrap();
@@ -390,5 +523,72 @@ mod tests {
             Err(DupeFailure::Invalid(e)) => assert_eq!(e.kind, "DupeWithContent"),
             other => panic!("{other:?}"),
         }
+        // A content filter the planner refuses is reported as such.
+        let text = "dupe: <a | content:x>";
+        let ast = athrix_query::parse(text).unwrap();
+        let rest = split_dupe(text, &ast).unwrap().unwrap();
+        match dupe_search(&view, text, &rest, 10, None, &AtomicBool::new(false)) {
+            Err(DupeFailure::Invalid(e)) => assert_eq!(e.kind, "ContentInOr"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_picks_the_candidates() {
+        use crate::content::{ContentService, test_options};
+        use crate::indexing::IndexObserver;
+
+        // Not under a dot folder (`.tmp…`): the content indexer skips hidden folders.
+        let dir = tempfile::Builder::new()
+            .prefix("athrix-dupe-")
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("copies")).unwrap();
+        let contract = "عقد الإيجار السنوي للشقة";
+        fs::write(root.join("contract.txt"), contract).unwrap();
+        fs::write(root.join("copies/contract (1).txt"), contract).unwrap();
+        fs::write(root.join("copies/contract (2).txt"), contract).unwrap();
+        // Same size and words, other bytes: not a copy.
+        fs::write(root.join("other.txt"), "عقد الإيجار السنوي للشقه").unwrap();
+        // Copies of a text without the words: not candidates.
+        fs::write(root.join("notes1.txt"), "shopping list").unwrap();
+        fs::write(root.join("notes2.txt"), "shopping list").unwrap();
+        let roots = vec![root.to_path_buf()];
+        let opts = walk_options(&roots);
+        let live = LiveIndex::new(walk(&opts).unwrap(), &opts).unwrap();
+        let view = Arc::new(IndexView::new(1, live.snapshot(), &roots));
+        let app = tempfile::tempdir().unwrap();
+        let content = ContentService::new(test_options());
+        content.configure(app.path());
+        content.base_ready(&view);
+        assert!(content.wait_idle(Duration::from_secs(60)));
+
+        let run = |text: &str| {
+            let ast = athrix_query::parse(text).unwrap();
+            let rest = split_dupe(text, &ast).unwrap().unwrap();
+            let no = AtomicBool::new(false);
+            dupe_search_with(&view, Some(&content), text, &rest, 50, None, &no)
+                .unwrap_or_else(|e| panic!("{text}: {e:?}"))
+        };
+        let h = run("dupe: content:الإيجار");
+        let mut got: Vec<String> = h.items.iter().map(|i| i.name.clone()).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            ["contract (1).txt", "contract (2).txt", "contract.txt"]
+        );
+        assert!(
+            h.items
+                .iter()
+                .all(|i| i.dupe_group == Some(1) && i.dupe_count == Some(3))
+        );
+        assert_eq!(h.summary.groups, 1);
+        // Names narrow the content matches further.
+        let h = run("dupe: content:الإيجار path:copies");
+        assert_eq!(h.items.len(), 2, "{:?}", h.items);
+        // No content match: no groups, although other copies exist.
+        assert!(run("dupe: content:غيرموجود").items.is_empty());
+        content.shutdown();
     }
 }

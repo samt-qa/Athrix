@@ -11,6 +11,11 @@
 //   fails when the file is missing, so run this script once after a fresh checkout
 //   (`npm run worker`) before `cargo build -p athrix-desktop`.
 // - `tauri build` installs it next to Athrix.exe (without the triple suffix).
+// - A plain `cargo build --workspace` also builds the worker crate's binary into target/<profile>/,
+//   WITHOUT the pdf feature, over the copy tauri-build put there. Debug builds of the app detect
+//   that (the worker's `--version` says `pdf: false`) and run the staged file in
+//   src-tauri/binaries/ instead (see src-tauri/src/pdf_worker.rs), so this script's output is
+//   what dev always uses. Release builds only look beside the executable.
 //
 // Why separate cargo invocations and target dir: cargo features are per package, so building
 // the worker with `--features pdf` in the same invocation as the app (or as athrix-mcp, which

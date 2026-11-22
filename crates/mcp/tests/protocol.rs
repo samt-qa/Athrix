@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use athrix_content_index::{ContentIndex, FileMeta};
 use athrix_fs_index::{WalkOptions, walk};
@@ -91,10 +92,10 @@ impl Fixture {
     }
 
     fn server(&self) -> Server {
-        Server::new(ServerOptions {
-            data_dir: self.data.clone(),
-            log_file: Some(self.log.clone()),
-        })
+        Server::new(ServerOptions::new(
+            self.data.clone(),
+            Some(self.log.clone()),
+        ))
     }
 }
 
@@ -305,6 +306,36 @@ fn name_search_sees_only_allowed_folders() {
     assert!(is_error);
     let (is_error, _) = call(&mut s, "search_files", json!({ "nope": 1 }));
     assert!(is_error);
+}
+
+#[test]
+fn idle_server_frees_the_name_index_and_reloads_it() {
+    let f = Fixture::new();
+    f.enable(false);
+    let mut s = Server::new(ServerOptions {
+        idle_release: Some(Duration::from_millis(200)),
+        ..ServerOptions::new(f.data.clone(), None)
+    });
+    assert!(!s.names_loaded());
+    let (_, r) = call(&mut s, "search_files", json!({ "query": "report" }));
+    assert_eq!(result_names(&r).len(), 2);
+    assert!(s.names_loaded());
+    let started = Instant::now();
+    while s.names_loaded() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!s.names_loaded(), "released after the idle period");
+    let (_, r) = call(&mut s, "search_files", json!({ "query": "report" }));
+    assert_eq!(result_names(&r).len(), 2, "loaded again on demand");
+
+    // Switched off: it stays.
+    let mut kept = Server::new(ServerOptions {
+        idle_release: None,
+        ..ServerOptions::new(f.data.clone(), None)
+    });
+    call(&mut kept, "search_files", json!({ "query": "report" }));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(kept.names_loaded());
 }
 
 #[test]

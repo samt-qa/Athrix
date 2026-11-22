@@ -462,7 +462,7 @@ fn write_choice(file: &Path, choice: &RootsChoice) -> io::Result<()> {
 }
 
 /// Writes `bytes` to a temporary file next to `file`, then renames it over `file`.
-fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
     }

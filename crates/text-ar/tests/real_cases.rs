@@ -7,8 +7,8 @@ use athrix_text_ar::{find_in_name, normalize_name, swap_layout, tokenize};
 ///
 /// Name search uses the nass `Search` level: harakat, tatweel and invisible marks are ignored,
 /// أ/إ/آ/ٱ = ا, ى = ي, Persian ک/ی = ك/ي, Arabic-Indic and Persian digits = ASCII digits,
-/// punctuation = space, Latin is case-insensitive. ة and ه, and the hamza seats ؤ/ئ, stay
-/// distinct (that folding is the content index's `Loose` level).
+/// punctuation = space, Latin is case-insensitive. On top of that, names fold ة = ه, ؤ = و and
+/// ئ = ي like content search's `Loose` level (decision 7); the standalone hamza ء is kept.
 const NAME_CASES: &[(&str, &str, Option<&str>)] = &[
     // Hamza forms of alef.
     ("أحمد - السيرة الذاتية.pdf", "احمد", Some("أحمد")),
@@ -61,9 +61,16 @@ const NAME_CASES: &[(&str, &str, Option<&str>)] = &[
     // ZWNJ / RLM inside a name (copied from a Persian keyboard or an RTL editor).
     ("می\u{200C}خواهم.txt", "میخواهم", Some("می\u{200C}خواهم")),
     ("\u{200F}تقرير\u{200F}.pdf", "تقرير", Some("تقرير\u{200F}")),
+    // Taa marbuta and hamza seats, either way round.
+    ("فاتورة.pdf", "فاتوره", Some("فاتورة")),
+    ("فاتوره.pdf", "فاتورة", Some("فاتوره")),
+    ("مؤتمر.pdf", "موتمر", Some("مؤتمر")),
+    ("تقرير المسؤول.docx", "مسوول", Some("مسؤول")),
+    ("مسوول المبيعات.xlsx", "مسؤول", Some("مسوول")),
+    ("مسئولية.pdf", "مسيولية", Some("مسئولية")),
+    ("مُحَاضَرَةُ الفِقْهِ.pdf", "محاضره", Some("مُحَاضَرَةُ")),
     // Must NOT match: different letters.
-    ("فاتورة.pdf", "فاتوره", None),
-    ("مؤتمر.pdf", "موتمر", None),
+    ("ماء.pdf", "ما ء", None),
     ("تقرير.pdf", "تقارير", None),
     ("عقد.pdf", "عقود", None),
 ];
@@ -151,7 +158,19 @@ const SAME_KEY: &[&[&str]] = &[
     &["کتاب", "كتاب", "كِتَاب"],
     &["Report", "REPORT", "report"],
     &["عقد_الإيجار", "عقد الايجار", "عقد-الإيجار"],
+    // Taa marbuta and hamza seats fold like content search (decision 7, 2026-11-22).
+    &["فاتورة", "فاتوره", "فَاتُورَة", "فاتـورة"],
+    &["مسؤول", "مسوول", "مَسْؤُول"],
+    &["مسئول", "مسيول"],
+    &["مكتبة الجامعة", "مكتبه الجامعه"],
 ];
+
+/// Names that must stay apart: the standalone hamza is not deleted in names.
+#[test]
+fn standalone_hamza_is_kept_in_names() {
+    assert_ne!(normalize_name("ماء"), normalize_name("ما"));
+    assert_ne!(normalize_name("جزء"), normalize_name("جز"));
+}
 
 #[test]
 fn normalization_groups() {

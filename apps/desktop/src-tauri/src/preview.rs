@@ -618,22 +618,8 @@ mod tests {
         // The staged worker, not the copy beside the test binary: `cargo test --workspace`
         // also builds the worker crate (without `pdf`) into `target/<profile>/`, and newer
         // cargo puts test binaries in another directory.
-        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
-        let program = fs::read_dir(&staged)
-            .ok()
-            .and_then(|dir| {
-                dir.flatten().map(|e| e.path()).find(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("athrix-extract-worker-"))
-                })
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no worker in {}: run `npm run worker` in apps/desktop",
-                    staged.display()
-                )
-            });
+        let program = crate::pdf_worker::staged_worker()
+            .expect("no staged worker: run `npm run worker` in apps/desktop");
         let mut config = athrix_extract::WorkerConfig::default();
         config.program = Some(program);
         let pool = WorkerPool::new(config);

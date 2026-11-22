@@ -1,12 +1,12 @@
 // "Understood as": the one-line suggestion under the search field when the user types plain
 // Arabic or English («ملفات PDF من الأسبوع الماضي أكبر من 5 ميجا») that reads as filters
 // (`interpret_query`, task 6.8). Never rewrites the text silently: Tab or the button applies
-// the suggestion, Esc dismisses it (remembered for that exact text). With the setting
+// the suggestion, Esc dismisses it (remembered for that exact text, across restarts). With the setting
 // «تطبيق التفسير تلقائيًا» on, it applies itself after a pause and Esc undoes it.
 import { createEffect, createSignal, on, onCleanup, Show } from "solid-js";
 import { t } from "../i18n";
 import { api, type Interpretation } from "../lib/api";
-import { storedFlag } from "../lib/storage";
+import { storedFlag, storedSet } from "../lib/storage";
 
 /** «تطبيق التفسير تلقائيًا» (default off), shared by both windows. */
 export const [autoInterpret, setAutoInterpret] = storedFlag("autoInterpret", false);
@@ -29,10 +29,10 @@ const DEBOUNCE_MS = 150;
 /** Extra idle time before an automatic apply, so it never lands mid-word. */
 const AUTO_APPLY_MS = 700;
 
-// Texts whose suggestion was dismissed (this session; capped).
-const dismissed = new Set<string>();
+// Texts whose suggestion was dismissed or applied: never offered again. Kept in local storage
+// (the most recent 300), so a dismissal survives a restart and holds in both windows.
+const dismissed = storedSet("interpretDismissed", 300);
 function dismiss(text: string) {
-  if (dismissed.size > 500) dismissed.clear();
   dismissed.add(text);
 }
 

@@ -206,7 +206,10 @@ fn search(ctx: &mut Ctx<'_>, args: &Value, content_mode: bool) -> Result<ToolOut
     }
     // Nothing (or a query error): try it as a natural-language request («ملفات PDF من الأسبوع
     // الماضي», "photos from last year") rewritten into the filter syntax.
-    let options = InterpretOptions { today: today() };
+    let options = InterpretOptions {
+        today: today(),
+        ..Default::default()
+    };
     if let Some(found) = interpret_with(text, &options) {
         if found.query.trim() != text {
             if let Ok(mut out) = run_query(ctx, &found.query, limit, content_mode) {

@@ -26,6 +26,7 @@
 //! Still to come (see `docs/03-PROGRESS-TRACKER.md`, M1/M2): USN journal replay and general
 //! ranking.
 
+pub mod exclude;
 mod exec;
 mod fuzzy;
 mod index;
@@ -40,5 +41,5 @@ pub use exec::kind_extensions;
 pub use index::{EntryId, EntryMeta, FileIndex, IndexBuilder};
 pub use live::{ApplyStats, Change, IndexSnapshot, LiveIndex};
 pub use search::{Query, QueryError};
-pub use walk::{WalkOptions, walk};
+pub use walk::{WalkOptions, WalkStats, walk, walk_with_stats};
 pub use watch::{WatchBatch, WatchConfig, Watcher};

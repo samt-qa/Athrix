@@ -301,7 +301,7 @@ mod tests {
         let ix = b.finish();
         assert_eq!(ix.len(), 3);
         assert_eq!(ix.name(file), "مُحَاضَرَةُ.PDF");
-        assert_eq!(ix.normalized_name(file), "محاضرة pdf");
+        assert_eq!(ix.normalized_name(file), "محاضره pdf");
         assert_eq!(ix.parent(file), Some(docs));
         assert_eq!(ix.parent(root), None);
         assert!(ix.meta(docs).is_dir);

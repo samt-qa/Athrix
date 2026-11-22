@@ -37,20 +37,6 @@ const USAGE: &str = "usage:
       extract documents under the roots into a scratch content index, then time content
       queries (see docs/PERF-AUDIT.md)";
 
-/// Same defaults as the desktop app (`apps/desktop/src-tauri/src/indexing.rs`), so CLI
-/// measurements index what the app indexes.
-const DEFAULT_EXCLUDED_NAMES: [&str; 8] = [
-    ".git",
-    "node_modules",
-    "$RECYCLE.BIN",
-    "System Volume Information",
-    "$WinREAgent",
-    "$Windows.~BT",
-    "$Windows.~WS",
-    "$SysReset",
-];
-const DEFAULT_EXCLUDED_PATH_GLOBS: [&str; 2] = ["**/AppData/Local/Temp", "**/Windows/WinSxS"];
-
 fn main() -> ExitCode {
     athrix_core::logging::init("warn");
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -143,14 +129,11 @@ fn cmd_index(args: &[String]) -> Result<ExitCode, CliError> {
     if roots.is_empty() {
         return Err(usage("index needs at least one root"));
     }
+    // The same defaults as the desktop app (`athrix_fs_index::exclude`), so CLI measurements
+    // index what the app indexes.
     let mut opts = WalkOptions::new(&roots);
     if defaults {
-        for g in DEFAULT_EXCLUDED_NAMES
-            .iter()
-            .chain(&DEFAULT_EXCLUDED_PATH_GLOBS)
-        {
-            opts = opts.exclude_glob(*g);
-        }
+        opts = opts.with_default_exclusions();
     }
     for g in excludes {
         opts = opts.exclude_glob(g);

@@ -6,7 +6,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageError, ImageFormat, ImageReader, Limits};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, Limits};
 
 use crate::ImageHash;
 use crate::exif::jpeg_thumbnail;
@@ -102,15 +103,24 @@ pub fn hash_bytes(bytes: &[u8]) -> Result<ImageHash, HashError> {
 }
 
 /// Hashes a decoded image: 32×32 grey levels (transparent pixels count as white), then
-/// the DCT pHash (see the crate docs).
+/// the DCT pHash (see the crate docs). The image is taken as it is stored: files go through
+/// [`hash_file`] / [`hash_bytes`], which also apply their EXIF orientation.
 pub fn hash_image(image: &DynamicImage) -> ImageHash {
+    hash_oriented(image, Orientation::NoTransforms)
+}
+
+/// [`hash_image`] of `image` turned upright by `orientation` (its EXIF orientation). The
+/// turn is applied to the 32×32 thumbnail, which is the same as turning the picture first
+/// (the shrink is symmetric) without copying a big picture.
+fn hash_oriented(image: &DynamicImage, orientation: Orientation) -> ImageHash {
     let side = SIDE as u32;
-    let small = if image.width() >= side && image.height() >= side {
+    let mut small = if image.width() >= side && image.height() >= side {
         // A fast area average: fine (and much quicker) for shrinking.
         image.thumbnail_exact(side, side)
     } else {
         image.resize_exact(side, side, FilterType::Triangle)
     };
+    small.apply_orientation(orientation);
     let rgba = small.to_rgba8();
     let mut grey = [0.0f32; SIDE * SIDE];
     for (out, px) in grey.iter_mut().zip(rgba.pixels()) {
@@ -122,7 +132,8 @@ pub fn hash_image(image: &DynamicImage) -> ImageHash {
     phash(&grey)
 }
 
-/// Decodes with limits and hashes; a decoder panic (malformed data) is a [`HashError::Decode`].
+/// Decodes with limits and hashes upright (EXIF orientation applied); a decoder panic
+/// (malformed data) is a [`HashError::Decode`].
 fn decode_and_hash<R: io::BufRead + Seek>(
     mut reader: ImageReader<R>,
 ) -> Result<ImageHash, HashError> {
@@ -134,10 +145,15 @@ fn decode_and_hash<R: io::BufRead + Seek>(
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let decoded = catch_unwind(AssertUnwindSafe(move || reader.decode()))
-        .map_err(|_| HashError::Decode("the decoder failed".to_owned()))?;
-    let image = decoded.map_err(map_error)?;
-    Ok(hash_image(&image))
+    let decoded = catch_unwind(AssertUnwindSafe(move || {
+        let mut decoder = reader.into_decoder()?;
+        // A broken EXIF block must not lose the picture: read it as stored.
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        DynamicImage::from_decoder(decoder).map(|image| (image, orientation))
+    }))
+    .map_err(|_| HashError::Decode("the decoder failed".to_owned()))?;
+    let (image, orientation) = decoded.map_err(map_error)?;
+    Ok(hash_oriented(&image, orientation))
 }
 
 fn map_error(e: ImageError) -> HashError {
@@ -153,10 +169,17 @@ fn map_error(e: ImageError) -> HashError {
 /// picture's shape. `None` means "decode the whole picture instead".
 fn exif_thumbnail_hash(prefix: &[u8]) -> Option<ImageHash> {
     let thumb_bytes = jpeg_thumbnail(prefix)?;
-    // The picture's size, from its frame header (no pixels decoded).
-    let (w, h) = ImageReader::with_format(Cursor::new(prefix), ImageFormat::Jpeg)
-        .into_dimensions()
-        .ok()?;
+    // The picture's size and orientation, from its headers (no pixels decoded). The
+    // thumbnail is stored the same way round as the picture.
+    let (w, h, orientation) = catch_unwind(|| {
+        let mut decoder = ImageReader::with_format(Cursor::new(prefix), ImageFormat::Jpeg)
+            .into_decoder()
+            .ok()?;
+        let (w, h) = decoder.dimensions();
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        Some((w, h, orientation))
+    })
+    .ok()??;
     let thumb =
         catch_unwind(|| image::load_from_memory_with_format(thumb_bytes, ImageFormat::Jpeg))
             .ok()?
@@ -170,13 +193,13 @@ fn exif_thumbnail_hash(prefix: &[u8]) -> Option<ImageHash> {
     if ((aspect - thumb_aspect) / aspect).abs() > MAX_ASPECT_DIFFERENCE {
         return None;
     }
-    Some(hash_image(&thumb))
+    Some(hash_oriented(&thumb, orientation))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exif::with_exif_thumbnail;
+    use crate::exif::{with_exif, with_exif_thumbnail};
     use image::{Rgb, RgbImage, Rgba, RgbaImage};
 
     /// A smooth test picture: a few blobs and gradients, `seed` choosing the layout.
@@ -338,6 +361,70 @@ mod tests {
             exif_thumbnail_hash(&with_exif_thumbnail(&main, &wide)),
             None
         );
+    }
+
+    /// Each EXIF orientation tag (1–8) and how the stored pixels relate to the upright
+    /// picture: stored = inverse of the turn the tag asks for.
+    fn stored_for(upright: &DynamicImage, tag: u16) -> DynamicImage {
+        match tag {
+            2 => upright.fliph(),
+            3 => upright.rotate180(),
+            4 => upright.flipv(),
+            5 => upright.fliph().rotate270(),
+            6 => upright.rotate270(),
+            7 => upright.fliph().rotate90(),
+            8 => upright.rotate90(),
+            _ => upright.clone(),
+        }
+    }
+
+    #[test]
+    fn exif_orientation_is_applied_before_hashing() {
+        let upright = DynamicImage::ImageRgb8(picture(400, 300, 5));
+        let h = hash_image(&upright);
+        for tag in 1..=8u16 {
+            let stored = jpeg(&stored_for(&upright, tag), 92);
+            let tagged = with_exif(&stored, Some(tag), None);
+            let d = hash_bytes(&tagged).unwrap().distance(h);
+            assert!(d <= 4, "orientation {tag}: {d} bits from the upright copy");
+            if tag != 1 {
+                // Without the tag the stored pixels are a different picture.
+                let raw = hash_bytes(&stored).unwrap().distance(h);
+                assert!(
+                    raw > crate::GROUP_MAX_DISTANCE,
+                    "orientation {tag}: only {raw}"
+                );
+            }
+        }
+        // Through a file too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phone.jpg");
+        std::fs::write(
+            &path,
+            with_exif(&jpeg(&stored_for(&upright, 6), 92), Some(6), None),
+        )
+        .unwrap();
+        assert!(hash_file(&path).unwrap().distance(h) <= 4);
+        // A bogus orientation value is ignored, not an error.
+        let odd = with_exif(&jpeg(&upright, 92), Some(77), None);
+        assert!(hash_bytes(&odd).unwrap().distance(h) <= 4);
+    }
+
+    #[test]
+    fn exif_thumbnails_are_turned_like_the_picture() {
+        let upright = DynamicImage::ImageRgb8(picture(1200, 900, 6));
+        let stored = stored_for(&upright, 6);
+        let main = jpeg(&stored, 98);
+        let thumb = jpeg(&stored.resize_exact(120, 160, FilterType::Triangle), 85);
+        let mut big = with_exif(&main, Some(6), Some(&thumb));
+        let comment = [&[0xFF, 0xFE, 0xFF, 0xF0][..], &[b' '; 0xFFEE][..]].concat();
+        while (big.len() as u64) < EXIF_THUMBNAIL_MIN_BYTES {
+            let at = big.len() - main.len() + 2;
+            big.splice(at..at, comment.iter().copied());
+        }
+        let from_thumb = exif_thumbnail_hash(&big).expect("thumbnail used");
+        assert!(from_thumb.distance(hash_image(&upright)) <= 4);
+        assert_eq!(hash_bytes(&big).unwrap(), from_thumb);
     }
 
     #[test]

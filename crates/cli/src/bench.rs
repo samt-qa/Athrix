@@ -158,7 +158,10 @@ fn suggestion_probes(index: &FileIndex, text: &str, query: &Query, limit: usize,
         let Ok(q) = Query::compile(&ast) else {
             continue;
         };
-        if index.search(&q, limit, c).is_ok_and(|ids| !ids.is_empty()) {
+        if index
+            .search(&q.unordered(), limit, c)
+            .is_ok_and(|ids| !ids.is_empty())
+        {
             return;
         }
     }
@@ -273,14 +276,7 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
 
 /// Default exclusions while picking documents (same intent as `index`).
 fn corpus_walk_options(roots: &[PathBuf]) -> WalkOptions {
-    let mut opts = WalkOptions::new(roots);
-    for g in crate::DEFAULT_EXCLUDED_NAMES
-        .iter()
-        .chain(&crate::DEFAULT_EXCLUDED_PATH_GLOBS)
-    {
-        opts = opts.exclude_glob(*g);
-    }
-    opts
+    WalkOptions::new(roots).with_default_exclusions()
 }
 
 fn bench_content(args: &[String]) -> Result<std::process::ExitCode, CliError> {

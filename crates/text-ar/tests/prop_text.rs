@@ -144,6 +144,42 @@ proptest! {
         prop_assert!(n.source_range(0..n.text.len() + 1).is_none());
     }
 
+    /// Names never keep the letters that name search folds (ة ؤ ئ), and swapping any of them
+    /// for its folded letter in the original gives the same key.
+    #[test]
+    fn taa_marbuta_and_hamza_seats_fold(s in tricky_string(60)) {
+        prop_assume!(!has_tatweel_form(&s));
+        let n = normalize_name(&s);
+        prop_assert!(!n.contains(['ة', 'ؤ', 'ئ']), "{:?} -> {:?}", s, n);
+        let swapped: String = s.chars().map(|c| match c {
+            'ة' => 'ه',
+            'ؤ' => 'و',
+            'ئ' => 'ي',
+            c => c,
+        }).collect();
+        prop_assert_eq!(normalize_name(&swapped), n);
+    }
+
+    /// A query with a folded letter highlights the original spelling, and vice versa.
+    #[test]
+    fn folded_spelling_is_highlighted(
+        before in arabic_word(5),
+        stem in arabic_word(5),
+        pick in prop::sample::select(&[('ة', 'ه'), ('ؤ', 'و'), ('ئ', 'ي')][..]),
+        swap in any::<bool>(),
+    ) {
+        let (orig, alt) = if swap { (pick.1, pick.0) } else { (pick.0, pick.1) };
+        let word = format!("{stem}{orig}");
+        let name = format!("{before} {word}.pdf");
+        let q = format!("{stem}{alt}");
+        let ms = find_in_name(&name, &q);
+        let start = before.len() + 1;
+        prop_assert!(
+            ms.iter().any(|m| m.start <= start && m.end >= start + word.len()),
+            "{:?} in {:?}: {:?}", q, name, ms
+        );
+    }
+
     /// Matches returned for highlighting are on char boundaries, in order, non-overlapping,
     /// and normalize to the query.
     #[test]

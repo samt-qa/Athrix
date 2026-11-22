@@ -39,12 +39,18 @@
 //! folders and the many files without text never cost anything. That is 12 bytes per
 //! content-candidate file (a few MB for a few hundred thousand documents), the same per-entry
 //! cost as the live index's own child table, and much less than a `path → id` map of strings
-//! (100+ bytes per entry). A lookup is a binary search plus one path rebuild to rule out hash
-//! collisions. Entries added since the base (the live delta, bounded by compaction) are
-//! resolved through a small `path key → id` map built per view, only when a hit is not in the
-//! base. Building the table costs one path rebuild per candidate file; it happens on the
-//! indexing thread when a base becomes ready (or on the first content search after a
-//! compaction).
+//! (100+ bytes per entry). A lookup is a binary search plus one path key rebuilt from the
+//! entry's ancestors (`entry_key`) to rule out hash collisions. Entries added since the base
+//! (the live delta, bounded by compaction) are resolved through a small `path key → id` map
+//! built per view, only when a hit is not in the base. Building the table costs one path key
+//! per candidate file, the parent's key reused while consecutive files share it (walk order);
+//! it happens on the indexing thread when a base becomes ready (or on the first content
+//! search after a compaction).
+//!
+//! Measured on a real 7.35M-entry index (2.2M candidate files, a busy machine): 10,000
+//! lookups (the most an `AND` plan maps) take 22–27 ms, the table is 25 MiB (+256 KiB of
+//! bucket starts) and builds in about 3 s. Rebuilding a `PathBuf` per lookup and per table
+//! key, and binary-searching the whole table, as before, took 67–85 ms and 8 s.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -575,7 +581,7 @@ impl ContentService {
         let mut drives: HashMap<u8, bool> = HashMap::new();
         let started = Instant::now();
         let removed = index.retain(|path, _| {
-            let key = path_key(Path::new(path));
+            let key = str_key(path);
             offline.iter().any(|o| key_has_prefix(&key, o))
                 || !drive_present(path, &mut drives)
                 || self.find_file(view, &lookup, &mut delta, &key).is_some()
@@ -599,11 +605,12 @@ impl ContentService {
         delta: &mut Option<Arc<DeltaMap>>,
         key: &str,
     ) -> Option<EntryId> {
+        let mut buf = String::with_capacity(key.len());
         let mut found = lookup
             .candidates(key_hash(key))
             .iter()
             .copied()
-            .find(|&id| view.contains(id) && path_key(&view.path(id)) == key);
+            .find(|&id| view.contains(id) && entry_key(&**view, id, &mut buf) == key);
         if found.is_none() && view.delta_entries() > 0 {
             found = delta
                 .get_or_insert_with(|| self.delta_for(view))
@@ -974,11 +981,21 @@ struct PathLookup {
     base: Weak<FileIndex>,
     hashes: Vec<u64>,
     ids: Vec<EntryId>,
+    /// `starts[b]..starts[b + 1]`: the part of `hashes` whose top [`BUCKET_BITS`] bits are
+    /// `b`, so a lookup binary-searches a few dozen hashes instead of millions (256 KiB, and
+    /// most of the cache misses of a lookup saved).
+    starts: Vec<u32>,
 }
+
+/// Top bits of a path hash that pick its bucket in [`PathLookup`].
+const BUCKET_BITS: u32 = 16;
 
 impl PathLookup {
     fn build(base: &Arc<FileIndex>) -> Self {
         let mut pairs: Vec<(u64, EntryId)> = Vec::new();
+        // The key of the last parent seen: files of one folder are consecutive in walk order.
+        let mut parent_key: Option<(EntryId, String)> = None;
+        let mut key = String::new();
         for id in 0..base.len() {
             let Ok(id) = EntryId::try_from(id) else {
                 break;
@@ -986,14 +1003,42 @@ impl PathLookup {
             if base.meta(id).is_dir || Kind::from_path(Path::new(base.name(id))).is_none() {
                 continue;
             }
-            pairs.push((key_hash(&path_key(&base.path(id))), id));
+            match base.parent(id) {
+                Some(p) => {
+                    if parent_key.as_ref().is_none_or(|(cached, _)| *cached != p) {
+                        let mut pk = String::new();
+                        entry_key(&**base, p, &mut pk);
+                        parent_key = Some((p, pk));
+                    }
+                    let (_, pk) = parent_key.as_ref().expect("just set");
+                    key.clear();
+                    key.push_str(pk);
+                    key.push('/');
+                    push_key_chars(&mut key, base.name(id));
+                }
+                None => {
+                    entry_key(&**base, id, &mut key);
+                }
+            }
+            pairs.push((key_hash(&key), id));
         }
         pairs.sort_unstable();
-        let (hashes, ids) = pairs.into_iter().unzip();
+        let (hashes, ids): (Vec<u64>, Vec<EntryId>) = pairs.into_iter().unzip();
+        let buckets = 1usize << BUCKET_BITS;
+        let mut starts = Vec::with_capacity(buckets + 1);
+        let mut at = 0;
+        for b in 0..buckets {
+            while at < hashes.len() && bucket(hashes[at]) < b {
+                at += 1;
+            }
+            starts.push(u32::try_from(at).unwrap_or(u32::MAX));
+        }
+        starts.push(u32::try_from(hashes.len()).unwrap_or(u32::MAX));
         PathLookup {
             base: Arc::downgrade(base),
             hashes,
             ids,
+            starts,
         }
     }
 
@@ -1003,10 +1048,93 @@ impl PathLookup {
 
     /// Base ids whose path key hashes to `hash`.
     fn candidates(&self, hash: u64) -> &[EntryId] {
-        let start = self.hashes.partition_point(|&h| h < hash);
-        let end = start + self.hashes[start..].partition_point(|&h| h == hash);
+        let b = bucket(hash);
+        let (lo, hi) = (self.starts[b] as usize, self.starts[b + 1] as usize);
+        let part = &self.hashes[lo..hi];
+        let start = lo + part.partition_point(|&h| h < hash);
+        let end = start + self.hashes[start..hi].partition_point(|&h| h == hash);
         &self.ids[start..end]
     }
+}
+
+/// The [`PathLookup`] bucket of a path hash.
+fn bucket(hash: u64) -> usize {
+    (hash >> (64 - BUCKET_BITS)) as usize
+}
+
+/// The entries the path keys below are built from: [`FileIndex`] (a base) and
+/// [`IndexSnapshot`] (a live view) have the same accessors.
+trait Entries {
+    fn name(&self, id: EntryId) -> &str;
+    fn parent(&self, id: EntryId) -> Option<EntryId>;
+}
+
+impl Entries for FileIndex {
+    fn name(&self, id: EntryId) -> &str {
+        FileIndex::name(self, id)
+    }
+    fn parent(&self, id: EntryId) -> Option<EntryId> {
+        FileIndex::parent(self, id)
+    }
+}
+
+impl Entries for IndexSnapshot {
+    fn name(&self, id: EntryId) -> &str {
+        IndexSnapshot::name(self, id)
+    }
+    fn parent(&self, id: EntryId) -> Option<EntryId> {
+        IndexSnapshot::parent(self, id)
+    }
+}
+
+/// Appends `s` with the character rules of [`path_key`] (`\` → `/`, lowercase on Windows),
+/// ASCII without going through `char::to_lowercase`.
+fn push_key_chars(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push('/'),
+            c if cfg!(windows) => {
+                if c.is_ascii() {
+                    out.push(c.to_ascii_lowercase());
+                } else {
+                    out.extend(c.to_lowercase());
+                }
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// [`path_key`] of a path given as text, without the `Path` round trip.
+fn str_key(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    push_key_chars(&mut out, path);
+    while out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// [`path_key`] of the path of entry `id` (its root's full path, then each name), built into
+/// `out` (cleared first) from the names, without building the `PathBuf`. Returns `out`.
+fn entry_key<'a, E: Entries + ?Sized>(entries: &E, id: EntryId, out: &'a mut String) -> &'a str {
+    let mut chain: Vec<EntryId> = Vec::with_capacity(16);
+    let mut cur = id;
+    while let Some(p) = entries.parent(cur) {
+        chain.push(cur);
+        cur = p;
+    }
+    out.clear();
+    // `cur` is the root: its name is its full path.
+    push_key_chars(out, entries.name(cur));
+    while out.ends_with('/') {
+        out.pop();
+    }
+    for &c in chain.iter().rev() {
+        out.push('/');
+        push_key_chars(out, entries.name(c));
+    }
+    out
 }
 
 fn key_hash(key: &str) -> u64 {
@@ -1054,7 +1182,7 @@ impl PlanSources<'_> {
 
     /// The live file entry of the view at `path` (the name index's form), if any.
     fn resolve(&mut self, path: &str) -> Option<EntryId> {
-        let key = path_key(Path::new(path));
+        let key = str_key(path);
         if let Some(&found) = self.resolved.get(&key) {
             return found;
         }
@@ -1417,6 +1545,42 @@ mod tests {
         assert!(lookup.is_of(view.snapshot().base()));
         let png = data.path().join("photo.png");
         assert!(lookup.candidates(key_hash(&path_key(&png))).is_empty());
+    }
+
+    /// The path keys built from names (lookup table, lookups) are exactly [`path_key`] of the
+    /// rebuilt path, for every kind of root and name.
+    #[test]
+    fn entry_and_text_keys_equal_path_key() {
+        use athrix_fs_index::{EntryMeta, IndexBuilder};
+        let dir = EntryMeta {
+            is_dir: true,
+            ..Default::default()
+        };
+        let file = EntryMeta::default();
+        let mut b = IndexBuilder::new();
+        for root in [r"C:\", r"D:\Data", r"E:\Ünïcode Ä\", "/", "/home/u"] {
+            let r = b.push(None, root, dir);
+            let sub = b.push(Some(r), "مُحَاضَرَات İSTANBUL", dir);
+            b.push(Some(sub), "Report.TXT", file);
+            b.push(Some(sub), "تقرير ẞ.docx", file);
+            b.push(Some(r), "a.md", file);
+        }
+        let ix = Arc::new(b.finish());
+        let mut buf = String::new();
+        for id in 0..ix.len() as EntryId {
+            let want = path_key(&ix.path(id));
+            assert_eq!(entry_key(&*ix, id, &mut buf), want, "{id}");
+            let text = ix.path(id).to_string_lossy().into_owned();
+            assert_eq!(str_key(&text), want, "{text}");
+        }
+        assert_eq!(str_key(r"C:\Users\"), path_key(Path::new(r"C:\Users\")));
+        // The table built with the parent cache hashes the same keys.
+        let lookup = PathLookup::build(&ix);
+        assert_eq!(lookup.ids.len(), 15);
+        for &id in &lookup.ids {
+            let key = path_key(&ix.path(id));
+            assert!(lookup.candidates(key_hash(&key)).contains(&id), "{key}");
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@
 
 mod cache;
 
-pub use cache::{CacheError, CacheRow, CachedHashes, HashCache};
+pub use cache::{CacheError, CacheRow, CachedHashes, HashCache, PruneLimits, PruneReport};
 
 use std::collections::HashMap;
 use std::fs::File;

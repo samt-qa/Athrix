@@ -66,7 +66,7 @@ use rayon::prelude::*;
 
 use crate::index::{EntryId, EntryMeta, FileIndex, IndexBuilder, NO_PARENT};
 use crate::search::{Query, bit_is_set};
-use crate::walk::{Scope, WalkOptions, key_has_prefix, path_key};
+use crate::walk::{Scope, WalkOptions, is_expected_error, key_has_prefix, path_key};
 
 /// Default: compact once the delta holds this many entries (or 1/16 of the base, if larger).
 const DEFAULT_MAX_DELTA: usize = 32 * 1024;
@@ -106,6 +106,13 @@ pub struct ApplyStats {
     pub unchanged: usize,
     /// Paths ignored: outside every root, excluded, unreadable, or whose parent is unknown.
     pub skipped: usize,
+    /// Of the skipped paths, those whose metadata could not be read (not "not found", which
+    /// is a removal).
+    pub unreadable: usize,
+    /// Of the unreadable paths, those refused with the errors whole-drive watches meet in
+    /// system folders (access denied, files in use, `os error 1920`...: see
+    /// [`crate::WalkStats::expected_errors`]). They are logged at `debug` only.
+    pub expected_errors: usize,
     /// The overlay was merged into a new base (all ids were renumbered).
     pub compacted: bool,
 }
@@ -777,8 +784,14 @@ impl State {
                 return;
             }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read changed path");
                 stats.skipped += 1;
+                stats.unreadable += 1;
+                if is_expected_error(&e) {
+                    stats.expected_errors += 1;
+                    tracing::debug!(path = %path.display(), error = %e, "cannot read changed path");
+                } else {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read changed path");
+                }
                 return;
             }
         };
@@ -1476,5 +1489,40 @@ mod tests {
             .search(&Query::parse("saved").unwrap(), 10, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(loaded.path(hits[0]), root.join("saved.txt"));
+    }
+
+    #[test]
+    fn system_noise_is_excluded_and_unreadable_paths_are_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        for d in ["Windows/Prefetch", "Windows/appcompat/Programs", "docs"] {
+            fs::create_dir_all(p.join(d)).unwrap();
+        }
+        let opts = WalkOptions::new([p]).with_default_exclusions();
+        let live = LiveIndex::new(walk(&opts).unwrap(), &opts).unwrap();
+        let pf = p.join("Windows").join("Prefetch").join("APP.EXE-1234.pf");
+        let hve = p
+            .join("Windows")
+            .join("appcompat")
+            .join("Programs")
+            .join("Amcache.hve");
+        fs::write(&pf, b"x").unwrap();
+        fs::write(&hve, b"x").unwrap();
+        let stats = live.apply_paths(&[&pf, &hve]);
+        assert_eq!((stats.skipped, stats.unreadable, stats.upserted), (2, 0, 0));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = p.join("docs");
+            fs::write(locked.join("secret.txt"), b"x").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let stats = live.apply_paths(&[locked.join("secret.txt")]);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            if stats.unreadable > 0 {
+                // (Running as root reads it anyway.)
+                assert_eq!(stats.expected_errors, 1);
+            }
+        }
     }
 }

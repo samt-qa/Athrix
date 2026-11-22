@@ -42,3 +42,37 @@ export function storedFlag(key: string, fallback: boolean): [() => boolean, (on:
     writeSetting(key, on ? "1" : "0");
   }];
 }
+
+/**
+ * A capped set of strings kept in local storage as a JSON array (oldest first), followed
+ * across windows. Adding past `cap` forgets the oldest entries; a corrupt or missing value reads
+ * as empty. Like the other helpers it never throws: without storage it only lasts the session.
+ */
+export function storedSet(key: string, cap: number): { has: (value: string) => boolean; add: (value: string) => void } {
+  const parse = (raw: string | null): Set<string> => {
+    if (!raw) return new Set();
+    try {
+      const list: unknown = JSON.parse(raw);
+      return new Set(Array.isArray(list) ? list.filter((v): v is string => typeof v === "string").slice(-cap) : []);
+    } catch {
+      return new Set();
+    }
+  };
+  let items = parse(readSetting(key));
+  onSettingChange(key, (v) => {
+    items = parse(v);
+  });
+  return {
+    has: (value) => items.has(value),
+    add(value) {
+      // Re-adding moves it to the newest end, so the most recently dismissed survive the cap.
+      items.delete(value);
+      items.add(value);
+      for (const oldest of items) {
+        if (items.size <= cap) break;
+        items.delete(oldest);
+      }
+      writeSetting(key, JSON.stringify([...items]));
+    },
+  };
+}

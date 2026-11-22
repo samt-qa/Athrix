@@ -223,10 +223,44 @@ fn print_summary(entries: &[Entry], ix: &FileIndex) {
     }
 }
 
+/// The "did you mean" probe (`search_suggest` in the app): how many entries a fuzzy rewrite
+/// finds, up to the app's limit, with [`Query::unordered`] (stops at the limit anywhere)
+/// against the ranked search it replaced (scores the whole index).
+fn print_suggest_probe(ix: &FileIndex) {
+    let cancel = AtomicBool::new(false);
+    for q in [
+        "fuzzy: rprt",
+        "fuzzy: reprot",
+        "fuzzy: managmnet",
+        "fuzzy: تقرر",
+        "fuzzy: zzqxv",
+        "fuzzy: budget 2024",
+        "fuzzy: فاتوره الكهرباء",
+    ] {
+        let query = Query::parse(q).unwrap();
+        for (label, query) in [("ranked", query.clone()), ("unordered", query.unordered())] {
+            let mut times = Vec::with_capacity(100);
+            let mut hits = 0;
+            for _ in 0..100 {
+                let t = Instant::now();
+                hits = ix.search(&query, 200, &cancel).unwrap().len();
+                times.push(t.elapsed());
+            }
+            times.sort();
+            eprintln!(
+                "[fs-index] probe {label:<9} {q:<24} hits {hits:>4}  p50 {:>9.3?}  p95 {:>9.3?}",
+                percentile(&times, 0.5),
+                percentile(&times, 0.95),
+            );
+        }
+    }
+}
+
 fn benches(c: &mut Criterion) {
     let entries = synthetic(ENTRIES);
     let ix = build(&entries);
     print_summary(&entries, &ix);
+    print_suggest_probe(&ix);
 
     let mut g = c.benchmark_group("build");
     g.sample_size(10);

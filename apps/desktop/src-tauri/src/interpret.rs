@@ -39,6 +39,8 @@ pub struct InterpretPart {
 pub fn interpret_query(text: String, today: Option<String>) -> Option<Interpretation> {
     let options = InterpretOptions {
         today: today.as_deref().and_then(parse_day),
+        // The name index has no creation / access times: keep every date `dm:`.
+        ..Default::default()
     };
     let found = interpret_with(&text, &options)?;
     Some(Interpretation {
@@ -94,5 +96,13 @@ mod tests {
         assert!(parse_day("2026-13").is_none());
         let relative = interpret_query("ملفات قبل 3 أيام".into(), Some("2026-11-22".into()));
         assert_eq!(relative.map(|i| i.query).as_deref(), Some("dm:2026-11-19"));
+    }
+
+    #[test]
+    fn date_kinds_and_size_words() {
+        let q = |s: &str| interpret_query(s.into(), Some("2026-11-22".into())).map(|i| i.query);
+        assert_eq!(q("ملفات أُنشئت أمس").as_deref(), Some("dm:yesterday"));
+        assert_eq!(q("files opened last week").as_deref(), Some("dm:lastweek"));
+        assert_eq!(q("الملفات الضخمة").as_deref(), Some("size:>1gb"));
     }
 }

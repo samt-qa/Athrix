@@ -96,10 +96,91 @@ pub(crate) struct FuzzyMatcher {
     compact_peq: Peq,
 }
 
+/// Most characters [`FuzzyMatcher::key_chars`] returns.
+pub(crate) const MAX_KEYS: usize = 3;
+
+/// Rough share (per mille) of normalized names that contain `c`, for picking the rarest
+/// characters of a term. Measured on a real 7M-entry index (a developer's disks, so hex
+/// digits and code names weigh in); only the order matters, and a poor guess only costs
+/// speed. Characters not listed are assumed rare.
+fn char_frequency(c: char) -> u32 {
+    const TABLE: &[(char, u32)] = &[
+        ('e', 765),
+        ('a', 662),
+        ('c', 564),
+        ('t', 541),
+        ('d', 529),
+        ('s', 511),
+        ('i', 488),
+        ('r', 485),
+        ('o', 482),
+        ('n', 475),
+        ('l', 470),
+        ('b', 419),
+        ('p', 414),
+        ('m', 372),
+        ('f', 369),
+        ('u', 301),
+        ('g', 282),
+        ('1', 278),
+        ('0', 275),
+        ('2', 274),
+        ('3', 255),
+        ('4', 246),
+        ('6', 242),
+        ('h', 242),
+        ('5', 236),
+        ('8', 233),
+        ('9', 233),
+        ('7', 230),
+        ('v', 215),
+        ('y', 169),
+        ('x', 166),
+        ('k', 146),
+        ('j', 119),
+        ('w', 115),
+        ('z', 59),
+        ('q', 55),
+        ('ا', 24),
+        ('ل', 23),
+        ('ي', 21),
+        ('م', 19),
+        ('ر', 18),
+        ('ه', 16),
+        ('و', 15),
+        ('ن', 15),
+        ('ب', 14),
+        ('ت', 14),
+        ('ع', 14),
+        ('د', 12),
+        ('ف', 12),
+        ('س', 11),
+        ('ح', 11),
+        ('ق', 10),
+        ('ج', 8),
+        ('ك', 7),
+        ('ص', 6),
+        ('ش', 6),
+        ('خ', 5),
+        ('ط', 5),
+        ('ث', 4),
+        ('ز', 3),
+        ('ض', 3),
+        ('ء', 2),
+        ('غ', 2),
+        ('ذ', 1),
+        ('ظ', 1),
+    ];
+    TABLE.iter().find(|&&(t, _)| t == c).map_or(1, |&(_, f)| f)
+}
+
 /// `PM[c]`: bit `i` is set when term character `i` is `c`.
 #[derive(Debug, Clone)]
 struct Peq {
     ascii: Box<[u64; 128]>,
+    /// The Arabic block U+0600..=U+06FF: most non-ASCII characters of names, looked up
+    /// directly instead of searching `other`.
+    arabic: Box<[u64; 256]>,
     other: Box<[(char, u64)]>,
     len: usize,
 }
@@ -107,10 +188,13 @@ struct Peq {
 impl Peq {
     fn new(chars: &[char]) -> Self {
         let mut ascii = Box::new([0u64; 128]);
+        let mut arabic = Box::new([0u64; 256]);
         let mut other: Vec<(char, u64)> = Vec::new();
         for (i, &c) in chars.iter().enumerate().take(64) {
             if c.is_ascii() {
                 ascii[c as usize] |= 1 << i;
+            } else if u32::from(c) >> 8 == 0x06 {
+                arabic[(u32::from(c) & 0xFF) as usize] |= 1 << i;
             } else if let Some(e) = other.iter_mut().find(|(o, _)| *o == c) {
                 e.1 |= 1 << i;
             } else {
@@ -119,6 +203,7 @@ impl Peq {
         }
         Peq {
             ascii,
+            arabic,
             other: other.into(),
             len: chars.len(),
         }
@@ -128,6 +213,8 @@ impl Peq {
     fn get(&self, c: char) -> u64 {
         if c.is_ascii() {
             self.ascii[c as usize]
+        } else if u32::from(c) >> 8 == 0x06 {
+            self.arabic[(u32::from(c) & 0xFF) as usize]
         } else {
             self.other
                 .iter()
@@ -171,6 +258,9 @@ fn is_word_start(name: &[u8], i: usize) -> bool {
 }
 
 impl FuzzyMatcher {
+    /// No name scores higher than this, for any term (best tier and detail, empty name).
+    pub(crate) const MAX_SCORE: u32 = (TIER_EXACT << 24) | (MAX_DETAIL << 8) | 255;
+
     /// Compiles an already normalized, non-empty term.
     pub(crate) fn new(normalized: &str) -> Self {
         let chars: Vec<char> = normalized.chars().collect();
@@ -283,7 +373,7 @@ impl FuzzyMatcher {
         // Acronym initials and subsequences are both ordered subsequences of the normalized
         // name (camelCase initials are lower-cased letters of it too), so one greedy pass
         // rules both out for most names.
-        let subsequence = is_subsequence(&self.compact, name);
+        let (subsequence, few_missing) = self.prefilter(name);
         // Acronyms.
         if subsequence && self.compact.len() >= 2 {
             // Shift-and over the initials first: most names have no acronym match, and then
@@ -317,7 +407,7 @@ impl FuzzyMatcher {
         if !reachable(TIER_ONE_TYPO, 0) {
             return None;
         }
-        let typos = if self.max_typos > 0 && self.few_missing(name) {
+        let typos = if self.max_typos > 0 && few_missing {
             let d = osa_substring_distance(&self.peq, name);
             (d <= self.max_typos as usize).then_some(d)
         } else {
@@ -361,8 +451,75 @@ impl FuzzyMatcher {
         None
     }
 
+    /// Characters at least one of which every name this term matches contains, with a rough
+    /// cost (how common they are in names, lower is better), or `None` if there is no useful
+    /// set (more than [`MAX_KEYS`] characters needed).
+    ///
+    /// Every tier needs all the term's characters in the name (substring, acronym and
+    /// subsequence: in order), except the typo tiers, which are only tried when at most
+    /// `max_typos` of them (by position) are missing ([`FuzzyMatcher::prefilter`]). So any
+    /// `max_typos + 1` positions of the term hold at least one character present in a matching
+    /// name; the rarest ones are picked. A scan can then skip every name with none of them.
+    pub(crate) fn key_chars(&self) -> Option<(Vec<char>, u32)> {
+        let (chars, k): (Vec<char>, usize) = if self.compact.is_empty() {
+            // Too long for the fuzzy tiers: substring only, so any one character will do.
+            (self.needle.chars().filter(|&c| c != ' ').collect(), 1)
+        } else {
+            (self.compact.to_vec(), self.max_typos as usize + 1)
+        };
+        if chars.is_empty() || k > MAX_KEYS {
+            return None;
+        }
+        let mut by_rarity = chars;
+        by_rarity.sort_by_key(|&c| char_frequency(c));
+        by_rarity.truncate(k);
+        by_rarity.sort_unstable();
+        by_rarity.dedup();
+        let cost = by_rarity.iter().map(|&c| char_frequency(c)).sum();
+        Some((by_rarity, cost))
+    }
+
+    /// The cheap filters of the non-substring tiers, in one pass over `name`:
+    /// - whether `compact` is a subsequence of it (acronyms and subsequences need that);
+    /// - whether at most `max_typos` of the term's characters (by position) are absent from it
+    ///   (the typo tiers: within `max_typos` edits, no more can be missing).
+    ///
+    /// Same answers as `is_subsequence` and `few_missing` (the tests check it); `compact` has
+    /// 1..=64 characters.
+    fn prefilter(&self, name: &str) -> (bool, bool) {
+        let compact = &self.compact;
+        let m = compact.len();
+        let all = if m >= 64 { u64::MAX } else { (1u64 << m) - 1 };
+        let mut next = 0;
+        let mut present = 0u64;
+        if compact.iter().all(char::is_ascii) {
+            // Bytes of multi-byte characters are >= 0x80 and never equal an ASCII character.
+            for &b in name.as_bytes() {
+                if b < 0x80 {
+                    if next < m && u32::from(b) == u32::from(compact[next]) {
+                        next += 1;
+                    }
+                    present |= self.compact_peq.ascii[b as usize];
+                }
+            }
+        } else {
+            for c in name.chars() {
+                if next < m && c == compact[next] {
+                    next += 1;
+                    if next == m {
+                        return (true, true);
+                    }
+                }
+                present |= self.compact_peq.get(c);
+            }
+        }
+        let missing = (all & !present).count_ones();
+        (next == m, missing <= self.max_typos)
+    }
+
     /// Cheap filter for the typo tiers: within `max_typos` edits, at most `max_typos` of the
-    /// term's characters can be absent from the name.
+    /// term's characters can be absent from the name. Reference for `prefilter`.
+    #[cfg(test)]
     fn few_missing(&self, name: &str) -> bool {
         let hay = name.as_bytes();
         let mut enc = [0u8; 4];
@@ -588,6 +745,7 @@ fn char_ranges(s: &str, offsets: &[usize]) -> Vec<Range<usize>> {
         .collect()
 }
 
+#[cfg(test)]
 /// True if `needle` appears in order in `hay` (greedy, O(hay), one `memchr`/`memmem` jump per
 /// needle character; UTF-8 is self-synchronizing, so byte search finds whole characters).
 fn is_subsequence(needle: &[char], hay: &str) -> bool {
@@ -1063,6 +1221,25 @@ mod tests {
             if m.acronym(&initials, false).is_some() {
                 prop_assert!(m.original_acronym_possible(&name));
             }
+        }
+        /// The one-pass prefilter gives the answers of the two separate filters it replaces.
+        #[test]
+        fn prefilter_equals_subsequence_and_few_missing(
+            (term, name) in prop_oneof![
+                ("[a-e1 ]{1,10}", "[a-eA-E0-9 _.ءةت]{0,24}"),
+                ("[a-cتمرلاة é]{1,10}", "[a-cتمرلاهة é_]{0,24}"),
+            ],
+        ) {
+            let n = norm(&term);
+            prop_assume!(!n.is_empty());
+            let m = FuzzyMatcher::new(&n);
+            prop_assume!(!m.compact.is_empty());
+            let name = norm(&name);
+            prop_assert_eq!(
+                m.prefilter(&name),
+                (is_subsequence(&m.compact, &name), m.few_missing(&name)),
+                "{:?} in {:?}", n, name
+            );
         }
     }
 }

@@ -16,7 +16,7 @@ const TODAY: CalendarDate = CalendarDate {
 };
 
 fn opts() -> InterpretOptions {
-    InterpretOptions::with_today(TODAY)
+    InterpretOptions::with_today(TODAY).with_date_kinds()
 }
 
 fn run(text: &str) -> Option<String> {
@@ -113,7 +113,7 @@ const CASES: &[(&str, &str)] = &[
     ("spreadsheets from 2024", "ext:xlsx;xls dm:2024"),
     (
         "presentations created last year",
-        "ext:pptx;ppt dm:lastyear",
+        "ext:pptx;ppt dc:lastyear",
     ),
     (
         "documents containing quarterly budget",
@@ -161,6 +161,55 @@ const CASES: &[(&str, &str)] = &[
         "documents with the text \"net profit\"",
         "type:doc content:\"net profit\"",
     ),
+    // --- creation and access dates ---
+    ("الملفات التي أُنشئت الأسبوع الماضي", "dc:lastweek"),
+    ("ملفات انشئت في 2024", "dc:2024"),
+    ("صور أنشأتها الشهر الماضي", "type:image dc:lastmonth"),
+    ("مستندات PDF المنشأة منذ 2023", "ext:pdf dc:>=2023"),
+    ("ملفات تم إنشاؤها قبل 3 أيام", "dc:2026-11-19"),
+    ("ملفات فُتحت أمس", "da:yesterday"),
+    ("ملفات وورد فتحتها هذا الأسبوع", "ext:docx;doc da:thisweek"),
+    ("صور استُخدمت في آخر 7 أيام", "type:image da:>=2026-11-16"),
+    ("ملفات عدلتها اليوم", "dm:today"),
+    ("files created in 2024", "dc:2024"),
+    ("pdf files i created last month", "ext:pdf dc:lastmonth"),
+    ("photos created on 2025-06-01", "type:image dc:2025-06-01"),
+    ("files opened yesterday", "da:yesterday"),
+    (
+        "documents accessed in the last 7 days",
+        "type:doc da:>=2026-11-16",
+    ),
+    (
+        "spreadsheets last opened before 2023",
+        "ext:xlsx;xls da:<2023",
+    ),
+    ("files used 3 days ago", "da:2026-11-19"),
+    // the same cases as the mock interpreter's self-checks (apps/desktop)
+    ("ملفات أُنشئت أمس", "dc:yesterday"),
+    ("صور أنشأتها من الشهر الماضي", "type:image dc:lastmonth"),
+    ("documents accessed from last week", "type:doc da:lastweek"),
+    ("large videos", "size:>100mb type:video"),
+    ("files last modified this week", "dm:thisweek"),
+    // --- size words without a number ---
+    ("ملفات كبيرة", "size:>100mb"),
+    ("الملفات الضخمة", "size:>1gb"),
+    (
+        "فيديوهات كبيرة من السنة الماضية",
+        "type:video size:>100mb dm:lastyear",
+    ),
+    ("ملفات حجمها كبير", "size:>100mb"),
+    ("ملفات كبيرة جدا", "size:>1gb"),
+    ("صور صغيرة", "type:image size:<100kb"),
+    ("ملفات صغيرة جدا", "size:tiny"),
+    ("ملفات فارغة", "size:empty"),
+    ("مجلدات فارغة", "type:folder size:empty"),
+    ("large files", "size:>100mb"),
+    ("big pdf files", "size:>100mb ext:pdf"),
+    ("huge videos", "size:>1gb type:video"),
+    ("very large files from last year", "size:>1gb dm:lastyear"),
+    ("small images", "size:<100kb type:image"),
+    ("tiny files", "size:tiny"),
+    ("empty folders", "size:empty type:folder"),
     // --- quoted phrases and negated words are kept as they are ---
     (
         "\"last week\" notes pdf files",
@@ -200,6 +249,13 @@ const LEFT_ALONE: &[&str] = &[
     "قبل",
     "أكبر من",
     "bigger than 5",
+    "big report",
+    "small business plan",
+    "كبيرة",
+    "large",
+    "created",
+    "files opened",
+    "ملفات أنشئت",
 ];
 
 #[test]
@@ -405,6 +461,18 @@ const VOCAB: &[&str] = &[
     "at least",
     "with the text",
     "infolder",
+    "أنشئت",
+    "فتحتها",
+    "created",
+    "opened",
+    "last opened",
+    "كبيرة",
+    "الضخمة",
+    "جدا",
+    "large",
+    "very",
+    "empty",
+    "small",
 ];
 
 proptest! {

@@ -29,6 +29,15 @@
 //! come back best first, ties in index order. A ranked search scans the whole index (no early
 //! stop at `limit`). Queries without fuzzy terms keep index order and the early stop.
 //!
+//! Two things keep fuzzy scans cheap:
+//! - **Score floor.** Once a scan holds `limit` hits, entries scoring below the lowest of them
+//!   are dropped and fuzzy terms skip the tiers that cannot reach it. In an AND of several
+//!   fuzzy terms (`fuzzy: report 2026`) each term gets the floor minus what the terms before it
+//!   scored and the most the terms after it can add ([`Node::max_score`]).
+//! - **Key characters.** Every fuzzy match holds at least one of a few rare characters of its
+//!   term ([`Node::key_chars`]), so scans jump with memchr over names holding none of them
+//!   and never evaluate those.
+//!
 //! # Paths
 //!
 //! The normalized path of an entry is the normalized names of its ancestors and itself joined
@@ -792,13 +801,30 @@ impl Node {
         match self {
             Node::Fuzzy(m) => m.score_at_least(e.name, e.ix.name(e.id), &mut s.fuzzy, floor),
             Node::And(xs) => {
-                // The score is the sum of the ranked children's scores; with one ranked child
-                // it is that child's score, so the floor applies to it directly.
-                let ranked = xs.iter().filter(|x| x.is_ranked()).count();
-                let child_floor = if ranked == 1 { floor } else { 0 };
+                // The score is the sum of the ranked children's scores. A ranked child must
+                // reach the floor minus what the children before it scored and the most the
+                // ranked children after it can add ([`Node::max_score`]); below that the sum
+                // cannot reach the floor, so the child may give up early. With one ranked
+                // child this is the floor itself. Computed in u64 so the bound never wraps.
+                let mut rest: u64 = if floor == 0 {
+                    0
+                } else {
+                    xs.iter()
+                        .filter(|x| x.is_ranked())
+                        .map(|x| u64::from(x.max_score()))
+                        .sum()
+                };
                 let mut total = 0u32;
                 for x in xs {
                     if x.is_ranked() {
+                        let child_floor = if floor == 0 {
+                            0
+                        } else {
+                            rest -= u64::from(x.max_score());
+                            let reached = u64::from(total) + rest;
+                            u32::try_from(u64::from(floor).saturating_sub(reached))
+                                .unwrap_or(u32::MAX)
+                        };
                         total = total.saturating_add(x.eval_score(e, s, child_floor)?);
                     } else if !x.eval(e, s) {
                         return None;
@@ -823,6 +849,58 @@ impl Node {
                 best.or_else(|| matched.then_some(0))
             }
             _ => (floor == 0 && self.eval(e, s)).then_some(0),
+        }
+    }
+
+    /// Characters at least one of which the normalized name of every matching entry contains,
+    /// with a rough cost (lower is rarer), or `None` if the node gives no such set. Only fuzzy
+    /// terms give one ([`FuzzyMatcher::key_chars`]): their per-name check is the expensive
+    /// one, and a scan can skip names without these characters at memchr speed.
+    pub(crate) fn key_chars(&self) -> Option<(Vec<char>, u32)> {
+        match self {
+            Node::Fuzzy(m) => m.key_chars(),
+            // Every child must match: any child's set will do, the rarest is best.
+            Node::And(xs) => xs
+                .iter()
+                .filter_map(Node::key_chars)
+                .min_by_key(|(_, cost)| *cost),
+            // Some child must match: the union of all the children's sets, if each has one.
+            Node::Or(xs) => {
+                let mut all: Vec<char> = Vec::new();
+                let mut cost = 0u32;
+                for x in xs {
+                    let (chars, c) = x.key_chars()?;
+                    all.extend(chars);
+                    cost = cost.saturating_add(c);
+                }
+                all.sort_unstable();
+                all.dedup();
+                (all.len() <= crate::fuzzy::MAX_KEYS).then_some((all, cost))
+            }
+            _ => None,
+        }
+    }
+
+    /// Independent [`Node::key_chars`] sets the name of every match must each hit: an AND
+    /// gives all its children's sets, any other node its one set (if any).
+    pub(crate) fn key_char_sets(&self) -> Vec<(Vec<char>, u32)> {
+        match self {
+            Node::And(xs) => xs.iter().flat_map(Node::key_char_sets).collect(),
+            _ => self.key_chars().into_iter().collect(),
+        }
+    }
+
+    /// An upper bound of [`Node::eval_score`] over every entry: the best fuzzy score for a
+    /// fuzzy term, the sum (AND) or the best (OR) of the ranked children, 0 otherwise.
+    pub(crate) fn max_score(&self) -> u32 {
+        match self {
+            Node::Fuzzy(_) => FuzzyMatcher::MAX_SCORE,
+            Node::And(xs) => xs
+                .iter()
+                .filter(|x| x.is_ranked())
+                .fold(0u32, |acc, x| acc.saturating_add(x.max_score())),
+            Node::Or(xs) => xs.iter().map(Node::max_score).max().unwrap_or(0),
+            _ => 0,
         }
     }
 

@@ -181,6 +181,10 @@ pub fn start_default_indexing(app: &AppHandle) {
             state
                 .drive_settings
                 .load_from(dir.join(DRIVE_SETTINGS_FILE));
+            // External drives remembered from earlier runs: unplugged ones start offline.
+            state
+                .drive_monitor
+                .load_from(dir.join(crate::drives::KNOWN_DRIVES_FILE));
             state.content.configure(&dir);
         }
         Err(e) => tracing::warn!(
@@ -314,17 +318,26 @@ enum SearchOutcome {
 /// The blocking part of a `dupe:` search; `rest` is the query without the switch.
 fn dupe_outcome(
     index: Option<Arc<IndexView>>,
+    content: &ContentService,
     text: &str,
     rest: &athrix_query::Query,
     request: &SearchRequest,
     cancel: &AtomicBool,
 ) -> SearchOutcome {
-    use crate::dupes::{DupeFailure, dupe_search};
+    use crate::dupes::{DupeFailure, dupe_search_with};
     let Some(index) = index else {
         return SearchOutcome::Empty;
     };
     let scope = request.scope.as_ref();
-    match dupe_search(&index, text, rest, request.limit, scope, cancel) {
+    match dupe_search_with(
+        &index,
+        Some(content),
+        text,
+        rest,
+        request.limit,
+        scope,
+        cancel,
+    ) {
         Ok(hits) => SearchOutcome::Dupes(hits),
         Err(DupeFailure::Invalid(e)) => SearchOutcome::Invalid(e),
         Err(DupeFailure::Search(SearchFailure::Cancelled)) => SearchOutcome::Cancelled,
@@ -388,7 +401,7 @@ fn execute_search(
     }
     // `dupe:` (see `crate::dupes`): the rest of the query picks the candidates, by name.
     match crate::dupes::split_dupe(text, &ast) {
-        Ok(Some(rest)) => return dupe_outcome(index, text, &rest, request, cancel),
+        Ok(Some(rest)) => return dupe_outcome(index, content, text, &rest, request, cancel),
         Ok(None) => {}
         Err(e) => return SearchOutcome::Invalid(e),
     }
@@ -632,15 +645,17 @@ pub fn entry_path(state: State<'_, AppState>, id: u64) -> Result<String, String>
     resolve(&state.indexer, id).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Resolves a result id to its path on the Rust side (the UI never sends paths), with the
-/// view of the id's generation (the current one or one of the few before it, see
-/// [`crate::indexing::RECENT_VIEWS`]). An id whose view is gone is rejected with
-/// [`STALE_ID_ERROR`], never resolved against another view.
+/// The path of result `id` (see [`resolve_entry`]).
 fn resolve(indexer: &Indexer, id: u64) -> Result<PathBuf, String> {
     resolve_entry(indexer, id).map(|(view, entry)| view.path(entry))
 }
 
-/// [`resolve`], keeping the view and the entry (for previews, which read metadata too).
+/// Resolves a result id on the Rust side (the UI never sends paths) to the view of the id's
+/// generation (the current one or one of the few before it, see
+/// [`crate::indexing::RECENT_VIEWS`]) and the entry in it. The one place ids become entries:
+/// opening, revealing, copying, previews, favorites (`library.rs`) and similar files all go
+/// through it. Errors: the index is not ready, the id is malformed, or its view is gone or no
+/// longer has the entry ([`STALE_ID_ERROR`]); an id is never resolved against another view.
 pub(crate) fn resolve_entry(
     indexer: &Indexer,
     id: u64,

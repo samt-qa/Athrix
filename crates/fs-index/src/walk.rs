@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use athrix_core::{Error, Result};
@@ -152,37 +153,93 @@ type State = ((), EntryMeta);
 /// Walks every root in `opts` in parallel and builds the name index.
 ///
 /// Entries that cannot be read (permission denied, vanished mid-walk, broken metadata) are
-/// skipped or kept without metadata; they never fail the walk. Access-denied errors are
-/// expected on whole-drive walks (system folders), so they are logged at `debug` only; other
-/// errors at `warn`. One `info` line at the end reports how many folders could not be listed.
-/// A root that cannot be read is skipped the same way. Symlinks and junctions are indexed as
-/// entries but not followed unless [`WalkOptions::follow_links`] is set.
+/// skipped or kept without metadata; they never fail the walk. Errors that whole-drive walks
+/// hit by the thousand in system folders (access denied, files in use, `os error 1920` on app
+/// execution aliases...; see [`WalkStats::expected_errors`]) are logged at `debug` only; other
+/// errors at `warn`. One `info` line at the end gives the counts (also returned by
+/// [`walk_with_stats`]). A root that cannot be read is skipped the same way. Symlinks and
+/// junctions are indexed as entries but not followed unless [`WalkOptions::follow_links`] is
+/// set.
 ///
 /// # Errors
 /// [`Error::Config`] if an exclusion glob is invalid.
 pub fn walk(opts: &WalkOptions) -> Result<FileIndex> {
+    walk_with_stats(opts).map(|(index, _)| index)
+}
+
+/// [`walk`], also returning what could not be read, for diagnostics.
+///
+/// # Errors
+/// [`Error::Config`] if an exclusion glob is invalid.
+pub fn walk_with_stats(opts: &WalkOptions) -> Result<(FileIndex, WalkStats)> {
     let exclusions = Arc::new(Exclusions::new(opts)?);
     let mut builder = IndexBuilder::new();
-    let mut skipped = Skipped::default();
+    let counters = Arc::new(Counters::default());
     for root in &opts.roots {
-        walk_root(
+        walk_counted(
             root,
             opts.follow_links,
             &exclusions,
             &mut builder,
-            &mut skipped,
+            &counters,
         );
     }
     let index = builder.finish();
+    let stats = counters.stats();
     tracing::info!(
         entries = index.len(),
-        skipped_folders = skipped.folders,
-        access_denied = skipped.access_denied,
-        "walk finished; {} folder(s) could not be listed ({} access denied)",
-        skipped.folders,
-        skipped.access_denied,
+        unlisted_folders = stats.unlisted_folders,
+        access_denied = stats.access_denied,
+        unreadable_metadata = stats.unreadable_metadata,
+        expected_errors = stats.expected_errors,
+        "walk finished; {} folder(s) could not be listed ({} access denied), the metadata of {} \
+         entries could not be read; {} of these errors are usual in system folders",
+        stats.unlisted_folders,
+        stats.access_denied,
+        stats.unreadable_metadata,
+        stats.expected_errors,
     );
-    Ok(index)
+    Ok((index, stats))
+}
+
+/// What a walk could not read ([`walk_with_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// Folders whose children could not be listed (they are indexed, empty).
+    pub unlisted_folders: usize,
+    /// Of those, the ones refused with "access denied".
+    pub access_denied: usize,
+    /// Entries kept without size and date because their metadata could not be read.
+    pub unreadable_metadata: usize,
+    /// How many of the errors (unlisted folders, unreadable metadata, skipped entries) are of
+    /// the kind whole-drive walks hit in system folders and log at `debug` only: access
+    /// denied, sharing / lock violations (`pagefile.sys`), `os error 1920` (app execution
+    /// aliases under `WindowsApps`), untrusted mount points and unreadable reparse points.
+    pub expected_errors: usize,
+}
+
+/// Error counts of one walk, shared with the walker threads.
+#[derive(Debug, Default)]
+pub(crate) struct Counters {
+    unlisted_folders: AtomicUsize,
+    access_denied: AtomicUsize,
+    unreadable_metadata: AtomicUsize,
+    expected_errors: AtomicUsize,
+}
+
+impl Counters {
+    fn add(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stats(&self) -> WalkStats {
+        WalkStats {
+            unlisted_folders: self.unlisted_folders.load(Ordering::Relaxed),
+            access_denied: self.access_denied.load(Ordering::Relaxed),
+            unreadable_metadata: self.unreadable_metadata.load(Ordering::Relaxed),
+            expected_errors: self.expected_errors.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The roots and exclusion rules of a [`WalkOptions`], compiled once and shared by the live
@@ -243,19 +300,21 @@ impl Scope {
     /// returned index has `dir` as its only root, named by its full path.
     pub(crate) fn walk_subtree(&self, dir: &Path) -> FileIndex {
         let mut builder = IndexBuilder::new();
-        let mut skipped = Skipped::default();
-        walk_root(
+        let counters = Arc::new(Counters::default());
+        walk_counted(
             dir,
             self.follow_links,
             &self.exclusions,
             &mut builder,
-            &mut skipped,
+            &counters,
         );
-        if skipped.folders > 0 {
+        let stats = counters.stats();
+        if stats.unlisted_folders > 0 || stats.unreadable_metadata > 0 {
             tracing::debug!(
                 dir = %dir.display(),
-                skipped_folders = skipped.folders,
-                "subtree walk could not list some folders"
+                unlisted_folders = stats.unlisted_folders,
+                unreadable_metadata = stats.unreadable_metadata,
+                "subtree walk could not read some entries"
             );
         }
         builder.finish()
@@ -308,7 +367,7 @@ fn meta_from(md: &std::fs::Metadata) -> EntryMeta {
     }
 }
 
-fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
+fn read_meta(path: &Path, follow_links: bool, counters: &Counters) -> Option<EntryMeta> {
     let md = if follow_links {
         std::fs::metadata(path)
     } else {
@@ -317,7 +376,9 @@ fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
     match md {
         Ok(md) => Some(meta_from(&md)),
         Err(e) => {
-            if is_access_denied(&e) {
+            Counters::add(&counters.unreadable_metadata);
+            if is_expected_error(&e) {
+                Counters::add(&counters.expected_errors);
                 tracing::debug!(path = %path.display(), error = %e, "cannot read metadata");
             } else {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
@@ -327,7 +388,39 @@ fn read_meta(path: &Path, follow_links: bool) -> Option<EntryMeta> {
     }
 }
 
-/// Folders a walk could not list.
+/// Windows error codes that whole-drive walks meet by the thousand in system folders and that
+/// are not worth a warning (besides "access denied", which has its own
+/// [`std::io::ErrorKind`]).
+const EXPECTED_WINDOWS_ERRORS: [i32; 6] = [
+    32,   // ERROR_SHARING_VIOLATION: pagefile.sys, hiberfil.sys, files held open.
+    33,   // ERROR_LOCK_VIOLATION.
+    448,  // ERROR_UNTRUSTED_MOUNT_POINT.
+    1920, // ERROR_CANT_ACCESS_FILE: app execution aliases (WindowsApps) and the like.
+    4390, // ERROR_NOT_A_REPARSE_POINT.
+    4392, // ERROR_INVALID_REPARSE_DATA.
+];
+
+/// True for the errors whole-drive walks hit in system folders (System Volume Information,
+/// other users' profiles, `WindowsApps` aliases, files in use...): "access denied" everywhere,
+/// plus [`EXPECTED_WINDOWS_ERRORS`] on Windows. They are logged at `debug` and counted.
+pub(crate) fn is_expected_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows)
+            && e.raw_os_error()
+                .is_some_and(|code| EXPECTED_WINDOWS_ERRORS.contains(&code)))
+}
+
+/// Logs a jwalk error: `debug` for the expected ones, `warn` otherwise.
+fn log_entry_error(e: &jwalk::Error, counters: &Counters) {
+    if e.io_error().is_some_and(is_expected_error) {
+        Counters::add(&counters.expected_errors);
+        tracing::debug!(error = %e, "skipping unreadable entry");
+    } else {
+        tracing::warn!(error = %e, "skipping unreadable entry");
+    }
+}
+
+/// Folders a walk could not list (the summary [`crate::ntfs`] logs for its fallback walks).
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Skipped {
     /// All folders whose children could not be read.
@@ -336,21 +429,7 @@ pub(crate) struct Skipped {
     pub(crate) access_denied: usize,
 }
 
-/// True for "access denied" / "permission denied", which whole-drive walks hit by the hundred
-/// (System Volume Information, other users' profiles...) and which are not worth a warning.
-fn is_access_denied(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied
-}
-
-/// Logs a jwalk error: `debug` for access denied, `warn` otherwise.
-fn log_entry_error(e: &jwalk::Error) {
-    if e.io_error().is_some_and(is_access_denied) {
-        tracing::debug!(error = %e, "skipping unreadable entry");
-    } else {
-        tracing::warn!(error = %e, "skipping unreadable entry");
-    }
-}
-
+/// [`walk_counted`] for callers that only keep the [`Skipped`] summary.
 pub(crate) fn walk_root(
     root: &Path,
     follow_links: bool,
@@ -358,7 +437,23 @@ pub(crate) fn walk_root(
     builder: &mut IndexBuilder,
     skipped: &mut Skipped,
 ) {
+    let counters = Arc::new(Counters::default());
+    walk_counted(root, follow_links, exclusions, builder, &counters);
+    let stats = counters.stats();
+    skipped.folders += stats.unlisted_folders;
+    skipped.access_denied += stats.access_denied;
+}
+
+/// Walks one root into `builder`, counting what could not be read in `counters`.
+pub(crate) fn walk_counted(
+    root: &Path,
+    follow_links: bool,
+    exclusions: &Arc<Exclusions>,
+    builder: &mut IndexBuilder,
+    counters: &Arc<Counters>,
+) {
     let ex = Arc::clone(exclusions);
+    let threads = Arc::clone(counters);
     let walker = WalkDirGeneric::<State>::new(root)
         .follow_links(follow_links)
         .skip_hidden(false)
@@ -375,7 +470,7 @@ pub(crate) fn walk_root(
                         return false;
                     }
                     let ft = entry.file_type;
-                    let mut meta = read_meta(&path, follow_links).unwrap_or_default();
+                    let mut meta = read_meta(&path, follow_links, &threads).unwrap_or_default();
                     // Trust the directory listing for the kind: it never follows links.
                     meta.is_dir = ft.is_dir();
                     meta.is_symlink |= ft.is_symlink();
@@ -388,7 +483,7 @@ pub(crate) fn walk_root(
                     true
                 }
                 Err(e) => {
-                    log_entry_error(e);
+                    log_entry_error(e, &threads);
                     false
                 }
             });
@@ -401,14 +496,20 @@ pub(crate) fn walk_root(
         let entry = match item {
             Ok(e) => e,
             Err(e) => {
-                log_entry_error(&e);
+                log_entry_error(&e, counters);
                 continue;
             }
         };
         if let Some(err) = &entry.read_children_error {
-            skipped.folders += 1;
-            if err.io_error().is_some_and(is_access_denied) {
-                skipped.access_denied += 1;
+            Counters::add(&counters.unlisted_folders);
+            if err
+                .io_error()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                Counters::add(&counters.access_denied);
+            }
+            if err.io_error().is_some_and(is_expected_error) {
+                Counters::add(&counters.expected_errors);
                 tracing::debug!(path = %entry.path().display(), error = %err, "cannot list folder");
             } else {
                 tracing::warn!(path = %entry.path().display(), error = %err, "cannot list folder");
@@ -416,7 +517,7 @@ pub(crate) fn walk_root(
         }
         let depth = entry.depth;
         let id = if depth == 0 {
-            let Some(meta) = read_meta(root, true) else {
+            let Some(meta) = read_meta(root, true, counters) else {
                 tracing::warn!(root = %root.display(), "skipping unreadable root");
                 return;
             };
@@ -557,6 +658,44 @@ mod tests {
             .collect();
         assert_eq!(roots.len(), 2);
         assert_eq!(ix.len(), 2 * 17);
+    }
+
+    #[test]
+    fn system_folder_errors_are_expected_others_are_not() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(is_expected_error(&IoError::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_expected_error(&IoError::from(ErrorKind::NotFound)));
+        let cant_access = IoError::from_raw_os_error(1920);
+        let sharing = IoError::from_raw_os_error(32);
+        assert_eq!(is_expected_error(&cant_access), cfg!(windows));
+        assert_eq!(is_expected_error(&sharing), cfg!(windows));
+        assert!(!is_expected_error(&IoError::from_raw_os_error(2)));
+    }
+
+    #[test]
+    fn walk_with_stats_counts_what_could_not_be_read() {
+        let dir = tree();
+        let missing = dir.path().join("does-not-exist");
+        let (ix, stats) = walk_with_stats(&WalkOptions::new([dir.path(), &missing])).unwrap();
+        assert_eq!(ix.len(), 17);
+        // A missing root is skipped (with a warning), not counted as a system-folder error.
+        assert_eq!(stats, WalkStats::default());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("keep");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let (_, stats) = walk_with_stats(&WalkOptions::new([dir.path()])).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            if stats.unlisted_folders > 0 {
+                // (Running as root reads it anyway.)
+                assert_eq!(stats.access_denied, 1);
+                assert_eq!(stats.expected_errors, 1);
+            }
+        }
     }
 
     #[test]

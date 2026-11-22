@@ -44,8 +44,11 @@ const MAGIC: [u8; 8] = *b"ATHRXIDX";
 const FORMAT_VERSION: u32 = 1;
 
 /// Manual epoch mixed into [`normalizer_version`]. Bump it when the name normalization
-/// (`athrix_text_ar::normalize_name_into`) changes in a way the probe strings below might miss.
-const NORMALIZER_EPOCH: u32 = 1;
+/// (`athrix_text_ar::normalize_name_into`) changes, even if the probe strings below catch it.
+///
+/// - 2: names fold ة → ه, ؤ → و, ئ → ي (decision 7). Snapshots of epoch 1 keep those letters
+///   in their normalized names, so they are rejected and the index is rebuilt.
+const NORMALIZER_EPOCH: u32 = 2;
 
 /// Names covering the normalization rules (diacritics, alef/yaa/taa marbuta/kaf variants,
 /// tatweel, ligatures, digits, invisible marks, case folding, separators). Their normalized
@@ -56,6 +59,7 @@ const NORMALIZER_PROBES: &[&str] = &[
     "إأآٱا",
     "ى ي ئ ؤ ء",
     "مدرسة مدرسه",
+    "فاتورة مسؤول مسئولية",
     "ك ک گ",
     "مـــلف",
     "ﻻ لا",

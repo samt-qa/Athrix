@@ -107,27 +107,47 @@ fn tiff_thumbnail(tiff: &[u8]) -> Option<&[u8]> {
 /// `main` (a whole JPEG, whose SOI marker is dropped). For tests.
 #[cfg(test)]
 pub(crate) fn with_exif_thumbnail(main: &[u8], thumb: &[u8]) -> Vec<u8> {
-    // Little-endian TIFF: header, an empty IFD0 pointing to IFD1, IFD1 with offset and length.
+    with_exif(main, None, Some(thumb))
+}
+
+/// Builds a JPEG whose APP1 EXIF block has the IFD0 orientation tag (0x0112) set to
+/// `orientation` (1–8) and, when given, the IFD1 thumbnail `thumb`, followed by `main`. For
+/// tests.
+#[cfg(test)]
+pub(crate) fn with_exif(main: &[u8], orientation: Option<u16>, thumb: Option<&[u8]>) -> Vec<u8> {
+    const TAG_ORIENTATION: u16 = 0x0112;
+    // Little-endian TIFF: header, IFD0 (orientation) pointing to IFD1 (offset and length).
     let mut tiff = Vec::new();
     tiff.extend_from_slice(b"II");
     tiff.extend_from_slice(&42u16.to_le_bytes());
     tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at 8
-    tiff.extend_from_slice(&0u16.to_le_bytes()); // IFD0: no entries
-    let ifd1 = 8 + 2 + 4;
-    tiff.extend_from_slice(&(ifd1 as u32).to_le_bytes()); // next IFD = IFD1
-    let thumb_at = ifd1 + 2 + 2 * 12 + 4;
-    tiff.extend_from_slice(&2u16.to_le_bytes());
-    for (tag, value) in [
-        (TAG_THUMB_OFFSET, thumb_at as u32),
-        (TAG_THUMB_LENGTH, thumb.len() as u32),
-    ] {
-        tiff.extend_from_slice(&tag.to_le_bytes());
-        tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    let ifd0_count = u16::from(orientation.is_some());
+    tiff.extend_from_slice(&ifd0_count.to_le_bytes());
+    if let Some(o) = orientation {
+        tiff.extend_from_slice(&TAG_ORIENTATION.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
         tiff.extend_from_slice(&1u32.to_le_bytes());
-        tiff.extend_from_slice(&value.to_le_bytes());
+        tiff.extend_from_slice(&o.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
     }
-    tiff.extend_from_slice(&0u32.to_le_bytes()); // no IFD2
-    tiff.extend_from_slice(thumb);
+    let ifd1 = 8 + 2 + 12 * usize::from(ifd0_count) + 4;
+    let next = if thumb.is_some() { ifd1 as u32 } else { 0 };
+    tiff.extend_from_slice(&next.to_le_bytes());
+    if let Some(thumb) = thumb {
+        let thumb_at = ifd1 + 2 + 2 * 12 + 4;
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        for (tag, value) in [
+            (TAG_THUMB_OFFSET, thumb_at as u32),
+            (TAG_THUMB_LENGTH, thumb.len() as u32),
+        ] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no IFD2
+        tiff.extend_from_slice(thumb);
+    }
 
     let mut out = vec![0xFF, 0xD8, 0xFF, 0xE1];
     let len = u16::try_from(2 + 6 + tiff.len()).expect("thumbnail too big for a test");

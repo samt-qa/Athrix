@@ -539,3 +539,32 @@ fn fuzzy_scores_and_highlights() {
     let plain = compile("report");
     assert_eq!(ix.score(&plain, 1), Some(0));
 }
+
+/// Name search folds ة = ه and the hamza seats ؤ = و, ئ = ي (decision 7), in plain words and
+/// wildcards, either way round.
+#[test]
+fn taa_marbuta_and_hamza_seats_match_either_way() {
+    let mut b = IndexBuilder::new();
+    let root = b.push(None, r"D:\Data", dir());
+    for name in [
+        "فاتورة الكهرباء.pdf",
+        "فاتوره قديمة.pdf",
+        "تقرير المسؤول.docx",
+        "مسوول المبيعات.xlsx",
+        "مسئولية.txt",
+        "ماء.txt",
+    ] {
+        b.push(Some(root), name, file(1, None));
+    }
+    let ix = b.finish();
+    let both = ["فاتورة الكهرباء.pdf", "فاتوره قديمة.pdf"];
+    assert_eq!(find(&ix, "فاتوره"), both);
+    assert_eq!(find(&ix, "فاتورة"), both);
+    assert_eq!(find(&ix, "فاتور*"), both);
+    let both = ["تقرير المسؤول.docx", "مسوول المبيعات.xlsx"];
+    assert_eq!(find(&ix, "مسوول"), both);
+    assert_eq!(find(&ix, "مسؤول"), both);
+    assert_eq!(find(&ix, "مسيولية"), ["مسئولية.txt"]);
+    // The standalone hamza is not deleted: «ما» is not «ماء».
+    assert_eq!(find(&ix, "ماء"), ["ماء.txt"]);
+}
