@@ -154,7 +154,7 @@
 | # | المهمة | الحالة | ملاحظات |
 |---|---|---|---|
 | 7.1 | CLI | ⬜ | |
-| 7.2 | خادم MCP (معطّل افتراضيًا، قراءة فقط) | ✅ | `athrix-mcp` (stdio، JSON-RPC يدوي): `search_files`/`search_content`/`file_info`/`read_text`، معطّل افتراضيًا، مجلدات مسموحة مع حماية من `..` و`\?\` والـ junction، سجلّ بلا محتوى، قسم «المساعدات الذكية» في الإعدادات. `docs/MCP.md` |
+| 7.2 | خادم MCP (معطّل افتراضيًا، قراءة فقط) | ✅ | `athrix-mcp` (stdio، JSON-RPC يدوي): `search_files`/`search_content`/`file_info`/`read_text`، معطّل افتراضيًا، مجلدات مسموحة مع حماية من `..` و`\\?\` والـ junction، سجلّ بلا محتوى، قسم «المساعدات الذكية» في الإعدادات. `docs/MCP.md` |
 | 7.3 | نظام Plugins | ⬜ | |
 | 7.4 | macOS (FSEvents) | ⬜ | |
 | 7.5 | Linux (fanotify/inotify) | ⬜ | |
