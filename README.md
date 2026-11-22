@@ -16,6 +16,10 @@
 
 </div>
 
+<p align="center">
+  <img src="docs/assets/screenshot-ar.png" alt="أثر: نتائج البحث عن «ملاحظات» مع معاينة الملف والكلمات المُبرزة" width="900">
+</p>
+
 > [!NOTE]
 > Athrix قيد التطوير النشط ولم يصدر منه إصدار مستقر بعد. الحالة التفصيلية في [`docs/03-PROGRESS-TRACKER.md`](docs/03-PROGRESS-TRACKER.md)، وما تبقّى في [`docs/05-REMAINING-WORK.md`](docs/05-REMAINING-WORK.md).
 
@@ -49,6 +53,11 @@
 - **المكتبة:** السجلّ، والبحوث المحفوظة، والمفضّلة.
 - **قائمة الزر الأيمن في المستكشف:** «ابحث هنا بـ Athrix».
 - سهولة الوصول: قارئ الشاشة، وتركيز ظاهر، وتباين مدروس، والوضع الداكن، والتباين العالي.
+
+<p align="center">
+  <img src="docs/assets/screenshot-content-dark.png" alt="البحث في محتوى المستندات بالوضع الداكن مع مقاطع مُبرزة تحت كل نتيجة" width="900">
+  <br><sub>البحث داخل المستندات: مقطع مُبرز تحت كل نتيجة (الوضع الداكن)</sub>
+</p>
 
 ## لغة الاستعلام
 
@@ -146,6 +155,10 @@ If this project helps you, you can support its development via PayPal.
 ## English
 
 Athrix is a desktop app that finds any file on your computer as you type, and searches inside documents too. It is built for Arabic from the ground up: it understands diacritics, hamza and alef forms, and taa marbuta; it fixes text typed with the wrong keyboard layout; and the interface is right-to-left first, with English also available. Everything runs on your machine, so no file name or content ever leaves it.
+
+<p align="center">
+  <img src="docs/assets/screenshot-en.png" alt="Athrix in English: search results with a highlighted preview" width="900">
+</p>
 
 **Highlights**
 - **Name search as you type** across millions of files: about 12 ms for the first result on 6.9M entries.
