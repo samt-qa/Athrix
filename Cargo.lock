@@ -304,7 +304,7 @@ dependencies = [
  "athrix-extract",
  "athrix-fs-index",
  "athrix-imagehash",
- "athrix-mcp",
+ "athrix-mcp-server",
  "athrix-ntfs",
  "athrix-query",
  "athrix-ranking",
@@ -378,7 +378,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "athrix-mcp"
+name = "athrix-mcp-server"
 version = "0.0.1"
 dependencies = [
  "athrix-content-index",

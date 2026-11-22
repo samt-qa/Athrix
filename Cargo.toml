@@ -27,7 +27,7 @@ athrix-store = { path = "crates/store" }
 athrix-ntfs = { path = "crates/ntfs" }
 athrix-dedupe = { path = "crates/dedupe" }
 athrix-imagehash = { path = "crates/imagehash" }
-athrix-mcp = { path = "crates/mcp" }
+athrix-mcp-server = { path = "crates/mcp" }
 
 # Desktop app
 tauri = { version = "2", features = [] }

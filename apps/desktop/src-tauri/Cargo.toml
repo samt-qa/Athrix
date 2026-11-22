@@ -29,7 +29,7 @@ athrix-fs-index.workspace = true
 # `similar:` and "find similar images": perceptual hashes, grouping and the hash cache.
 athrix-imagehash.workspace = true
 # The MCP settings file (Settings → MCP); the server itself is the `athrix-mcp` sidecar.
-athrix-mcp.workspace = true
+athrix-mcp-server.workspace = true
 # Drive-letter probe (serial numbers) for noticing USB drives plugged in / removed.
 athrix-ntfs.workspace = true
 athrix-query.workspace = true

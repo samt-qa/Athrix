@@ -1,5 +1,5 @@
 [package]
-name = "athrix-mcp"
+name = "athrix-mcp-server"
 description = "Athrix MCP server: lets AI assistants search the user's files (read-only, opt-in, allowed folders only)."
 version.workspace = true
 edition.workspace = true
@@ -8,6 +8,13 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 publish.workspace = true
+
+# Package name differs from the sidecar binary name: cargo names per-package build
+# directories after the package, and tauri-build copies the `athrix-mcp` sidecar next to
+# them, so equal names collide ("Is a directory").
+[lib]
+name = "athrix_mcp"
+path = "src/lib.rs"
 
 [[bin]]
 name = "athrix-mcp"

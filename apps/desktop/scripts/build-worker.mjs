@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
 // Each sidecar: its binary name and the cargo arguments that build it.
 const SIDECARS = [
   { bin: "athrix-extract-worker", args: ["-p", "athrix-extract", "--bin", "athrix-extract-worker", "--features", "pdf"] },
-  { bin: "athrix-mcp", args: ["-p", "athrix-mcp", "--bin", "athrix-mcp"] },
+  { bin: "athrix-mcp", args: ["-p", "athrix-mcp-server", "--bin", "athrix-mcp"] },
 ];
 const here = dirname(fileURLToPath(import.meta.url));
 const appDir = resolve(here, "..");
