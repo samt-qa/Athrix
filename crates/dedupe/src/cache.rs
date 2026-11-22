@@ -473,9 +473,11 @@ mod tests {
             row(&key(&resized), 10, 1, 1, true),
             row(&key(dir.path()), 0, 1, 1, true),
         ];
-        // Many rows of deleted files, enough to leave most of the file free.
+        // Many rows of deleted files, enough to leave most of the file free. Long names keep
+        // the file well over the 1 MB compaction floor even where temp paths are short (Linux).
+        let pad = "x".repeat(200);
         for i in 0..8000 {
-            let gone = dir.path().join(format!("gone-{i}.bin"));
+            let gone = dir.path().join(format!("gone-{i}-{pad}.bin"));
             rows.push(row(&key(&gone), 5, 1, 1, true));
         }
         c.put_many(&rows).unwrap();
