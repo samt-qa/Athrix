@@ -488,8 +488,12 @@ mod tests {
             here.to_string_lossy().into_owned(),
             resized.to_string_lossy().into_owned(),
         ];
+        // Long names keep the file over the 1 MB compaction floor even with short temp paths (Linux).
+        let pad = "x".repeat(200);
         for i in 0..12_000 {
-            let gone = dir.path().join(format!("deleted picture number {i}.jpg"));
+            let gone = dir
+                .path()
+                .join(format!("deleted picture number {i} {pad}.jpg"));
             keys.push(gone.to_string_lossy().into_owned());
         }
         let rows: Vec<(&str, u64, i64, Option<ImageHash>)> = keys
