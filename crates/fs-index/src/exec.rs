@@ -9,6 +9,7 @@
 //! | `type:image;folder` (`نوع:`) | `folder` = is a directory; other kinds = a file whose extension is in the kind's list (see [`kind_extensions`]). |
 //! | `size:>1mb` (`حجم:`) | Size in bytes (1024-based units, from the parser). `size:1mb` is exact. Folders never match. |
 //! | `dm:today`, `dm:2026-03`, `dm:>=2026-01-15` (`تاريخ:`) | Modification time, in local dates. A date as `=` means "within that day/month/year/period". Entries without a known time never match. |
+//! | `dc:today`, `dc:2026-03`, `dc:<2020` | Creation time, with exactly the date rules of `dm:`. Entries without a known creation time never match. |
 //! | `path:x` (`مسار:`) | `x` with plain-term rules (substring, `^`/`$`, wildcards) against the normalized **full path** (including the name). |
 //! | `parent:x` | The normalized path of the direct parent folder ends with `x` at a word boundary (`parent:docs`, `parent:"D:\Data\Docs"`). With wildcards: the whole parent path matches the pattern. |
 //! | `infolder:x` (`مجلد:`) | Like `parent:`, for any ancestor folder (the entry is somewhere under it). |
@@ -18,9 +19,16 @@
 //! | `fuzzy:` alone | A switch: every plain word of the query (not quoted, no wildcards or `^`/`$` anchors, not a filter value) is matched like `fuzzy:word`, so `fuzzy: rprt 2026` = `fuzzy:rprt fuzzy:2026`. Cannot be negated. |
 //!
 //! Rejected with [`QueryError::Unsupported`]: `content:`, `sem:`/`~` (`~` is the semantic
-//! prefix, not fuzzy), `regex:`, `dupe:`, `similar:`, `tag:`, `dc:`, `da:` (the index stores
-//! only the modification time), `case:`/`ww:` written without a value (as global switches),
-//! and a negated `fuzzy:` switch.
+//! prefix, not fuzzy), `regex:`, `dupe:`, `similar:`, `tag:`, `da:` (the index does not store
+//! access times: Windows updates them lazily or not at all, so they would mislead),
+//! `case:`/`ww:` written without a value (as global switches), and a negated `fuzzy:` switch.
+//!
+//! # Name-only nodes
+//!
+//! Names are interned (see `index.rs`), so a scan evaluates the part of a query that depends
+//! only on the name once per distinct name and remembers the answer (`search.rs`). `ext:` and
+//! `type:` are compiled into a folder check plus a name-only extension check
+//! ([`Node::ExtName`], [`Node::KindExt`]) for that reason.
 //!
 //! # Ranking
 //!
@@ -133,13 +141,12 @@ pub(crate) enum Node {
     WholeWord(Box<memmem::Finder<'static>>),
     /// `fuzzy:` (or a word under the `fuzzy:` switch) on the normalized name.
     Fuzzy(Box<FuzzyMatcher>),
-    /// `ext:` lower-cased extensions.
-    Ext(Box<[Box<str>]>),
-    /// `type:` sorted union of the kinds' extensions, plus whether folders match.
-    Kind {
-        exts: Box<[&'static str]>,
-        folders: bool,
-    },
+    /// Matches directories (`true`) or everything else (`false`).
+    Dir(bool),
+    /// `ext:` lower-cased extensions, on the original name only (see [`Node::Dir`]).
+    ExtName(Box<[Box<str>]>),
+    /// `type:` sorted union of the kinds' extensions, on the original name only.
+    KindExt(Box<[&'static str]>),
     /// `size:` inclusive byte range.
     Size {
         lo: u64,
@@ -147,6 +154,11 @@ pub(crate) enum Node {
     },
     /// `dm:` inclusive range of Unix seconds.
     Modified {
+        lo: i64,
+        hi: i64,
+    },
+    /// `dc:` inclusive range of Unix seconds.
+    Created {
         lo: i64,
         hi: i64,
     },
@@ -321,9 +333,10 @@ fn compile_filter(f: &Filter, e: &Expr, cx: &mut Compiler) -> Result<Node, Query
     };
     let bad_value = || unsupported(f, e, format!("unexpected value for `{}:`", f.name));
     Ok(match (f.name, &f.value) {
-        (FilterName::Ext, FilterValue::Extensions(exts)) => {
-            Node::Ext(exts.iter().map(|x| x.to_lowercase().into()).collect())
-        }
+        (FilterName::Ext, FilterValue::Extensions(exts)) => Node::And(vec![
+            Node::Dir(false),
+            Node::ExtName(exts.iter().map(|x| x.to_lowercase().into()).collect()),
+        ]),
         (FilterName::Type, FilterValue::Kinds(kinds)) => {
             let mut exts: Vec<&'static str> = kinds
                 .iter()
@@ -331,19 +344,24 @@ fn compile_filter(f: &Filter, e: &Expr, cx: &mut Compiler) -> Result<Node, Query
                 .collect();
             exts.sort_unstable();
             exts.dedup();
-            Node::Kind {
-                exts: exts.into(),
-                folders: kinds.contains(&FileKind::Folder),
+            let files = Node::KindExt(exts.into());
+            match (kinds.contains(&FileKind::Folder), files) {
+                (true, Node::KindExt(e)) if e.is_empty() => Node::Dir(true),
+                // A folder matches anyway, so the extension test only decides for files.
+                (true, files) => Node::Or(vec![Node::Dir(true), files]),
+                (false, files) => Node::And(vec![Node::Dir(false), files]),
             }
         }
         (FilterName::Size, FilterValue::Size(cmp)) => match size_range(*cmp) {
             Some((lo, hi)) => Node::Size { lo, hi },
             None => Node::Const(false),
         },
-        (FilterName::DateModified, FilterValue::Date(cmp)) => {
+        (FilterName::DateModified | FilterName::DateCreated, FilterValue::Date(cmp)) => {
             let (lo, hi) = date_range(*cmp, &cx.clock);
             if lo > hi {
                 Node::Const(false)
+            } else if f.name == FilterName::DateCreated {
+                Node::Created { lo, hi }
             } else {
                 Node::Modified { lo, hi }
             }
@@ -390,12 +408,11 @@ fn compile_filter(f: &Filter, e: &Expr, cx: &mut Compiler) -> Result<Node, Query
             ));
         }
         (FilterName::Ext | FilterName::Type | FilterName::Size, _)
-        | (FilterName::DateModified | FilterName::Path, _)
+        | (FilterName::DateModified | FilterName::DateCreated | FilterName::Path, _)
         | (FilterName::Parent | FilterName::InFolder, _)
         | (FilterName::Case | FilterName::WholeWord | FilterName::Fuzzy, _) => {
             return Err(bad_value());
         }
-        (FilterName::DateCreated, _) => return Err(not_yet("creation date")),
         (FilterName::DateAccessed, _) => return Err(not_yet("access date")),
         (FilterName::Content, _) => return Err(not_yet("file contents")),
         (FilterName::Semantic, _) => return Err(not_yet("semantic search")),
@@ -519,12 +536,35 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// The entry being evaluated.
+/// The entry being evaluated. Its names are looked up only when a node needs them.
+#[derive(Clone, Copy)]
 pub(crate) struct Entry<'a> {
     pub(crate) ix: &'a FileIndex,
     pub(crate) id: EntryId,
-    /// Its normalized name.
-    pub(crate) name: &'a str,
+    /// Its distinct-name id (see `index.rs`).
+    pub(crate) nid: u32,
+}
+
+impl<'a> Entry<'a> {
+    pub(crate) fn new(ix: &'a FileIndex, id: EntryId) -> Self {
+        Entry {
+            ix,
+            id,
+            nid: ix.name_ids[id as usize],
+        }
+    }
+
+    /// The normalized name.
+    #[inline]
+    pub(crate) fn name(&self) -> &'a str {
+        self.ix.names.norm.get(self.nid as usize)
+    }
+
+    /// The original name.
+    #[inline]
+    pub(crate) fn original(&self) -> &'a str {
+        self.ix.names.orig.get(self.nid as usize)
+    }
 }
 
 /// Per-task reusable buffers for lazily built paths.
@@ -599,10 +639,11 @@ impl Scratch {
         self.ensure_parent(e.ix, e.id);
         if self.cached_full != Some(e.id) {
             self.path.truncate(self.parent_len());
-            if !self.path.is_empty() && !e.name.is_empty() {
+            let name = e.name();
+            if !self.path.is_empty() && !name.is_empty() {
                 self.path.push(' ');
             }
-            self.path.push_str(e.name);
+            self.path.push_str(name);
             self.cached_full = Some(e.id);
         }
         &self.path
@@ -717,8 +758,12 @@ impl Node {
     fn cost(&self) -> u8 {
         match self {
             Node::Const(_) => 0,
-            Node::Name(_) | Node::CaseSensitive(_) | Node::WholeWord(_) => 1,
-            Node::Ext(_) | Node::Kind { .. } | Node::Size { .. } | Node::Modified { .. } => 2,
+            Node::Name(_) | Node::CaseSensitive(_) | Node::WholeWord(_) | Node::Dir(_) => 1,
+            Node::ExtName(_)
+            | Node::KindExt(_)
+            | Node::Size { .. }
+            | Node::Modified { .. }
+            | Node::Created { .. } => 2,
             Node::Fuzzy(_) => 3,
             Node::Path(_) | Node::Parent(..) | Node::InFolder(..) => 5,
             Node::Not(x) => x.cost(),
@@ -726,20 +771,41 @@ impl Node {
         }
     }
 
+    /// True if the node depends on nothing but the entry's (original or normalized) name, so
+    /// its result can be shared by every entry with the same name.
+    pub(crate) fn is_name_only(&self) -> bool {
+        match self {
+            Node::Const(_)
+            | Node::Name(_)
+            | Node::CaseSensitive(_)
+            | Node::WholeWord(_)
+            | Node::Fuzzy(_)
+            | Node::ExtName(_)
+            | Node::KindExt(_) => true,
+            Node::Dir(_)
+            | Node::Size { .. }
+            | Node::Modified { .. }
+            | Node::Created { .. }
+            | Node::Path(_)
+            | Node::Parent(..)
+            | Node::InFolder(..) => false,
+            Node::Not(x) => x.is_name_only(),
+            Node::And(xs) | Node::Or(xs) => xs.iter().all(Node::is_name_only),
+        }
+    }
+
     pub(crate) fn eval(&self, e: &Entry<'_>, s: &mut Scratch) -> bool {
         match self {
             Node::Const(b) => *b,
-            Node::Name(m) => m.matches(e.name),
-            Node::CaseSensitive(f) => f.find(e.ix.name(e.id).as_bytes()).is_some(),
-            Node::WholeWord(f) => find_words(e.name, f, None),
+            Node::Name(m) => m.matches(e.name()),
+            Node::CaseSensitive(f) => f.find(e.original().as_bytes()).is_some(),
+            Node::WholeWord(f) => find_words(e.name(), f, None),
             Node::Fuzzy(m) => m
-                .score_at_least(e.name, e.ix.name(e.id), &mut s.fuzzy, 0)
+                .score_at_least(e.name(), e.original(), &mut s.fuzzy, 0)
                 .is_some(),
-            Node::Ext(exts) => {
-                if e.ix.meta(e.id).is_dir {
-                    return false;
-                }
-                let ext = extension(e.ix.name(e.id));
+            Node::Dir(dir) => e.ix.is_dir(e.id) == *dir,
+            Node::ExtName(exts) => {
+                let ext = extension(e.original());
                 exts.iter().any(|x| {
                     if x.is_ascii() {
                         x.eq_ignore_ascii_case(ext)
@@ -748,21 +814,17 @@ impl Node {
                     }
                 })
             }
-            Node::Kind { exts, folders } => {
-                if e.ix.meta(e.id).is_dir {
-                    return *folders;
-                }
-                let ext = extension(e.ix.name(e.id));
+            Node::KindExt(exts) => {
+                let ext = extension(e.original());
                 !ext.is_empty() && with_lowercase(ext, |l| exts.binary_search(&l).is_ok())
             }
-            Node::Size { lo, hi } => {
-                let m = e.ix.meta(e.id);
-                !m.is_dir && (*lo..=*hi).contains(&m.size)
-            }
+            Node::Size { lo, hi } => !e.ix.is_dir(e.id) && (*lo..=*hi).contains(&e.ix.size(e.id)),
             Node::Modified { lo, hi } => {
-                e.ix.meta(e.id)
-                    .modified
+                e.ix.modified(e.id)
                     .is_some_and(|t| (*lo..=*hi).contains(&t))
+            }
+            Node::Created { lo, hi } => {
+                e.ix.created(e.id).is_some_and(|t| (*lo..=*hi).contains(&t))
             }
             Node::Path(m) => m.matches(s.full_path(e)),
             Node::Parent(FolderMatcher::Words(f), _) => {
@@ -799,7 +861,7 @@ impl Node {
     /// cannot reach it; `floor = 0` is exactly "matches, and its score".
     pub(crate) fn eval_score(&self, e: &Entry<'_>, s: &mut Scratch, floor: u32) -> Option<u32> {
         match self {
-            Node::Fuzzy(m) => m.score_at_least(e.name, e.ix.name(e.id), &mut s.fuzzy, floor),
+            Node::Fuzzy(m) => m.score_at_least(e.name(), e.original(), &mut s.fuzzy, floor),
             Node::And(xs) => {
                 // The score is the sum of the ranked children's scores. A ranked child must
                 // reach the floor minus what the children before it scored and the most the
@@ -908,7 +970,7 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn score(&self, e: &Entry<'_>, s: &mut Scratch) -> u32 {
         match self {
-            Node::Fuzzy(m) => m.score(e.name, e.ix.name(e.id), &mut s.fuzzy).unwrap_or(0),
+            Node::Fuzzy(m) => m.score(e.name(), e.original(), &mut s.fuzzy).unwrap_or(0),
             Node::And(xs) => xs
                 .iter()
                 .filter(|x| x.is_ranked())
@@ -1001,11 +1063,7 @@ mod tests {
             .chain((0..ix.len() as EntryId).map(|i| (i * 37) % ix.len() as EntryId))
             .collect();
         for id in ids {
-            let e = Entry {
-                ix: &ix,
-                id,
-                name: ix.normalized_name(id),
-            };
+            let e = Entry::new(&ix, id);
             assert_eq!(s.full_path(&e), fresh(id), "id {id}");
             let parent = ix.parent(id).map(fresh).unwrap_or_default();
             assert_eq!(&s.path[..s.parent_len()], parent, "parent of {id}");

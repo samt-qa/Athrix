@@ -24,6 +24,7 @@
 //! `sys` module (Windows only). On other platforms [`Volume::open`] returns
 //! [`NtfsError::Unsupported`].
 
+pub mod bus;
 mod bytes;
 pub mod drives;
 mod error;
@@ -36,6 +37,7 @@ mod sys;
 pub mod tree;
 mod volume;
 
+pub use bus::{BusInfo, BusType, volume_bus};
 pub use error::NtfsError;
 pub use journal::{Change, ChangeBatch, ChangeKind, JournalCursor, JournalInfo, RescanReason};
 pub use tree::{EntryRef, VolumeTree};

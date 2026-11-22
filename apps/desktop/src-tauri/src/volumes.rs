@@ -15,9 +15,21 @@
 //! `network`, indexed only if the user asks). [`signature`] is the cheap poll the drive monitor
 //! ([`crate::drives`]) runs every few seconds; [`diff`] compares two lists by mount path *and*
 //! serial, so another USB stick on the same letter counts as a removal plus an arrival.
+//!
+//! **External disks.** Windows calls most USB hard disks and SSDs "fixed". Each fixed drive's
+//! bus is therefore asked ([`athrix_ntfs::volume_bus`]: USB, FireWire, SD/MMC, removable media
+//! or hot-pluggable, see [`athrix_ntfs::BusInfo::is_external`]); an external one is listed as
+//! [`VolumeKind::Removable`], so everywhere the app treats it like a USB stick: polled rather
+//! than watched (safe removal, [`roots_on_removable_drives`]), taken in by "the whole computer"
+//! only with the removable-drives setting, remembered offline when unplugged, shown with the
+//! USB icon. The answer is cached per drive letter and serial number. If the bus cannot be
+//! asked the drive stays fixed (logged at debug level), and the system drive is always fixed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
+use athrix_ntfs::BusInfo;
 use athrix_ntfs::drives::{DriveProbe, DriveType, probe_drives};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +39,8 @@ use serde::{Deserialize, Serialize};
 pub enum VolumeKind {
     /// An internal (non-removable) disk. Indexed by default.
     Fixed,
-    /// A USB stick, memory card... Not indexed by default.
+    /// A USB stick, memory card, external USB / FireWire disk... Indexed by "the whole
+    /// computer" only if the removable-drives setting says so (default on).
     Removable,
     /// A network share. Not indexed by default.
     Network,
@@ -138,20 +151,26 @@ fn drive_type_code(kind: DriveType) -> u8 {
     }
 }
 
-/// The roots of `roots` that lie on a removable drive (USB stick, memory card) right now:
-/// the roots to poll for changes rather than watch, so no handle stays open on the drive and
-/// Windows can eject it safely (see [`athrix_fs_index::watch`]). Empty outside Windows, where
-/// watching does not prevent unmounting. A cheap probe (no disk access).
+/// The roots of `roots` that lie on a removable or external drive (USB stick, memory card,
+/// USB hard disk; see the module documentation) right now: the roots to poll for changes
+/// rather than watch, so no handle stays open on the drive and Windows can eject it safely (see
+/// [`athrix_fs_index::watch`]). Empty outside Windows, where watching does not prevent
+/// unmounting. Cheap: a drive-letter probe, plus a bus query per fixed drive the first time
+/// it is seen (no disk access).
 pub fn roots_on_removable_drives(roots: &[PathBuf]) -> Vec<PathBuf> {
     if cfg!(windows) {
-        roots_on_kind(roots, &probe_drives(), DriveType::Removable)
+        let external: Vec<DriveProbe> = probe_drives()
+            .into_iter()
+            .filter(|p| is_external(p, cached_bus))
+            .collect();
+        roots_on_drives(roots, &external)
     } else {
         Vec::new()
     }
 }
 
-/// The roots of `roots` whose drive letter is one of `probed` with kind `kind`.
-fn roots_on_kind(roots: &[PathBuf], probed: &[DriveProbe], kind: DriveType) -> Vec<PathBuf> {
+/// The roots of `roots` whose drive letter is one of `drives`.
+fn roots_on_drives(roots: &[PathBuf], drives: &[DriveProbe]) -> Vec<PathBuf> {
     roots
         .iter()
         .filter(|root| {
@@ -160,15 +179,76 @@ fn roots_on_kind(roots: &[PathBuf], probed: &[DriveProbe], kind: DriveType) -> V
             b.len() >= 2
                 && b[0].is_ascii_alphabetic()
                 && b[1] == b':'
-                && probed.iter().any(|p| {
-                    p.kind == kind
-                        && p.root
-                            .get(..2)
-                            .is_some_and(|r| r.eq_ignore_ascii_case(&s[..2]))
+                && drives.iter().any(|p| {
+                    p.root
+                        .get(..2)
+                        .is_some_and(|r| r.eq_ignore_ascii_case(&s[..2]))
                 })
         })
         .cloned()
         .collect()
+}
+
+/// True if the probed drive can be unplugged: a removable drive, or a fixed one whose bus
+/// (asked through `bus`, `None` if that failed) is external ([`BusInfo::is_external`]). The
+/// system drive is never external (Windows To Go on a USB disk stays watched: polling it
+/// would rescan the whole system disk), and a fixed drive whose bus is unknown stays fixed.
+fn is_external(probe: &DriveProbe, bus: impl FnOnce(&DriveProbe) -> Option<BusInfo>) -> bool {
+    match probe.kind {
+        DriveType::Removable => true,
+        DriveType::Fixed => {
+            !is_system_drive(&probe.root) && bus(probe).is_some_and(|b| b.is_external())
+        }
+        _ => false,
+    }
+}
+
+/// True if `root` is on the Windows system drive (`%SystemDrive%`, `C:` if unset).
+fn is_system_drive(root: &str) -> bool {
+    let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    match (root.get(..2), system.get(..2)) {
+        (Some(r), Some(s)) => r.eq_ignore_ascii_case(s),
+        _ => false,
+    }
+}
+
+/// At most this many bus answers are cached (then the cache starts over).
+const MAX_CACHED_BUSES: usize = 64;
+
+/// [`athrix_ntfs::volume_bus`] for `probe`, cached by drive letter and serial number (the
+/// same volume on the same letter is on the same bus), so polling does not reopen the drive.
+/// Failures are logged at debug level, not cached, and give `None`.
+fn cached_bus(probe: &DriveProbe) -> Option<BusInfo> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), BusInfo>>> = OnceLock::new();
+    let key = probe.serial.map(|s| (probe.root.to_ascii_uppercase(), s));
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some(key) = &key {
+        let hit = cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .copied();
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    match athrix_ntfs::volume_bus(&probe.root) {
+        Ok(info) => {
+            tracing::debug!(root = %probe.root, ?info, "drive bus");
+            if let Some(key) = key {
+                let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
+                if c.len() >= MAX_CACHED_BUSES {
+                    c.clear();
+                }
+                c.insert(key, info);
+            }
+            Some(info)
+        }
+        Err(e) => {
+            tracing::debug!(root = %probe.root, error = %e, "cannot ask the drive's bus; treating it as fixed");
+            None
+        }
+    }
 }
 
 /// Lists the volumes of this computer, sorted by path (drive letter on Windows). May block for
@@ -196,7 +276,7 @@ pub fn list_volumes() -> Vec<Volume> {
         if found.is_empty() {
             found = probe_drive_letters();
         }
-        add_probe_details(&mut found, &probe_drives());
+        add_probe_details(&mut found, &probe_drives(), cached_bus);
     }
     if !cfg!(windows) && !found.iter().any(|v| v.path == "/") {
         found.push(volume(Path::new("/"), None, VolumeKind::Fixed));
@@ -261,12 +341,20 @@ fn is_listed_mount(mount: &Path) -> bool {
             .any(|p| s.starts_with(p) && s.len() > p.len())
 }
 
-/// Fills in the serial numbers from the drive-letter probe and adds the mapped network drives
-/// (which the volume API does not list).
-fn add_probe_details(found: &mut Vec<Volume>, probed: &[DriveProbe]) {
+/// Fills in the serial numbers from the drive-letter probe, lists the external fixed drives
+/// (bus asked through `bus`, see [`is_external`]) as removable, and adds the mapped network
+/// drives (which the volume API does not list).
+fn add_probe_details(
+    found: &mut Vec<Volume>,
+    probed: &[DriveProbe],
+    mut bus: impl FnMut(&DriveProbe) -> Option<BusInfo>,
+) {
     for v in found.iter_mut() {
         if let Some(p) = probed.iter().find(|p| p.root.eq_ignore_ascii_case(&v.path)) {
             v.serial = p.serial;
+            if v.kind == VolumeKind::Fixed && is_external(p, &mut bus) {
+                v.kind = VolumeKind::Removable;
+            }
         }
     }
     for p in probed {
@@ -296,6 +384,7 @@ fn sort_and_dedup(mut volumes: Vec<Volume>) -> Vec<Volume> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use athrix_ntfs::BusType;
 
     #[test]
     fn lists_something_sane_on_this_machine() {
@@ -424,8 +513,9 @@ mod tests {
                 serial: None,
             },
         ];
-        add_probe_details(&mut found, &probed);
+        add_probe_details(&mut found, &probed, |_| None);
         assert_eq!(found[0].serial, Some(7));
+        assert_eq!(found[0].kind, VolumeKind::Fixed, "bus unknown: stays fixed");
         assert_eq!(found.len(), 2, "network yes, optical no: {found:?}");
         assert_eq!(
             (found[1].name.as_str(), found[1].kind),
@@ -455,8 +545,13 @@ mod tests {
             PathBuf::from("/media/usb"),
             PathBuf::from("\\\\server\\share"),
         ];
+        let removable: Vec<DriveProbe> = probed
+            .iter()
+            .filter(|p| is_external(p, |_| None))
+            .cloned()
+            .collect();
         assert_eq!(
-            roots_on_kind(&roots, &probed, DriveType::Removable),
+            roots_on_drives(&roots, &removable),
             [PathBuf::from("e:\\Photos"), PathBuf::from("E:\\")]
         );
         // The system drive is never removable.
@@ -466,6 +561,134 @@ mod tests {
         } else {
             assert!(roots_on_removable_drives(&roots).is_empty());
         }
+    }
+
+    fn probe(root: &str, kind: DriveType) -> DriveProbe {
+        DriveProbe {
+            root: root.into(),
+            kind,
+            serial: Some(1),
+        }
+    }
+
+    fn on_bus(bus: BusType) -> Option<BusInfo> {
+        Some(BusInfo {
+            bus,
+            ..BusInfo::default()
+        })
+    }
+
+    #[test]
+    fn external_disks_are_told_apart_by_their_bus() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let other = if system.eq_ignore_ascii_case("Q:") {
+            "R:\\"
+        } else {
+            "Q:\\"
+        };
+        let fixed = probe(other, DriveType::Fixed);
+        // A fixed disk on USB / FireWire / SD is external; on SATA / NVMe it is not.
+        for bus in [BusType::Usb, BusType::Ieee1394, BusType::Sd, BusType::Mmc] {
+            assert!(is_external(&fixed, |_| on_bus(bus)), "{bus:?}");
+        }
+        for bus in [BusType::Sata, BusType::Nvme, BusType::Unknown] {
+            assert!(!is_external(&fixed, |_| on_bus(bus)), "{bus:?}");
+        }
+        let hotplug = BusInfo {
+            bus: BusType::Nvme,
+            device_hotplug: true,
+            ..BusInfo::default()
+        };
+        assert!(is_external(&fixed, |_| Some(hotplug)), "hot-pluggable");
+        // The probe failed: current behaviour (fixed).
+        assert!(!is_external(&fixed, |_| None));
+        // Removable drives need no bus query; network / optical never count.
+        let asked = std::cell::Cell::new(false);
+        let ask = |_: &DriveProbe| {
+            asked.set(true);
+            on_bus(BusType::Usb)
+        };
+        assert!(is_external(&probe(other, DriveType::Removable), ask));
+        assert!(!is_external(&probe(other, DriveType::Remote), ask));
+        assert!(!is_external(&probe(other, DriveType::CdRom), ask));
+        assert!(!asked.get());
+        // The system drive is never external, even on USB (Windows To Go).
+        let sys = probe(&format!("{}\\", &system[..2]), DriveType::Fixed);
+        assert!(!is_external(&sys, |_| on_bus(BusType::Usb)));
+    }
+
+    #[test]
+    fn external_fixed_disks_are_listed_and_polled_as_removable() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let sys_root = format!("{}\\", system[..2].to_ascii_uppercase());
+        let (internal, usb_disk) = if sys_root == "D:\\" {
+            ("E:\\", "F:\\")
+        } else {
+            ("D:\\", "F:\\")
+        };
+        let mut found = vec![
+            volume(Path::new(&sys_root), None, VolumeKind::Fixed),
+            volume(Path::new(internal), None, VolumeKind::Fixed),
+            volume(
+                Path::new(usb_disk),
+                Some("Backup".into()),
+                VolumeKind::Fixed,
+            ),
+        ];
+        let probed = [
+            probe(&sys_root, DriveType::Fixed),
+            probe(internal, DriveType::Fixed),
+            probe(usb_disk, DriveType::Fixed),
+        ];
+        let bus = |p: &DriveProbe| {
+            if p.root == usb_disk {
+                on_bus(BusType::Usb)
+            } else {
+                on_bus(BusType::Nvme)
+            }
+        };
+        add_probe_details(&mut found, &probed, bus);
+        assert_eq!(
+            found.iter().map(|v| v.kind).collect::<Vec<_>>(),
+            [VolumeKind::Fixed, VolumeKind::Fixed, VolumeKind::Removable]
+        );
+        // "The whole computer" leaves it to the removable-drives setting.
+        if cfg!(windows) {
+            assert!(!whole_computer_roots(&found).contains(&PathBuf::from(usb_disk)));
+        }
+        // And its roots are polled rather than watched.
+        let external: Vec<DriveProbe> = probed
+            .iter()
+            .filter(|p| is_external(p, bus))
+            .cloned()
+            .collect();
+        let roots = [
+            PathBuf::from(&sys_root),
+            PathBuf::from(internal),
+            PathBuf::from(format!("{usb_disk}Photos")),
+        ];
+        assert_eq!(
+            roots_on_drives(&roots, &external),
+            [PathBuf::from(format!("{usb_disk}Photos"))]
+        );
+    }
+
+    #[test]
+    fn the_internal_disks_of_this_machine_stay_fixed() {
+        // No external disk is expected on a development / CI machine's system drive.
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let root = format!("{}\\", &system[..2]);
+        let p = DriveProbe {
+            root: root.clone(),
+            kind: DriveType::Fixed,
+            serial: None,
+        };
+        let info = cached_bus(&p);
+        if cfg!(windows) {
+            let info = info.expect("the system drive's bus can be asked");
+            assert!(!info.is_external(), "{info:?}");
+        }
+        assert!(roots_on_removable_drives(&[PathBuf::from(root)]).is_empty());
     }
 
     #[test]

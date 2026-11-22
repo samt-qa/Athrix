@@ -10,8 +10,8 @@
 //!
 //! What is decoded per FILE record (after update-sequence fixups):
 //! * header: in-use and directory flags, sequence number, base record reference;
-//! * `$STANDARD_INFORMATION` (0x10): last-write `FILETIME` (what Explorer shows as
-//!   "Date modified");
+//! * `$STANDARD_INFORMATION` (0x10): creation and last-write `FILETIME`s (what Explorer
+//!   shows as "Date created" and "Date modified");
 //! * unnamed `$DATA` (0x80): logical size (`value length` when resident, `DataSize` of the
 //!   first extent when non-resident). Extension records (base reference ≠ 0) carrying the
 //!   first `$DATA` extent are attributed to their base record, so heavily fragmented files
@@ -127,6 +127,8 @@ pub struct FileRecordInfo {
     pub is_dir: bool,
     /// Last-write `FILETIME` from `$STANDARD_INFORMATION`.
     pub modified_filetime: Option<i64>,
+    /// Creation `FILETIME` from `$STANDARD_INFORMATION`.
+    pub created_filetime: Option<i64>,
     /// Logical size of the unnamed `$DATA` stream (only from its first extent).
     pub data_size: Option<u64>,
     /// The record has an `$ATTRIBUTE_LIST` (attributes continue in extension records).
@@ -173,6 +175,7 @@ pub fn parse_file_record(rec: &[u8]) -> Result<Option<FileRecordInfo>, RecordErr
         match ty {
             ATTR_STANDARD_INFORMATION if !non_resident => {
                 let value = resident_value(attr)?;
+                info.created_filetime = i64_at(value, 0);
                 info.modified_filetime = i64_at(value, 8);
             }
             ATTR_ATTRIBUTE_LIST => info.has_attribute_list = true,
@@ -397,12 +400,13 @@ impl MftScan {
                     i,
                     size,
                     info.modified_filetime.and_then(filetime_to_unix_seconds),
+                    info.created_filetime.and_then(filetime_to_unix_seconds),
                 );
             }
         } else if let (Some(size), false) = (info.data_size, info.is_dir) {
             // First $DATA extent stored in an extension record: belongs to the base file.
             if let Some(i) = self.lookup.get(info.base_ref) {
-                tree.set_metadata(i, Some(size), None);
+                tree.set_metadata(i, Some(size), None, None);
             }
         }
     }
@@ -412,6 +416,10 @@ impl MftScan {
 #[cfg(test)]
 pub(crate) mod build {
     use super::*;
+
+    /// The builders' files were created this long (one day, in FILETIME ticks) before their
+    /// last write.
+    pub(crate) const CREATED_BEFORE: i64 = 86_400 * 10_000_000;
 
     pub(crate) struct Rec {
         pub(crate) buf: Vec<u8>,
@@ -444,12 +452,17 @@ pub(crate) mod build {
         }
 
         pub(crate) fn std_info(&mut self, modified: i64) -> &mut Self {
+            self.std_info_times(modified - CREATED_BEFORE, modified)
+        }
+
+        pub(crate) fn std_info_times(&mut self, created: i64, modified: i64) -> &mut Self {
             let mut a = vec![0u8; 24 + 48];
             a[0..4].copy_from_slice(&ATTR_STANDARD_INFORMATION.to_le_bytes());
             let alen = a.len() as u32;
             a[4..8].copy_from_slice(&alen.to_le_bytes());
             a[16..20].copy_from_slice(&48u32.to_le_bytes());
             a[20..22].copy_from_slice(&24u16.to_le_bytes());
+            a[24..24 + 8].copy_from_slice(&created.to_le_bytes());
             a[24 + 8..24 + 16].copy_from_slice(&modified.to_le_bytes());
             self.attr(&a)
         }
@@ -554,6 +567,7 @@ mod tests {
         assert_eq!(info.sequence, 3);
         assert!(info.in_use && !info.is_dir);
         assert_eq!(info.modified_filetime, Some(FT_2024));
+        assert_eq!(info.created_filetime, Some(FT_2024 - build::CREATED_BEFORE));
         assert_eq!(info.data_size, Some(300));
         assert!(!info.has_attribute_list);
     }
@@ -722,6 +736,7 @@ mod tests {
             assert_eq!(by_name("dir").modified, Some(1_704_067_200));
             assert_eq!(by_name("small.txt").size, Some(42));
             assert_eq!(by_name("small.txt").modified, Some(1_704_067_201));
+            assert_eq!(by_name("small.txt").created, Some(1_704_067_201 - 86_400));
             assert_eq!(by_name("big.bin").size, Some(7 << 30));
             assert_eq!(by_name("big.bin").modified, Some(1_704_067_200));
         }

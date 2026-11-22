@@ -100,3 +100,134 @@ proptest! {
             "{:?} vs {:?}: {:?}", bare, name, found);
     }
 }
+
+/// Names drawn from a small pool, so most entries share their name with others (as on a real
+/// disk), with folders and files of every kind, sizes and both times.
+fn shared_names_index(seed: u64, entries: usize) -> athrix_fs_index::FileIndex {
+    const POOL: &[&str] = &[
+        "index.js",
+        "Index.JS",
+        "report.pdf",
+        "Report 2026.PDF",
+        "تقرير_مالي.docx",
+        "التقرير السنوي.xlsx",
+        "cover.jpg",
+        "META-INF",
+        "MonthlyReportSummary.txt",
+        "notes",
+        "README.md",
+        "فاتورة.pdf",
+        "clip.mp4",
+        "archive.tar.gz",
+        "",
+    ];
+    let mut x = seed | 1;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut b = IndexBuilder::new();
+    let root = b.push(
+        None,
+        "/r",
+        EntryMeta {
+            is_dir: true,
+            ..Default::default()
+        },
+    );
+    let mut dirs = vec![root];
+    for i in 0..entries {
+        let r = next();
+        let parent = dirs[(r as usize >> 8) % dirs.len()];
+        let name = if r % 7 == 0 {
+            format!("{} {}", POOL[(r >> 20) as usize % POOL.len()], i % 50)
+        } else {
+            POOL[(r >> 20) as usize % POOL.len()].to_owned()
+        };
+        let is_dir = r % 5 == 0;
+        let t = |k: u64| (r >> k) % 3 != 0;
+        let id = b.push(
+            Some(parent),
+            &name,
+            EntryMeta {
+                is_dir,
+                size: if is_dir { 0 } else { (r >> 33) % (4 << 20) },
+                modified: t(40).then_some(NOW - ((r >> 41) % 800) as i64 * 86_400),
+                created: t(50).then_some(NOW - ((r >> 51) % 800) as i64 * 86_400),
+                ..Default::default()
+            },
+        );
+        if is_dir {
+            dirs.push(id);
+        }
+    }
+    b.finish()
+}
+
+const SHARED_QUERIES: &[&str] = &[
+    "report",
+    "index",
+    "تقرير",
+    "*.pdf",
+    "ext:pdf",
+    "ext:pdf;docx size:>1mb",
+    "type:image",
+    "type:folder|image",
+    "type:folder",
+    "case:Report",
+    "ww:notes",
+    "report !ext:pdf",
+    "notes | size:<1kb",
+    "dc:lastmonth",
+    "dc:thisyear dm:<2026-06",
+    "parent:notes report",
+    "index dc:>2026-01",
+    "fuzzy:rprt",
+    "fuzzy:mrs",
+    "fuzzy: report 2026",
+    "fuzzy:rprt ext:pdf",
+    "fuzzy:rprt size:>1kb",
+    "fuzzy:idx | notes",
+];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Sharing name-only work between entries of the same name (the per-search memo) gives
+    /// exactly the per-entry results, for every limit, ranked or not, and across many
+    /// searches on one index (memo reuse and epoch wrap-around).
+    #[test]
+    fn shared_name_work_equals_per_entry_evaluation(seed in any::<u64>(), big in any::<bool>()) {
+        let ix = shared_names_index(seed, if big { 40_000 } else { 3_000 });
+        prop_assert!(ix.distinct_names() < ix.len() / 4);
+        let no = AtomicBool::new(false);
+        for round in 0..3 {
+            for text in SHARED_QUERIES {
+                let q = compile(text).expect("parses");
+                let ids = || 0..ix.len() as EntryId;
+                let expected: Vec<EntryId> = if q.is_ranked() {
+                    let mut all: Vec<(u32, EntryId)> = ids()
+                        .filter_map(|id| ix.score(&q, id).map(|s| (s, id)))
+                        .collect();
+                    all.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
+                    all.into_iter().map(|(_, id)| id).collect()
+                } else {
+                    ids().filter(|&id| ix.is_match(&q, id)).collect()
+                };
+                for limit in [1, 7, 200, usize::MAX] {
+                    let got = ix.search(&q, limit, &no).unwrap();
+                    let want = &expected[..limit.min(expected.len())];
+                    prop_assert_eq!(&got[..], want, "{} limit {} round {}", text, limit, round);
+                }
+                let unordered = ix.search(&q.unordered(), usize::MAX, &no).unwrap();
+                let mut sorted = unordered.clone();
+                sorted.sort_unstable();
+                let mut want = expected.clone();
+                want.sort_unstable();
+                prop_assert_eq!(sorted, want, "{} unordered", text);
+            }
+        }
+    }
+}

@@ -285,6 +285,41 @@ fn left_alone() {
 }
 
 #[test]
+fn creation_and_access_dates_are_enabled_separately() {
+    let with =
+        |options: InterpretOptions, text: &str| interpret_with(text, &options).map(|i| i.query);
+    let base = InterpretOptions::with_today(TODAY);
+    let created = base.with_created_dates();
+    let cases = [
+        ("ملفات أُنشئت أمس", "dc:yesterday", "dm:yesterday"),
+        ("files created in 2024", "dc:2024", "dm:2024"),
+        ("ملفات فُتحت أمس", "dm:yesterday", "dm:yesterday"),
+        ("files opened yesterday", "dm:yesterday", "dm:yesterday"),
+        (
+            "صور أنشأتها الشهر الماضي",
+            "type:image dc:lastmonth",
+            "type:image dm:lastmonth",
+        ),
+    ];
+    for (text, with_created, neither) in cases {
+        assert_eq!(with(created, text).as_deref(), Some(with_created), "{text}");
+        assert_eq!(with(base, text).as_deref(), Some(neither), "{text}");
+    }
+    let accessed = InterpretOptions {
+        accessed_dates: true,
+        ..base
+    };
+    assert_eq!(
+        with(accessed, "files opened yesterday").as_deref(),
+        Some("da:yesterday")
+    );
+    assert_eq!(
+        with(accessed, "files created in 2024").as_deref(),
+        Some("dm:2024")
+    );
+}
+
+#[test]
 fn relative_dates_need_today() {
     assert_eq!(interpret("ملفات قبل 3 أيام"), None);
     assert_eq!(interpret("files from the last 7 days"), None);

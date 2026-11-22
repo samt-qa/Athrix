@@ -166,8 +166,8 @@ eq("مح → محتوى", labels(at("مح")), ["محتوى:"]);
 {
   const q = (text: string) => mockInterpret(text)?.query ?? null;
   eq("nl: modified by default", q("ملفات PDF من الأسبوع الماضي"), "ext:pdf dm:lastweek");
-  eq("nl: created (harakat)", q("ملفات أُنشئت أمس"), "dm:yesterday");
-  eq("nl: created + preposition", q("صور أنشأتها من الشهر الماضي"), "type:image dm:lastmonth");
+  eq("nl: created (harakat)", q("ملفات أُنشئت أمس"), "dc:yesterday");
+  eq("nl: created + preposition", q("صور أنشأتها من الشهر الماضي"), "type:image dc:lastmonth");
   eq("nl: opened", q("files opened yesterday"), "dm:yesterday");
   eq("nl: accessed from", q("documents accessed from last week"), "type:doc dm:lastweek");
   eq("nl: large files", q("ملفات كبيرة"), "size:>100mb");
@@ -180,7 +180,8 @@ eq("مح → محتوى", labels(at("مح")), ["محتوى:"]);
   eq("nl: plain names left alone", q("تقرير المبيعات"), null);
   eq("nl: filter syntax left alone", q("ext:pdf from last week"), null);
   const it = mockInterpret("ملفات أُنشئت أمس");
-  eq("nl: parts cover the words", it?.parts.map((p) => [p.role, p.output]), [["ignored", ""], ["date", "dm:yesterday"]]);
+  eq("nl: parts cover the words", it?.parts.map((p) => [p.role, p.output]), [["ignored", ""], ["date", "dc:yesterday"]]);
+  eq("nl: created (English)", q("files created last month"), "dc:lastmonth");
 }
 
 if (failures) {

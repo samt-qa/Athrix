@@ -17,7 +17,7 @@ use crate::{
 
 /// Parent index of the root entry.
 pub const NO_PARENT: u32 = u32::MAX;
-/// Stored modification time meaning "unknown".
+/// Stored modification or creation time meaning "unknown".
 const NO_MTIME: i64 = i64::MIN;
 
 /// Collects USN records of one volume.
@@ -172,6 +172,7 @@ impl TreeBuilder {
             attributes: Vec::with_capacity(len),
             sizes: vec![0; len],
             mtimes: vec![NO_MTIME; len],
+            ctimes: vec![NO_MTIME; len],
             orphans: n + 1 - len,
             has_metadata: false,
         };
@@ -271,6 +272,7 @@ pub struct VolumeTree {
     attributes: Vec<u32>,
     sizes: Vec<u64>,
     mtimes: Vec<i64>,
+    ctimes: Vec<i64>,
     orphans: usize,
     has_metadata: bool,
 }
@@ -292,6 +294,8 @@ pub struct EntryRef<'a> {
     pub size: Option<u64>,
     /// Last modification time (seconds since the Unix epoch), if metadata was read.
     pub modified: Option<i64>,
+    /// Creation time (seconds since the Unix epoch), if metadata was read.
+    pub created: Option<i64>,
 }
 
 impl EntryRef<'_> {
@@ -369,6 +373,7 @@ impl VolumeTree {
             attributes: self.attributes[k],
             size: self.has_metadata.then_some(self.sizes[k]),
             modified: Some(self.mtimes[k]).filter(|&m| m != NO_MTIME),
+            created: Some(self.ctimes[k]).filter(|&c| c != NO_MTIME),
         }
     }
 
@@ -393,16 +398,25 @@ impl VolumeTree {
         RefLookup::build(&self.file_refs)
     }
 
-    /// Sets the size and/or modification time of entry `i` (used by the MFT reader, and by
-    /// tests or other metadata sources); `None` leaves a field unchanged. Sizes are only
-    /// reported by [`VolumeTree::get`] once [`VolumeTree::mark_metadata`] was called.
-    pub fn set_metadata(&mut self, i: u32, size: Option<u64>, mtime: Option<i64>) {
+    /// Sets the size, modification and/or creation time of entry `i` (used by the MFT
+    /// reader, and by tests or other metadata sources); `None` leaves a field unchanged. Sizes
+    /// are only reported by [`VolumeTree::get`] once [`VolumeTree::mark_metadata`] was called.
+    pub fn set_metadata(
+        &mut self,
+        i: u32,
+        size: Option<u64>,
+        mtime: Option<i64>,
+        ctime: Option<i64>,
+    ) {
         let k = i as usize;
         if let (Some(s), Some(slot)) = (size, self.sizes.get_mut(k)) {
             *slot = s;
         }
         if let (Some(m), Some(slot)) = (mtime, self.mtimes.get_mut(k)) {
             *slot = m;
+        }
+        if let (Some(c), Some(slot)) = (ctime, self.ctimes.get_mut(k)) {
+            *slot = c;
         }
     }
 
@@ -420,6 +434,7 @@ impl VolumeTree {
             + self.attributes.capacity() * 4
             + self.sizes.capacity() * 8
             + self.mtimes.capacity() * 8
+            + self.ctimes.capacity() * 8
     }
 }
 

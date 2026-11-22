@@ -22,7 +22,10 @@
 //!
 //! **Safe removal.** Roots on removable drives are polled rather than watched by the OS (see
 //! [`crate::indexing::POLL_INTERVAL`]), so Athrix keeps no handle open on a USB stick and
-//! Windows' "safely remove" is not refused because of it.
+//! Windows' "safely remove" is not refused because of it. External USB / FireWire disks that
+//! Windows calls "fixed" are found by their bus and listed as removable
+//! ([`crate::volumes`]), so they are polled, remembered offline and governed by the
+//! removable-drives setting like sticks.
 //!
 //! Commands: [`get_drive_settings`] / [`set_drive_settings`] (persisted next to
 //! `indexed-roots.json`, see [`crate::roots::DRIVE_SETTINGS_FILE`]).
@@ -82,7 +85,7 @@ struct MonitorState {
 pub struct KnownDrive {
     /// The drive root, e.g. `E:\`.
     pub root: PathBuf,
-    /// Removable or network.
+    /// Removable (sticks, cards, external disks) or network.
     pub kind: VolumeKind,
     /// The volume serial number, if known: the same drive seen under another letter replaces
     /// this entry.

@@ -28,9 +28,30 @@
 //! Results come back in index (walk) order, except for queries with fuzzy terms (`fuzzy:`),
 //! which come back best first (see [`Query::is_ranked`] and `fuzzy.rs`). General ranking of
 //! plain results is a later task.
+//!
+//! # Sharing work between equal names
+//!
+//! Names are interned (`index.rs`): about two entries in three share their name with another
+//! one. A scan therefore evaluates the part of a query that depends only on the name once per
+//! distinct name and remembers the answer in a per-search memo (one byte per distinct name,
+//! pooled and epoch-tagged so it is never cleared between searches):
+//!
+//! - a query that depends only on names (plain terms, `ext:`/`type:` extension checks,
+//!   `case:`, `ww:`, `fuzzy:`...) is fully memoized; other entries with the same name cost one
+//!   byte load;
+//! - an unranked AND mixing name-only children with others (`report size:>1mb`) memoizes the
+//!   name-only children and evaluates the rest per entry;
+//! - a ranked query that depends only on names memoizes *rejections* only: an entry that does
+//!   not match, or scores below the score floor, stays rejected for the rest of the search
+//!   because the floor only rises (matches are scored again, they are few);
+//! - anything else is evaluated per entry, as before.
+//!
+//! Every memoized answer is exactly what the evaluation would give for each entry of that
+//! name, so results and their order do not change.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use athrix_core::{Error, Result};
 use athrix_query::{FilterName, ParseError, Span};
@@ -38,7 +59,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 
 use crate::exec::{self, Clock, Entry, Node, Scratch};
-use crate::index::{EntryId, FileIndex};
+use crate::index::{EntryId, FileIndex, NameMemo};
 
 /// Entries scanned per parallel task.
 const CHUNK: usize = 16 * 1024;
@@ -132,9 +153,19 @@ pub struct Query {
     ranked: bool,
     /// Any `limit` matches will do, in no particular order (see [`Query::unordered`]).
     unordered: bool,
-    /// For a tree plan: byte sets every matching name holds a byte of, so scans skip the
-    /// other names without evaluating them (see [`Keys`]).
-    keys: Keys,
+    /// How scans share name-only work between entries (see the module docs).
+    split: Split,
+}
+
+/// How a scan shares the name-only part of a query between entries with the same name.
+#[derive(Debug, Clone)]
+enum Split {
+    /// Nothing is shared: every entry evaluates the whole plan (after the key check).
+    None(Keys),
+    /// The whole plan depends only on the name.
+    Whole(Keys),
+    /// An unranked AND: `name` (its name-only children) is shared, `rest` runs per entry.
+    Part { name: Node, keys: Keys, rest: Node },
 }
 
 /// Up to three bytes at least one of which the normalized name of every match contains: the
@@ -181,6 +212,19 @@ impl KeyBytes {
 struct Keys([Option<KeyBytes>; 2]);
 
 impl Keys {
+    /// False if `name` misses every byte of some key set (the entry cannot match).
+    #[inline]
+    fn admit(&self, name: &str) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .all(|k| k.find(name.as_bytes()).is_some())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+
     fn of(node: &Node) -> Keys {
         let mut sets = node.key_char_sets();
         sets.sort_by_key(|(_, cost)| *cost);
@@ -193,47 +237,6 @@ impl Keys {
             *slot = Some(bytes);
         }
         keys
-    }
-}
-
-/// Walks the names of a scan in order and tells which can be skipped: those missing every
-/// byte of some key set. About one memchr per candidate name and set; the names in between
-/// cost a comparison.
-struct KeySkip<'a> {
-    /// The scanned names' text, up to the end of the last one.
-    text: &'a [u8],
-    /// Per key set: the set, and the position of its next byte at or after the last search
-    /// (`usize::MAX` if none; `None` before the first search).
-    cursors: [Option<(KeyBytes, Option<usize>)>; 2],
-}
-
-impl<'a> KeySkip<'a> {
-    fn new(keys: Keys, text: &'a [u8]) -> Self {
-        KeySkip {
-            text,
-            cursors: keys.0.map(|k| k.map(|k| (k, None))),
-        }
-    }
-
-    /// True if the name at `from..to` misses some key set (`from` only increases).
-    #[inline]
-    fn skip(&mut self, from: usize, to: usize) -> bool {
-        for (keys, next) in self.cursors.iter_mut().flatten() {
-            let at = match *next {
-                Some(at) if at >= from => at,
-                _ => {
-                    let at = keys
-                        .find(&self.text[from..])
-                        .map_or(usize::MAX, |p| p + from);
-                    *next = Some(at);
-                    at
-                }
-            };
-            if at >= to {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -306,15 +309,34 @@ impl Query {
             other => Plan::Tree(other),
         };
         let ranked = matches!(&plan, Plan::Tree(n) if n.is_ranked());
-        let keys = match &plan {
-            Plan::Tree(n) => Keys::of(n),
-            _ => Keys::default(),
+        let split = match &plan {
+            Plan::All | Plan::Nothing => Split::None(Keys::default()),
+            Plan::Names(_) => Split::Whole(Keys::default()),
+            Plan::Tree(n) if n.is_name_only() => Split::Whole(Keys::of(n)),
+            Plan::Tree(Node::And(xs)) if !ranked && xs.iter().any(Node::is_name_only) => {
+                let (name, rest): (Vec<Node>, Vec<Node>) =
+                    xs.iter().cloned().partition(Node::is_name_only);
+                let and = |mut v: Vec<Node>| {
+                    if v.len() == 1 {
+                        v.pop().unwrap_or(Node::Const(true))
+                    } else {
+                        Node::And(v)
+                    }
+                };
+                let name = and(name);
+                Split::Part {
+                    keys: Keys::of(&name),
+                    name,
+                    rest: and(rest),
+                }
+            }
+            Plan::Tree(n) => Split::None(Keys::of(n)),
         };
         Ok(Query {
             plan,
             ranked,
             unordered: false,
-            keys,
+            split,
         })
     }
 
@@ -336,7 +358,7 @@ impl Query {
             plan: self.plan.clone(),
             ranked: false,
             unordered: true,
-            keys: self.keys,
+            split: self.split.clone(),
         }
     }
 
@@ -592,10 +614,9 @@ impl FileIndex {
     /// # Panics
     /// If `id` is out of range.
     pub fn score(&self, query: &Query, id: EntryId) -> Option<u32> {
-        let name = self.normalized_name(id);
         match &query.plan {
             Plan::Tree(node) if query.ranked => {
-                let e = Entry { ix: self, id, name };
+                let e = Entry::new(self, id);
                 node.eval_score(&e, &mut Scratch::default(), 0)
             }
             _ => self.is_match(query, id).then_some(0),
@@ -630,6 +651,7 @@ impl FileIndex {
         let wave = rayon::current_num_threads().max(1) * 4;
         // The lowest score that can still make the final top `limit` (see `scan_scored`).
         let floor = AtomicU32::new(0);
+        let eval = Eval::new(self, query);
         let mut first = 0;
         while first < chunks {
             if cancel.load(Ordering::Relaxed) {
@@ -640,8 +662,7 @@ impl FileIndex {
                 .into_par_iter()
                 .map(|c| {
                     let end = ((c + 1) * CHUNK).min(n);
-                    let keys = query.keys;
-                    self.scan_scored(c * CHUNK, end, node, keys, limit, cancel, mask, &floor)
+                    eval.scan_scored(c * CHUNK, end, node, limit, cancel, mask, &floor)
                 })
                 .collect();
             for part in parts {
@@ -651,71 +672,9 @@ impl FileIndex {
             raise_floor(&floor, &out, limit);
             first = last;
         }
+        eval.finish();
         out.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
         Ok(out)
-    }
-
-    /// Scans ids `start..end` for a ranked query, keeping the best `limit`; `None` if
-    /// cancelled.
-    ///
-    /// `floor` is shared by every chunk of the search: once some chunk (or the merged waves
-    /// before) holds `limit` hits, the lowest of their scores is a lower bound for the final
-    /// top `limit`, so entries scoring below it can be skipped, and fuzzy terms do not even
-    /// try the tiers that cannot reach it ([`Node::eval_score`]). Exact: an entry scoring at
-    /// least the floor is never skipped, and ties are kept for the final (score, id) order.
-    #[allow(clippy::too_many_arguments)]
-    fn scan_scored(
-        &self,
-        start: usize,
-        end: usize,
-        node: &Node,
-        keys: Keys,
-        limit: usize,
-        cancel: &AtomicBool,
-        mask: Option<&[u64]>,
-        floor: &AtomicU32,
-    ) -> Option<Vec<(u32, EntryId)>> {
-        let arena = &self.normalized;
-        let text = arena.text.as_str();
-        let mut hits = Vec::new();
-        let mut from = if start == 0 {
-            0
-        } else {
-            arena.ends[start - 1] as usize
-        };
-        let mut scratch = Scratch::default();
-        let mut local = 0;
-        let mut skip = KeySkip::new(keys, &text.as_bytes()[..chunk_text_end(arena, end)]);
-        for (i, &to) in arena.ends[start..end].iter().enumerate() {
-            if i % FLOOR_CHECK_EVERY == 0 {
-                if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
-                local = local.max(floor.load(Ordering::Relaxed));
-            }
-            let to = to as usize;
-            let name_from = from;
-            from = to;
-            if skip.skip(name_from, to) {
-                continue;
-            }
-            let name = &text[name_from..to];
-            let id = (start + i) as EntryId;
-            if mask.is_some_and(|m| bit_is_set(m, id)) {
-                continue;
-            }
-            let e = Entry { ix: self, id, name };
-            if let Some(score) = node.eval_score(&e, &mut scratch, local) {
-                hits.push((score, id));
-                if hits.len() >= limit.saturating_mul(2).max(1024) {
-                    keep_best(&mut hits, limit);
-                    local = local.max(raise_floor(floor, &hits, limit));
-                }
-            }
-        }
-        keep_best(&mut hits, limit);
-        raise_floor(floor, &hits, limit);
-        Some(hits)
     }
 
     /// [`FileIndex::search`] that skips every id whose bit is set in `mask` (bit `id % 64` of
@@ -736,7 +695,7 @@ impl FileIndex {
                 .collect());
         }
         let n = self.len();
-        let mut out = Vec::new();
+        let out = Vec::new();
         if limit == 0 {
             return Ok(out);
         }
@@ -747,14 +706,32 @@ impl FileIndex {
             return Ok(out);
         }
         let chunks = n.div_ceil(CHUNK);
-        if query.unordered {
+        let eval = Eval::new(self, query);
+        let result = self.scan_all(&eval, chunks, limit, cancel, mask);
+        eval.finish();
+        result
+    }
+
+    /// The unranked part of [`FileIndex::search_masked`]: scans the chunks in waves (or all
+    /// at once for an unordered query) until `limit` hits.
+    fn scan_all(
+        &self,
+        eval: &Eval<'_>,
+        chunks: usize,
+        limit: usize,
+        cancel: &AtomicBool,
+        mask: Option<&[u64]>,
+    ) -> Result<Vec<EntryId>> {
+        let n = self.len();
+        let mut out = Vec::new();
+        if eval.query.unordered {
             // One parallel pass over every chunk; all of them stop once `limit` hits exist.
             let found = AtomicUsize::new(0);
             let parts: Vec<Option<Vec<EntryId>>> = (0..chunks)
                 .into_par_iter()
                 .map(|c| {
                     let end = ((c + 1) * CHUNK).min(n);
-                    self.scan(c * CHUNK, end, query, limit, cancel, mask, Some(&found))
+                    eval.scan(c * CHUNK, end, limit, cancel, mask, Some(&found))
                 })
                 .collect();
             for part in parts {
@@ -774,7 +751,7 @@ impl FileIndex {
                 .into_par_iter()
                 .map(|c| {
                     let end = ((c + 1) * CHUNK).min(n);
-                    self.scan(c * CHUNK, end, query, limit, cancel, mask, None)
+                    eval.scan(c * CHUNK, end, limit, cancel, mask, None)
                 })
                 .collect();
             for part in parts {
@@ -794,24 +771,221 @@ impl FileIndex {
     /// # Panics
     /// If `id` is out of range.
     pub fn is_match(&self, query: &Query, id: EntryId) -> bool {
-        let name = self.normalized_name(id);
-        match &query.plan {
+        query.eval_plan(&Entry::new(self, id), &mut Scratch::default())
+    }
+
+    /// A memo table over this index's distinct names, from the pool (see the module docs).
+    fn take_memo(&self) -> NameMemo {
+        let n = self.names.len();
+        let pooled = self
+            .memos
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut memo = pooled
+            .filter(|m| m.cells.len() == n)
+            .unwrap_or_else(|| NameMemo {
+                cells: (0..n).map(|_| AtomicU8::new(0)).collect(),
+                epoch: 0,
+            });
+        memo.epoch += 1;
+        if memo.epoch > MAX_EPOCH {
+            for c in &memo.cells {
+                c.store(0, Ordering::Relaxed);
+            }
+            memo.epoch = 1;
+        }
+        memo
+    }
+
+    fn give_memo(&self, memo: NameMemo) {
+        let mut pool = self.memos.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.len() < MEMO_POOL {
+            pool.push(memo);
+        }
+    }
+}
+
+/// Memo cell states (low two bits; the high six bits are the memo's epoch).
+const MEMO_MATCH: u8 = 1;
+const MEMO_MISS: u8 = 2;
+/// Epochs run `1..=MAX_EPOCH` (0 is a cleared cell), then the table is cleared once.
+const MAX_EPOCH: u8 = 63;
+/// Memo tables kept per index for reuse (concurrent searches take one each).
+const MEMO_POOL: usize = 2;
+
+impl Query {
+    /// Evaluates the whole plan for one entry, without the memo.
+    fn eval_plan(&self, e: &Entry<'_>, s: &mut Scratch) -> bool {
+        match &self.plan {
             Plan::All => true,
             Plan::Nothing => false,
-            Plan::Names(terms) => terms.iter().all(|t| t.matches(name)),
-            Plan::Tree(node) => node.eval(&Entry { ix: self, id, name }, &mut Scratch::default()),
+            Plan::Names(terms) => {
+                let name = e.name();
+                terms.iter().all(|t| t.matches(name))
+            }
+            Plan::Tree(node) => node.eval(e, s),
         }
+    }
+}
+
+/// One search over one index: the query and its memo over the distinct names.
+struct Eval<'a> {
+    ix: &'a FileIndex,
+    query: &'a Query,
+    /// `None` when nothing can be shared ([`Split::None`]).
+    memo: Option<NameMemo>,
+    /// The memo's epoch in the high bits of a cell.
+    tag: u8,
+}
+
+impl<'a> Eval<'a> {
+    fn new(ix: &'a FileIndex, query: &'a Query) -> Self {
+        let memo = match query.split {
+            Split::None(_) => None,
+            _ => Some(ix.take_memo()),
+        };
+        let tag = memo.as_ref().map_or(0, |m| m.epoch << 2);
+        Eval {
+            ix,
+            query,
+            memo,
+            tag,
+        }
+    }
+
+    /// Returns the memo to the pool.
+    fn finish(self) {
+        if let Some(m) = self.memo {
+            self.ix.give_memo(m);
+        }
+    }
+
+    /// The memoized answer for distinct name `nid`, if this search has one.
+    #[inline]
+    fn recall(&self, nid: u32) -> Option<bool> {
+        let cell = self.memo.as_ref()?.cells[nid as usize].load(Ordering::Relaxed);
+        (cell & !3 == self.tag).then_some(cell & 3 == MEMO_MATCH)
+    }
+
+    #[inline]
+    fn remember(&self, nid: u32, hit: bool) {
+        if let Some(m) = &self.memo {
+            let state = if hit { MEMO_MATCH } else { MEMO_MISS };
+            m.cells[nid as usize].store(self.tag | state, Ordering::Relaxed);
+        }
+    }
+
+    /// Name-only `f`, evaluated once per distinct name (with the key check first).
+    #[inline]
+    fn shared(
+        &self,
+        e: &Entry<'_>,
+        keys: &Keys,
+        s: &mut Scratch,
+        f: impl FnOnce(&Entry<'_>, &mut Scratch) -> bool,
+    ) -> bool {
+        if let Some(hit) = self.recall(e.nid) {
+            return hit;
+        }
+        let hit = (keys.is_empty() || keys.admit(e.name())) && f(e, s);
+        self.remember(e.nid, hit);
+        hit
+    }
+
+    /// True if entry `id` matches (unranked).
+    #[inline]
+    fn hit(&self, id: EntryId, s: &mut Scratch) -> bool {
+        let e = Entry::new(self.ix, id);
+        match &self.query.split {
+            Split::Whole(keys) => self.shared(&e, keys, s, |e, s| self.query.eval_plan(e, s)),
+            Split::Part { name, keys, rest } => {
+                self.shared(&e, keys, s, |e, s| name.eval(e, s)) && rest.eval(&e, s)
+            }
+            Split::None(keys) => {
+                (keys.is_empty() || keys.admit(e.name())) && self.query.eval_plan(&e, s)
+            }
+        }
+    }
+
+    /// The score of entry `id` if it matches with at least `floor` (ranked; see
+    /// [`Node::eval_score`]). With a fully name-only query, a rejection is remembered: the
+    /// floor only rises during a search, so the name stays rejected (see the module docs).
+    #[inline]
+    fn score(&self, node: &Node, id: EntryId, s: &mut Scratch, floor: u32) -> Option<u32> {
+        let e = Entry::new(self.ix, id);
+        let keys = match &self.query.split {
+            Split::Whole(keys) | Split::None(keys) => keys,
+            Split::Part { .. } => &Keys([None, None]),
+        };
+        if self.recall(e.nid) == Some(false) {
+            return None;
+        }
+        let score = if keys.is_empty() || keys.admit(e.name()) {
+            node.eval_score(&e, s, floor)
+        } else {
+            None
+        };
+        if score.is_none() && matches!(self.query.split, Split::Whole(_)) {
+            self.remember(e.nid, false);
+        }
+        score
+    }
+
+    /// Scans ids `start..end` for a ranked query, keeping the best `limit`; `None` if
+    /// cancelled.
+    ///
+    /// `floor` is shared by every chunk of the search: once some chunk (or the merged waves
+    /// before) holds `limit` hits, the lowest of their scores is a lower bound for the final
+    /// top `limit`, so entries scoring below it can be skipped, and fuzzy terms do not even
+    /// try the tiers that cannot reach it ([`Node::eval_score`]). Exact: an entry scoring at
+    /// least the floor is never skipped, and ties are kept for the final (score, id) order.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_scored(
+        &self,
+        start: usize,
+        end: usize,
+        node: &Node,
+        limit: usize,
+        cancel: &AtomicBool,
+        mask: Option<&[u64]>,
+        floor: &AtomicU32,
+    ) -> Option<Vec<(u32, EntryId)>> {
+        let mut hits = Vec::new();
+        let mut scratch = Scratch::default();
+        let mut local = 0;
+        for (i, raw) in (start..end).enumerate() {
+            if i % FLOOR_CHECK_EVERY == 0 {
+                if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                local = local.max(floor.load(Ordering::Relaxed));
+            }
+            let id = raw as EntryId;
+            if mask.is_some_and(|m| bit_is_set(m, id)) {
+                continue;
+            }
+            if let Some(score) = self.score(node, id, &mut scratch, local) {
+                hits.push((score, id));
+                if hits.len() >= limit.saturating_mul(2).max(1024) {
+                    keep_best(&mut hits, limit);
+                    local = local.max(raise_floor(floor, &hits, limit));
+                }
+            }
+        }
+        keep_best(&mut hits, limit);
+        raise_floor(floor, &hits, limit);
+        Some(hits)
     }
 
     /// Scans ids `start..end` for up to `limit` hits; `None` if cancelled. With `found` (an
     /// unordered search), hits are also counted there for the whole search, and the scan stops
     /// once it reaches `limit`.
-    #[allow(clippy::too_many_arguments)]
     fn scan(
         &self,
         start: usize,
         end: usize,
-        query: &Query,
         limit: usize,
         cancel: &AtomicBool,
         mask: Option<&[u64]>,
@@ -820,17 +994,9 @@ impl FileIndex {
         if found.is_some_and(|f| f.load(Ordering::Relaxed) >= limit) {
             return Some(Vec::new());
         }
-        let arena = &self.normalized;
-        let text = arena.text.as_str();
         let mut hits = Vec::new();
-        let mut from = if start == 0 {
-            0
-        } else {
-            arena.ends[start - 1] as usize
-        };
         let mut scratch = Scratch::default();
-        let mut skip = KeySkip::new(query.keys, &text.as_bytes()[..chunk_text_end(arena, end)]);
-        for (i, &to) in arena.ends[start..end].iter().enumerate() {
+        for (i, raw) in (start..end).enumerate() {
             if i % FLOOR_CHECK_EVERY == 0 {
                 if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
                     return None;
@@ -839,20 +1005,11 @@ impl FileIndex {
                     break;
                 }
             }
-            let to = to as usize;
-            if skip.skip(from, to) {
-                from = to;
+            let id = raw as EntryId;
+            if mask.is_some_and(|m| bit_is_set(m, id)) {
                 continue;
             }
-            let name = &text[from..to];
-            let id = (start + i) as EntryId;
-            let hit = match &query.plan {
-                Plan::All => true,
-                Plan::Nothing => false,
-                Plan::Names(terms) => terms.iter().all(|t| t.matches(name)),
-                Plan::Tree(node) => node.eval(&Entry { ix: self, id, name }, &mut scratch),
-            };
-            if hit && !mask.is_some_and(|m| bit_is_set(m, id)) {
+            if self.hit(id, &mut scratch) {
                 hits.push(id);
                 if hits.len() >= limit
                     || found.is_some_and(|f| f.fetch_add(1, Ordering::Relaxed) + 1 >= limit)
@@ -860,18 +1017,10 @@ impl FileIndex {
                     break;
                 }
             }
-            from = to;
         }
         Some(hits)
     }
 }
-
-/// Byte offset of the end of the last name of a scan over ids `..end` (`end > 0`).
-fn chunk_text_end(arena: &crate::index::Arena, end: usize) -> usize {
-    end.checked_sub(1)
-        .map_or(0, |last| arena.ends[last] as usize)
-}
-
 /// If `best` holds at least `limit` hits (after [`keep_best`]: exactly the best `limit` of
 /// them), raises `floor` to their lowest score: no entry scoring less can make the top `limit`
 /// of a search whose hits include these. Returns the new floor.
@@ -1081,11 +1230,7 @@ mod tests {
         let mut s = Scratch::default();
         let mut all: Vec<(u32, EntryId)> = (0..ix.len() as EntryId)
             .filter_map(|id| {
-                let e = Entry {
-                    ix,
-                    id,
-                    name: ix.normalized_name(id),
-                };
+                let e = Entry::new(ix, id);
                 node.eval(&e, &mut s).then(|| (node.score(&e, &mut s), id))
             })
             .collect();
@@ -1181,11 +1326,7 @@ mod tests {
             let all = ranked_brute_force(&ix, &query, usize::MAX);
             let mut sc = Scratch::default();
             for (k, &(score, id)) in all.iter().enumerate().step_by(97) {
-                let e = Entry {
-                    ix: &ix,
-                    id,
-                    name: ix.normalized_name(id),
-                };
+                let e = Entry::new(&ix, id);
                 let other = all[(k * 7919) % all.len()].0;
                 for floor in [score, score + 1, score.saturating_sub(1), other, 1 << 24] {
                     let got = node.eval_score(&e, &mut sc, floor);

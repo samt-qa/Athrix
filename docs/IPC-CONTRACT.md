@@ -65,7 +65,7 @@ interface ContentStatus {
 interface QueryError {
   message: string;          // إنجليزية
   kind: string;             // رمز ثابت من ParseErrorKind (مثل "UnknownFilter") لترجمته في الواجهة،
-                            // أو "Unsupported": مرشّح صحيح لا يدعمه فهرس الأسماء بعد (content:, sem:, ~, tag:...)
+                            // أو "Unsupported": مرشّح صحيح لا يدعمه فهرس الأسماء بعد (content:, sem:, ~, tag:, da:...)
   start: number;            // مدى الخطأ في نص الاستعلام بوحدات UTF-16
   end: number;
   suggestion: string | null;
@@ -258,6 +258,7 @@ type PreviewBody =          // موسوم بالحقل kind
   `indexing (entries: 0)` ← `ready (entries: N, elapsedMs: null)` ← `indexing (entries: N)` ← `ready (entries: M, elapsedMs: …)`.
   البحث يعمل من حدث `ready` الأول؛ ومعرّفات نتائج اللقطة تصبح قديمة بعد `ready` الثاني.
 - لقطة تالفة أو من إصدار آخر أو لمجلدات أخرى تُتجاهل (تُسجَّل في السجل فقط) ويجري مشي عادي: `indexing` ← `ready`.
+  الصيغة الحالية v2 (أضافت تاريخ الإنشاء لكل مدخل، ويستعمله `dc:`)؛ لقطة v1 من إصدار سابق تُعامل كإصدار آخر.
 - فشل حفظ اللقطة لا يظهر كخطأ فهرسة (يُسجَّل فقط).
 
 ## المجلدات المفهرسة (الإعداد الافتراضي: كل الجهاز)
@@ -393,8 +394,10 @@ interface InterpretPart {
 - نوع التاريخ: `dm:` افتراضيًا؛ وكلمة إنشاء قبل التاريخ مباشرة (يُسمح بحرف جر بينهما) تجعله `dc:`
   («أُنشئت»، «أنشأتها»، «المنشأة»، «تم إنشاؤها»، "created")، وكلمة فتح/استخدام تجعله `da:` («فُتحت»، «فتحتها»،
   «استُخدمت»، "opened"، "accessed"، "used"): «الملفات التي أُنشئت في 2024» ⇠ `dc:2024`، "files opened yesterday" ⇠
-  `da:yesterday`. هذا يحدث فقط مع `InterpretOptions::date_kinds`. التطبيق وخادم MCP يتركانه معطّلًا لأن فهرس الأسماء
-  لا يخزّن تاريخ الإنشاء أو الفتح، فيصير كل تاريخ `dm:` (كما يفعل المحاكي `DATE_KINDS = false`) إلى أن يخزّنهما الفهرس.
+  `da:yesterday`. كلٌّ منهما بخيار منفصل: `InterpretOptions::created_dates` لـ`dc:` و`accessed_dates` لـ`da:`
+  (و`with_date_kinds()` يفعّل الاثنين). فهرس الأسماء يخزّن تاريخ الإنشاء (منذ صيغة اللقطة v2) ولا يخزّن تاريخ الفتح، فالتطبيق
+  وخادم MCP يفعّلان `created_dates` فقط: كلمة الإنشاء ⇠ `dc:`، وكلمة الفتح تبقى `dm:` (كما يفعل المحاكي
+  `DATE_KINDS = { dc: true, da: false }`).
 - كلمات الحجم بلا رقم، فقط بجوار نوع أو «ملفات»/"files" (قبله أو بعده؛ فـ"big report" يبقى اسمًا): «كبيرة»/"large"/"big"
   ⇠ `size:>100mb`؛ «ضخمة»/«كبيرة جدًا»/"huge"/"very large" ⇠ `size:>1gb`؛ «صغيرة»/"small" ⇠ `size:<100kb`؛
   «صغيرة جدًا»/"tiny" ⇠ `size:tiny` (≤10KB)؛ «فارغة»/"empty" ⇠ `size:empty`. لا يُستعمل `size:large` لأنه عند Everything

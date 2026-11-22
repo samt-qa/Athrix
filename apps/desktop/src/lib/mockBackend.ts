@@ -385,7 +385,7 @@ const ARABIC_FILTERS: Record<string, string> = {
 const VALUE_FILTERS = new Set(["ext", "type", "size", "dm", "dc", "da", "path", "parent", "infolder", "tag"]);
 /** Valid filters the mock cannot answer (contract: QueryError.kind "Unsupported"). `content:` is
  *  taken out of the query before parsing (see contentFilters). */
-const UNSUPPORTED = new Set(["sem", "tag", "regex", "dc", "da"]);
+const UNSUPPORTED = new Set(["sem", "tag", "regex", "da"]);
 const KINDS: Record<string, string> = {
   doc: "doc", docs: "doc", document: "doc", documents: "doc", "مستند": "doc", "مستندات": "doc",
   image: "image", images: "image", "صورة": "image", "صور": "image",
@@ -523,7 +523,7 @@ function applyFilter(out: Parsed, name: string, value: string, start: number, va
   else if (UNSUPPORTED.has(name)) {
     fail("Unsupported", start, valueStart + value.length, `\`${name}:\` is not supported by name search yet`);
   }
-  // Other known filters (dm, path, parent, infolder, case, ww) are accepted and ignored by the mock.
+  // Other known filters (dm, dc, path, parent, infolder, case, ww) are accepted and ignored by the mock.
 }
 
 // ---------- content: filters and the planner's rejected combinations (crates/query/src/plan.rs) ----------

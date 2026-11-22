@@ -64,7 +64,7 @@ const QUERY_HELP: &str = "Athrix query syntax (Arabic and English): plain words 
 names (Arabic letter variants and diacritics are ignored); `\"exact phrase\"`; `-word` \
 excludes; `a OR b`; `*.pdf` wildcards; filters `ext:pdf`, `type:document|image|video|audio|\
 archive|folder`, `size:>1mb`, `dm:2025` / `dm:today` / `dm:>=2025-01-15` (modified), \
-`path:x`, `infolder:x`, `content:word` (file text), `fuzzy:word`. Arabic filter names work too \
+`dc:` (created, same forms), `path:x`, `infolder:x`, `content:word` (file text), `fuzzy:word`. Arabic filter names work too \
 (`نوع:`, `حجم:`, `تاريخ:`, `مسار:`, `مجلد:`). When the query as written finds nothing, it is read as a natural-language request (Arabic or English, e.g. `ملفات PDF من الأسبوع الماضي`, `photos from last year`) and the rewritten query is reported in `interpretedAs`.";
 
 /// The `tools/list` result.
@@ -206,9 +206,11 @@ fn search(ctx: &mut Ctx<'_>, args: &Value, content_mode: bool) -> Result<ToolOut
     }
     // Nothing (or a query error): try it as a natural-language request («ملفات PDF من الأسبوع
     // الماضي», "photos from last year") rewritten into the filter syntax.
+    // The name index answers `dc:` but not `da:` (no access times): "opened" stays `dm:`.
     let options = InterpretOptions {
         today: today(),
-        ..Default::default()
+        created_dates: true,
+        accessed_dates: false,
     };
     if let Some(found) = interpret_with(text, &options) {
         if found.query.trim() != text {

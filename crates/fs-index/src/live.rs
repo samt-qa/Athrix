@@ -31,8 +31,8 @@
 //! search plus a scan of a few thousand entries.
 //!
 //! To map a changed path to a base id, the live index builds, once per base, a child table
-//! (CSR adjacency sorted by a case-folded name hash; 12 bytes per entry), so a lookup costs one
-//! binary search per path component.
+//! (CSR adjacency sorted by a case-folded name hash: about 5 bytes per entry, plus the 4-byte
+//! hash of each distinct name), so a lookup costs one binary search per path component.
 //!
 //! # Entry ids
 //!
@@ -64,7 +64,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use athrix_core::Result;
 use rayon::prelude::*;
 
-use crate::index::{EntryId, EntryMeta, FileIndex, IndexBuilder, NO_PARENT};
+use crate::index::{EntryId, EntryMeta, FileIndex, IndexBuilder, NO_PARENT, NameRemap};
 use crate::search::{Query, bit_is_set};
 use crate::walk::{Scope, WalkOptions, is_expected_error, key_has_prefix, path_key};
 
@@ -350,16 +350,43 @@ impl IndexSnapshot {
         if !self.has_changes() {
             return (*self.base).clone();
         }
+        let avg = self.base.names.orig.text.len() / self.base.names.len().max(1) + 1;
+        let mut b = IndexBuilder::with_capacity(self.len(), avg);
+        self.push_live(&mut b, |_| true);
+        b.finish()
+    }
+
+    /// Like [`FileIndex::concat`] with [`IndexSnapshot::to_file_index`] as part 0 and `extra`
+    /// as parts 1.., but without building that intermediate copy: the live entries are copied
+    /// straight into the result, so the peak is this snapshot, `extra` and the result (one
+    /// full copy of the entries less than going through `to_file_index`).
+    pub fn concat(
+        &self,
+        extra: &[&FileIndex],
+        mut keep_root: impl FnMut(usize, &str) -> bool,
+    ) -> FileIndex {
+        let entries = self.len() + extra.iter().map(|p| p.len()).sum::<usize>();
+        let mut b = IndexBuilder::with_capacity(entries, 0);
+        self.push_live(&mut b, |name| keep_root(0, name));
+        for (n, part) in extra.iter().enumerate() {
+            b.push_part(part, |name| keep_root(n + 1, name));
+        }
+        b.finish()
+    }
+
+    /// Copies the live entries (base first, then the delta) into `b`, except the roots
+    /// `keep_root(name)` rejects, with their subtrees.
+    fn push_live(&self, b: &mut IndexBuilder, mut keep_root: impl FnMut(&str) -> bool) {
         let base = &*self.base;
         let n = base.len();
-        let avg = base.names.text.len() / n.max(1) + 1;
-        let mut b = IndexBuilder::with_capacity(self.len(), avg);
         let mut remap = vec![NO_PARENT; n];
+        let mut names = NameRemap::default();
         for id in 0..n as EntryId {
             if bit_is_set(&self.dead, id) {
                 continue;
             }
             let parent = match base.parent(id) {
+                None if !keep_root(base.name(id)) => continue,
                 None => None,
                 Some(p) => match remap[p as usize] {
                     // A live child of a removed folder cannot exist; skip defensively.
@@ -367,15 +394,11 @@ impl IndexSnapshot {
                     p => Some(p),
                 },
             };
-            remap[id as usize] = b.push_normalized(
-                parent,
-                base.name(id),
-                base.normalized_name(id),
-                base.meta(id),
-            );
+            remap[id as usize] = b.copy_entry(base, id, parent, &mut names);
         }
         let d = &self.delta.index;
         let mut dremap = vec![NO_PARENT; d.len()];
+        let mut names = NameRemap::default();
         for id in 0..d.len() as EntryId {
             let origin = self.delta.origin[id as usize];
             if origin != NO_PARENT {
@@ -383,16 +406,15 @@ impl IndexSnapshot {
                 continue;
             }
             let parent = match d.parent(id) {
+                None if !keep_root(d.name(id)) => continue,
                 None => None,
                 Some(p) => match dremap[p as usize] {
                     NO_PARENT => continue,
                     p => Some(p),
                 },
             };
-            dremap[id as usize] =
-                b.push_normalized(parent, d.name(id), d.normalized_name(id), d.meta(id));
+            dremap[id as usize] = b.copy_entry(d, id, parent, &mut names);
         }
-        b.finish()
     }
 
     /// Saves the live entries as a snapshot file (see [`FileIndex::save`]); compacts first if
@@ -436,50 +458,77 @@ fn short_hash(name: &str) -> u32 {
 struct Lookup {
     /// Root key, root id, and number of path components of the root's name.
     roots: Vec<(String, EntryId, usize)>,
-    /// `kids[start[p]..start[p + 1]]` are the children of `p`.
-    start: Vec<u32>,
+    /// Every entry with a parent, grouped by parent (in id order), each group sorted by name
+    /// hash.
     kids: Vec<u32>,
-    /// `hashes[i]`: folded-name hash of `kids[i]` (truncated), so binary searches scan a
-    /// small contiguous array instead of hashing names scattered over the arena.
+    /// Bit `p` is set if entry `p` has children: only those get a `start` (a tenth of the
+    /// entries are folders), found by rank.
+    has_kids: Vec<u64>,
+    /// Set bits of `has_kids` before each of its words.
+    ranks: Vec<u32>,
+    /// `kids[start[r]..start[r + 1]]` are the children of the `r`-th entry with children.
+    start: Vec<u32>,
+    /// Folded-name hash (truncated) of each distinct name of the base, so binary searches
+    /// never hash names (equal names share one hash: a third of the per-entry cost).
     hashes: Vec<u32>,
 }
 
 impl Lookup {
     fn build(ix: &FileIndex) -> Self {
         let n = ix.len();
-        let mut roots = Vec::new();
-        let mut start = vec![0u32; n + 1];
-        for id in 0..n as EntryId {
-            match ix.parent(id) {
-                Some(p) => start[p as usize + 1] += 1,
-                None => {
-                    let path = Path::new(ix.name(id));
-                    roots.push((path_key(path), id, path.components().count()));
-                }
-            }
-        }
-        for i in 0..n {
-            start[i + 1] += start[i];
-        }
-        let all: Vec<u32> = (0..n as EntryId)
-            .into_par_iter()
-            .map(|id| short_hash(ix.name(id)))
+        let roots = (0..n as EntryId)
+            .filter(|&id| ix.parent(id).is_none())
+            .map(|id| {
+                let path = Path::new(ix.name(id));
+                (path_key(path), id, path.components().count())
+            })
             .collect();
+        let hashes: Vec<u32> = (0..ix.names.len())
+            .into_par_iter()
+            .map(|nid| short_hash(ix.names.orig.get(nid)))
+            .collect();
+        let hash_of = |k: u32| hashes[ix.name_ids[k as usize] as usize];
         let mut kids: Vec<u32> = (0..n as EntryId)
             .filter(|&id| ix.parent(id).is_some())
             .collect();
-        kids.par_sort_unstable_by_key(|&k| (ix.parents[k as usize], all[k as usize]));
-        let hashes = kids.par_iter().map(|&k| all[k as usize]).collect();
+        kids.par_sort_unstable_by_key(|&k| (ix.parents[k as usize], hash_of(k)));
+        let mut has_kids = vec![0u64; n.div_ceil(64)];
+        let mut start = Vec::new();
+        let mut last = NO_PARENT;
+        for (i, &k) in kids.iter().enumerate() {
+            let p = ix.parents[k as usize];
+            if p != last {
+                has_kids[p as usize / 64] |= 1 << (p % 64);
+                start.push(i as u32);
+                last = p;
+            }
+        }
+        start.push(kids.len() as u32);
+        let mut ranks = Vec::with_capacity(has_kids.len());
+        let mut before = 0u32;
+        for w in &has_kids {
+            ranks.push(before);
+            before += w.count_ones();
+        }
         Lookup {
             roots,
-            start,
             kids,
+            has_kids,
+            ranks,
+            start,
             hashes,
         }
     }
 
     fn range(&self, p: EntryId) -> std::ops::Range<usize> {
-        self.start[p as usize] as usize..self.start[p as usize + 1] as usize
+        let (w, bit) = (p as usize / 64, p % 64);
+        match self.has_kids.get(w) {
+            Some(&word) if word & (1 << bit) != 0 => {
+                let r = self.ranks[w] as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize;
+                self.start[r] as usize..self.start[r + 1] as usize
+            }
+            _ => 0..0,
+        }
     }
 
     fn children(&self, p: EntryId) -> &[u32] {
@@ -488,12 +537,12 @@ impl Lookup {
 
     fn child(&self, ix: &FileIndex, parent: EntryId, name: &str) -> Option<EntryId> {
         let h = short_hash(name);
-        let range = self.range(parent);
-        let hashes = &self.hashes[range.clone()];
-        let first = hashes.partition_point(|&x| x < h);
-        let equal = hashes[first..].iter().take_while(|&&x| x == h).count();
-        self.kids[range.start + first..range.start + first + equal]
+        let kids = self.children(parent);
+        let hash_of = |k: u32| self.hashes[ix.name_ids[k as usize] as usize];
+        let first = kids.partition_point(|&k| hash_of(k) < h);
+        kids[first..]
             .iter()
+            .take_while(|&&k| hash_of(k) == h)
             .find(|&&k| fold(ix.name(k)).eq(fold(name)))
             .copied()
     }
@@ -1277,6 +1326,50 @@ mod tests {
         assert!(!stats.changed());
     }
 
+    #[test]
+    fn lookup_finds_every_entry_and_its_children() {
+        // Folders and files interleaved over several bitset words, equal names in many
+        // folders, files without children between folders with children.
+        let mut b = IndexBuilder::new();
+        let root = b.push(None, "/lk", dir());
+        let mut dirs = vec![root];
+        for i in 0..700u32 {
+            let parent = dirs[(i as usize * 7919) % dirs.len()];
+            let name = format!("n{}", i % 37);
+            if i % 3 == 0 {
+                dirs.push(b.push(Some(parent), &format!("{name}-{i}"), dir()));
+            } else {
+                b.push(Some(parent), &name, file(u64::from(i)));
+            }
+        }
+        let ix = b.finish();
+        let lookup = Lookup::build(&ix);
+        let mut children = vec![Vec::new(); ix.len()];
+        for id in 0..ix.len() as EntryId {
+            let path = ix.path(id);
+            if let Some(found) = lookup.find(&ix, &path, &path_key(&path)) {
+                // Equal names in one folder resolve to one of them.
+                assert_eq!(ix.path(found), path);
+            } else {
+                panic!("{} not found", path.display());
+            }
+            if let Some(p) = ix.parent(id) {
+                children[p as usize].push(id);
+            }
+        }
+        for (p, want) in children.iter_mut().enumerate() {
+            let mut got = lookup.children(p as EntryId).to_vec();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(&got, want, "children of {p}");
+        }
+        assert!(
+            lookup
+                .find(&ix, Path::new("/lk/nope"), "/lk/nope")
+                .is_none()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn lookup_is_case_insensitive_on_windows() {
@@ -1370,6 +1463,44 @@ mod tests {
             path: root.join("Docs").join("Fresh"),
         }]);
         assert!(names(&live.snapshot(), "fresh").is_empty());
+    }
+
+    #[test]
+    fn concat_of_a_snapshot_equals_concat_of_its_copy() {
+        let (live, root) = synthetic();
+        live.apply_changes(&[
+            Change::Upsert {
+                path: root.join("Docs").join("Fresh"),
+                meta: dir(),
+            },
+            Change::Upsert {
+                path: root.join("Docs").join("Fresh").join("in fresh.txt"),
+                meta: file(3),
+            },
+            Change::Remove {
+                path: root.join("Docs").join("Sub"),
+            },
+        ]);
+        let snap = live.snapshot();
+        let mut b = IndexBuilder::new();
+        let other = b.push(None, "/elsewhere", dir());
+        b.push(Some(other), "in fresh.txt", file(9));
+        let extra = b.finish();
+        let rows = |ix: &FileIndex| -> Vec<(PathBuf, String, EntryMeta)> {
+            (0..ix.len() as EntryId)
+                .map(|id| (ix.path(id), ix.normalized_name(id).to_owned(), ix.meta(id)))
+                .collect()
+        };
+        for drop_root in [false, true] {
+            let keep = |part: usize, name: &str| part == 1 || !drop_root || name != "/elsewhere";
+            let direct = snap.concat(&[&extra], keep);
+            let copied = FileIndex::concat(&[&snap.to_file_index(), &extra], keep);
+            assert_eq!(rows(&direct), rows(&copied));
+            assert_eq!(direct.len(), snap.len() + 2);
+            // Dropping the snapshot's own root drops everything of part 0.
+            let only_extra = snap.concat(&[&extra], |part, _| part == 1);
+            assert_eq!(rows(&only_extra), rows(&extra));
+        }
     }
 
     #[test]

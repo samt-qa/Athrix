@@ -43,11 +43,11 @@ const FILES = new Set(["ملفات", "الملفات", "files"]);
 const FILLERS = new Set([...FILES, "ابحث", "عن", "show", "me", "find", "the"]);
 const PREPS = new Set(["من", "في", "from", "in"]);
 /**
- * Whether `dc:` / `da:` may be produced (Rust: `InterpretOptions::date_kinds`). The app's name
- * index stores modification times only, so the app keeps this off and creation / access words
- * still give `dm:`.
+ * Which date fields besides `dm:` may be produced (Rust: `InterpretOptions::created_dates` /
+ * `accessed_dates`). The app's name index stores modification and creation times but no access
+ * times, so creation words give `dc:` and access words still give `dm:`.
  */
-const DATE_KINDS = false;
+const DATE_KINDS: Record<string, boolean> = { dc: true, da: false };
 /** Creation / access words before a date (Rust: `DATE_FIELDS`); the default is `dm:`. */
 const DATE_FIELDS: Record<string, string> = {
   أنشئت: "dc",
@@ -114,7 +114,7 @@ export function mockInterpret(text: string): Interpretation | null {
       const d = dateAt(i + skip + prep);
       if (d) {
         cues += 2;
-        push(skip + prep + d[0].split(" ").length, "date", `${DATE_KINDS && field ? field : "dm"}:${d[1]}`);
+        push(skip + prep + d[0].split(" ").length, "date", `${field && DATE_KINDS[field] ? field : "dm"}:${d[1]}`);
         continue;
       }
     }

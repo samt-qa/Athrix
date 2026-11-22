@@ -46,8 +46,10 @@
 //! Dates use `dm:` (modified) unless a creation or access word comes right before the date
 //! (possibly with a preposition between): «الملفات التي أُنشئت في 2024» → `dc:2024`, "photos I
 //! opened last week" → `da:lastweek`. A creation/access word with no date after it is dropped
-//! like any filler. Note that an executor may not support `dc:`/`da:` (the name index rejects
-//! them with a clear "not supported yet" error); the suggestion still says what was asked.
+//! like any filler. Each kind is produced only if the caller says its executor supports it
+//! ([`InterpretOptions::created_dates`], [`InterpretOptions::accessed_dates`]); otherwise the
+//! date stays `dm:`. The name index answers `dc:` but rejects `da:` (Windows keeps access times
+//! lazily or not at all), so the app enables creation dates only.
 //!
 //! # Size words
 //!
@@ -83,11 +85,15 @@ pub struct InterpretOptions {
     /// are not recognised and stay as words. Named periods («الأسبوع الماضي» → `dm:lastweek`)
     /// do not need it: the executor resolves them.
     pub today: Option<CalendarDate>,
-    /// Whether the executor can filter by creation / access date. When `false` (the default)
-    /// a creation or access word («أُنشئت», "opened") is still understood, but the date becomes
-    /// `dm:`, because the name index stores only modification times and would reject `dc:` /
-    /// `da:`. Set it when the query will run on an engine that supports them.
-    pub date_kinds: bool,
+    /// Whether the executor can filter by creation date (`dc:`). When `false` (the default) a
+    /// creation word («أُنشئت», "created") is still understood, but the date becomes `dm:`.
+    /// The name index supports `dc:`.
+    pub created_dates: bool,
+    /// Whether the executor can filter by access date (`da:`). When `false` (the default) an
+    /// access word («فُتحت», "opened") is still understood, but the date becomes `dm:`. The
+    /// name index does not store access times (Windows updates them lazily, if at all), so
+    /// leave this off for it.
+    pub accessed_dates: bool,
 }
 
 impl InterpretOptions {
@@ -95,13 +101,22 @@ impl InterpretOptions {
     pub const fn with_today(today: CalendarDate) -> Self {
         InterpretOptions {
             today: Some(today),
-            date_kinds: false,
+            created_dates: false,
+            accessed_dates: false,
         }
     }
 
-    /// The same options, with `dc:` / `da:` output allowed (see [`InterpretOptions::date_kinds`]).
+    /// The same options, with `dc:` output allowed (see [`InterpretOptions::created_dates`]).
+    pub const fn with_created_dates(mut self) -> Self {
+        self.created_dates = true;
+        self
+    }
+
+    /// The same options, with both `dc:` and `da:` output allowed (see
+    /// [`InterpretOptions::created_dates`] and [`InterpretOptions::accessed_dates`]).
     pub const fn with_date_kinds(mut self) -> Self {
-        self.date_kinds = true;
+        self.created_dates = true;
+        self.accessed_dates = true;
         self
     }
 }
@@ -187,7 +202,8 @@ pub fn interpret_with(text: &str, options: &InterpretOptions) -> Option<Interpre
     let cx = Cx {
         toks: &toks,
         today,
-        date_kinds: options.date_kinds,
+        created_dates: options.created_dates,
+        accessed_dates: options.accessed_dates,
     };
 
     let mut hits: Vec<(usize, Hit)> = Vec::new();
@@ -1249,8 +1265,10 @@ const NUMBER_WORDS: &[(&str, u32)] = &[
 struct Cx<'t, 'a> {
     toks: &'t [Tok<'a>],
     today: Option<Day>,
-    /// `dc:` / `da:` may be produced (otherwise every date is `dm:`).
-    date_kinds: bool,
+    /// `dc:` may be produced (otherwise creation words give `dm:`).
+    created_dates: bool,
+    /// `da:` may be produced (otherwise access words give `dm:`).
+    accessed_dates: bool,
 }
 
 impl Cx<'_, '_> {
@@ -1393,10 +1411,10 @@ impl Cx<'_, '_> {
         let (f, field) = self
             .longest(i, DATE_FIELDS)
             .unwrap_or((0, DateField::Modified));
-        let field = if self.date_kinds {
-            field
-        } else {
-            DateField::Modified
+        let field = match field {
+            DateField::Created if self.created_dates => DateField::Created,
+            DateField::Accessed if self.accessed_dates => DateField::Accessed,
+            _ => DateField::Modified,
         };
         if f > 0 {
             if let Some(mut h) = self.date_body(i + f, true, field) {

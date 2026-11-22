@@ -3,27 +3,33 @@
 //! At startup the app loads the last snapshot so results are available immediately, then
 //! re-walks (or, later, replays the NTFS USN journal) in the background.
 //!
-//! # Format (version 1)
+//! # Format (version 2)
 //!
-//! All integers are little-endian. `n` is the entry count.
+//! All integers are little-endian. `n` is the entry count, `u` the number of distinct names,
+//! `s`/`m`/`c` the lengths of the size, modification-time and creation-time overflow lists
+//! (see `index.rs` for the layout these columns mirror).
 //!
 //! | Part | Size | Content |
 //! |---|---|---|
 //! | magic | 8 | `ATHRXIDX` |
 //! | format version | 4 | `u32`, currently [`FORMAT_VERSION`] |
 //! | normalizer version | 4 | `u32`, see [`normalizer_version`] |
-//! | entry count | 8 | `u64` `n` |
-//! | names length | 8 | `u64`, bytes of the original-name arena |
-//! | normalized length | 8 | `u64`, bytes of the normalized-name arena |
+//! | counts | 7 × 8 | `u64` each: `n`, `u`, original-names bytes, normalized-names bytes, `s`, `m`, `c` |
+//! | name ids | 4n | `u32` per entry, `< u` |
 //! | parents | 4n | `u32` per entry, `u32::MAX` for a root |
 //! | flags | n | `u8` per entry (bit 0 directory, bit 1 symlink) |
-//! | sizes | 8n | `u64` per entry |
-//! | mtimes | 8n | `i64` per entry, `i64::MIN` when unknown |
-//! | name ends | 4n | `u32` end offset of each original name |
-//! | names | names length | UTF-8 |
-//! | normalized ends | 4n | `u32` end offset of each normalized name |
-//! | normalized names | normalized length | UTF-8 |
+//! | sizes | 4n | `u32` per entry, `u32::MAX` = in the overflow list |
+//! | mtimes, ctimes | 4n + 4n | `u32` Unix seconds; `u32::MAX` unknown, `u32::MAX - 1` = in the overflow list |
+//! | size overflow | 12s | `(u32 id, u64 size)`, ids increasing |
+//! | mtime, ctime overflow | 12m + 12c | `(u32 id, i64 seconds)`, ids increasing |
+//! | original name ends | 4u | `u32` end offset of each distinct original name |
+//! | original names | bytes | UTF-8 |
+//! | normalized name ends | 4u | `u32` end offset of each distinct normalized name |
+//! | normalized names | bytes | UTF-8 |
 //! | checksum | 4 | CRC-32 (IEEE) of every preceding byte |
+//!
+//! Version 1 (two per-entry name arenas, `u64` sizes, `i64` modification times and no creation
+//! times) is rejected like any other version, so the app re-walks once after the upgrade.
 //!
 //! A snapshot whose format or normalizer version differs from this build is rejected, so the
 //! caller simply re-walks. Loading validates the whole structure (lengths, offsets, UTF-8
@@ -36,12 +42,14 @@ use std::path::{Path, PathBuf};
 
 use athrix_core::{Error, Result};
 
-use crate::index::{Arena, FLAG_DIR, FLAG_SYMLINK, FileIndex, NO_PARENT};
+use crate::index::{Arena, FLAG_DIR, FLAG_SYMLINK, FileIndex, NO_PARENT, Names, Overflow};
 
 const MAGIC: [u8; 8] = *b"ATHRXIDX";
 
 /// Version of the on-disk layout. Bump on any change to the format above.
-const FORMAT_VERSION: u32 = 1;
+///
+/// - 2: distinct names stored once, packed `u32` sizes and times, creation times.
+const FORMAT_VERSION: u32 = 2;
 
 /// Manual epoch mixed into [`normalizer_version`]. Bump it when the name normalization
 /// (`athrix_text_ar::normalize_name_into`) changes, even if the probe strings below catch it.
@@ -70,10 +78,14 @@ const NORMALIZER_PROBES: &[&str] = &[
     "الفِقْه وَالتَّفْسِير",
 ];
 
-const HEADER_LEN: u64 = 8 + 4 + 4 + 8 + 8 + 8;
+const HEADER_LEN: u64 = 8 + 4 + 4 + 7 * 8;
 const CHECKSUM_LEN: u64 = 4;
-/// Fixed bytes per entry: parent 4 + flags 1 + size 8 + mtime 8 + two name ends 4 + 4.
-const BYTES_PER_ENTRY: u64 = 4 + 1 + 8 + 8 + 4 + 4;
+/// Fixed bytes per entry: name id 4 + parent 4 + flags 1 + size 4 + mtime 4 + ctime 4.
+const BYTES_PER_ENTRY: u64 = 4 + 4 + 1 + 4 + 4 + 4;
+/// Bytes per distinct name: two end offsets.
+const BYTES_PER_NAME: u64 = 4 + 4;
+/// Bytes per overflow item: `u32` id + 8-byte value.
+const BYTES_PER_OVERFLOW: u64 = 4 + 8;
 /// Entries converted per I/O chunk.
 const CHUNK: usize = 16 * 1024;
 const IO_BUFFER: usize = 1 << 20;
@@ -168,6 +180,31 @@ impl HashWriter {
     }
 }
 
+/// An overflow item as written: `u32` id, then the 8-byte value.
+fn pair(id: u32, value: [u8; 8]) -> [u8; 12] {
+    let mut out = [0; 12];
+    out[..4].copy_from_slice(&id.to_le_bytes());
+    out[4..].copy_from_slice(&value);
+    out
+}
+
+/// An overflow item as read: `u32` id and the 8-byte value.
+fn split(b: [u8; 12]) -> (u32, [u8; 8]) {
+    let mut v = [0; 8];
+    v.copy_from_slice(&b[4..]);
+    (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), v)
+}
+
+/// True if `ids` increase strictly and stay below `n`.
+fn ids_ok(mut ids: impl Iterator<Item = u32>, n: usize) -> bool {
+    let mut prev: Option<u32> = None;
+    ids.all(|id| {
+        let ok = (id as usize) < n && prev.is_none_or(|p| p < id);
+        prev = Some(id);
+        ok
+    })
+}
+
 fn write_snapshot(ix: &FileIndex, path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = HashWriter {
@@ -178,17 +215,31 @@ fn write_snapshot(ix: &FileIndex, path: &Path) -> io::Result<()> {
     w.put(&MAGIC)?;
     w.put(&FORMAT_VERSION.to_le_bytes())?;
     w.put(&normalizer_version().to_le_bytes())?;
-    w.put(&(ix.len() as u64).to_le_bytes())?;
-    w.put(&(ix.names.text.len() as u64).to_le_bytes())?;
-    w.put(&(ix.normalized.text.len() as u64).to_le_bytes())?;
+    let o = &ix.overflow;
+    for count in [
+        ix.len(),
+        ix.names.len(),
+        ix.names.orig.text.len(),
+        ix.names.norm.text.len(),
+        o.sizes.len(),
+        o.mtimes.len(),
+        o.ctimes.len(),
+    ] {
+        w.put(&(count as u64).to_le_bytes())?;
+    }
+    w.put_col(&ix.name_ids, u32::to_le_bytes)?;
     w.put_col(&ix.parents, u32::to_le_bytes)?;
     w.put(&ix.flags)?;
-    w.put_col(&ix.sizes, u64::to_le_bytes)?;
-    w.put_col(&ix.mtimes, i64::to_le_bytes)?;
-    w.put_col(&ix.names.ends, u32::to_le_bytes)?;
-    w.put(ix.names.text.as_bytes())?;
-    w.put_col(&ix.normalized.ends, u32::to_le_bytes)?;
-    w.put(ix.normalized.text.as_bytes())?;
+    w.put_col(&ix.sizes, u32::to_le_bytes)?;
+    w.put_col(&ix.mtimes, u32::to_le_bytes)?;
+    w.put_col(&ix.ctimes, u32::to_le_bytes)?;
+    w.put_col(&o.sizes, |(id, v)| pair(id, v.to_le_bytes()))?;
+    w.put_col(&o.mtimes, |(id, v)| pair(id, v.to_le_bytes()))?;
+    w.put_col(&o.ctimes, |(id, v)| pair(id, v.to_le_bytes()))?;
+    for arena in [&ix.names.orig, &ix.names.norm] {
+        w.put_col(&arena.ends, u32::to_le_bytes)?;
+        w.put(arena.text.as_bytes())?;
+    }
     let checksum = w.hasher.clone().finalize();
     w.inner.write_all(&checksum.to_le_bytes())?;
     let file = w
@@ -282,35 +333,77 @@ fn read_snapshot(path: &Path) -> io::Result<FileIndex> {
             "written with a different name normalizer; rebuild the index",
         ));
     }
-    let count = r.u64()?;
-    let names_len = r.u64()?;
-    let normalized_len = r.u64()?;
-    if count >= u64::from(NO_PARENT) {
-        return Err(invalid(format!("entry count {count} out of range")));
+    let mut counts = [0u64; 7];
+    for c in &mut counts {
+        *c = r.u64()?;
+    }
+    let [
+        count,
+        distinct,
+        names_len,
+        normalized_len,
+        big_sizes,
+        big_mtimes,
+        big_ctimes,
+    ] = counts;
+    if count >= u64::from(NO_PARENT) || distinct >= u64::from(u32::MAX) {
+        return Err(invalid(format!(
+            "entry count {count} or name count {distinct} out of range"
+        )));
     }
     for len in [names_len, normalized_len] {
         if len > u64::from(u32::MAX) {
             return Err(invalid(format!("name arena of {len} bytes exceeds 4 GiB")));
         }
     }
+    for len in [big_sizes, big_mtimes, big_ctimes] {
+        if len > count {
+            return Err(invalid(format!(
+                "overflow list of {len} items for {count} entries"
+            )));
+        }
+    }
     // Checked against the real size before allocating anything, so a forged header cannot
     // trigger a huge allocation. All terms are bounded above, so this cannot overflow.
-    let expected = HEADER_LEN + count * BYTES_PER_ENTRY + names_len + normalized_len + CHECKSUM_LEN;
+    let expected = HEADER_LEN
+        + count * BYTES_PER_ENTRY
+        + (big_sizes + big_mtimes + big_ctimes) * BYTES_PER_OVERFLOW
+        + distinct * BYTES_PER_NAME
+        + names_len
+        + normalized_len
+        + CHECKSUM_LEN;
     if expected != file_len {
         return Err(invalid(format!(
             "file is {file_len} bytes, header implies {expected}"
         )));
     }
     let n = count as usize;
+    let u = distinct as usize;
 
+    let name_ids = r.col(n, u32::from_le_bytes)?;
     let parents = r.col(n, u32::from_le_bytes)?;
     let flags = r.bytes(n)?;
-    let sizes = r.col(n, u64::from_le_bytes)?;
-    let mtimes = r.col(n, i64::from_le_bytes)?;
-    let name_ends = r.col(n, u32::from_le_bytes)?;
-    let names = r.bytes(names_len as usize)?;
-    let normalized_ends = r.col(n, u32::from_le_bytes)?;
-    let normalized = r.bytes(normalized_len as usize)?;
+    let sizes = r.col(n, u32::from_le_bytes)?;
+    let mtimes = r.col(n, u32::from_le_bytes)?;
+    let ctimes = r.col(n, u32::from_le_bytes)?;
+    let overflow = Overflow {
+        sizes: r.col(big_sizes as usize, |b| {
+            let (id, v) = split(b);
+            (id, u64::from_le_bytes(v))
+        })?,
+        mtimes: r.col(big_mtimes as usize, |b| {
+            let (id, v) = split(b);
+            (id, i64::from_le_bytes(v))
+        })?,
+        ctimes: r.col(big_ctimes as usize, |b| {
+            let (id, v) = split(b);
+            (id, i64::from_le_bytes(v))
+        })?,
+    };
+    let orig_ends = r.col(u, u32::from_le_bytes)?;
+    let orig = r.bytes(names_len as usize)?;
+    let norm_ends = r.col(u, u32::from_le_bytes)?;
+    let norm = r.bytes(normalized_len as usize)?;
 
     let computed = r.hasher.clone().finalize();
     let mut stored = [0; 4];
@@ -328,6 +421,12 @@ fn read_snapshot(path: &Path) -> io::Result<FileIndex> {
             return Err(invalid(format!("entry {i} has invalid parent {p}")));
         }
     }
+    if let Some(i) = name_ids.iter().position(|&nid| nid as usize >= u) {
+        return Err(invalid(format!(
+            "entry {i} has invalid name id {}",
+            name_ids[i]
+        )));
+    }
     if let Some(i) = flags
         .iter()
         .position(|&f| f & !(FLAG_DIR | FLAG_SYMLINK) != 0)
@@ -337,16 +436,27 @@ fn read_snapshot(path: &Path) -> io::Result<FileIndex> {
             flags[i]
         )));
     }
-    let names = arena(names, name_ends, "names")?;
-    let normalized = arena(normalized, normalized_ends, "normalized names")?;
+    if !ids_ok(overflow.sizes.iter().map(|x| x.0), n)
+        || !ids_ok(overflow.mtimes.iter().map(|x| x.0), n)
+        || !ids_ok(overflow.ctimes.iter().map(|x| x.0), n)
+    {
+        return Err(invalid("overflow list ids out of order or range"));
+    }
+    let names = Names {
+        orig: arena(orig, orig_ends, "names")?,
+        norm: arena(norm, norm_ends, "normalized names")?,
+    };
 
     Ok(FileIndex {
         names,
-        normalized,
+        name_ids,
         parents,
         flags,
         sizes,
         mtimes,
+        ctimes,
+        overflow,
+        memos: Default::default(),
     })
 }
 
@@ -401,23 +511,39 @@ mod tests {
             EntryMeta {
                 is_symlink: true,
                 modified: Some(-5),
+                created: Some(1_600_000_000),
                 ..Default::default()
             },
         );
         b.push(None, "/other root", dir);
         b.push(Some(4), "", EntryMeta::default());
+        b.push(
+            Some(4),
+            "link",
+            EntryMeta {
+                size: 1 << 40,
+                created: Some(i64::from(u32::MAX) + 7),
+                ..Default::default()
+            },
+        );
         b.finish()
     }
 
     fn assert_same(a: &FileIndex, b: &FileIndex) {
-        assert_eq!(a.names.text, b.names.text);
-        assert_eq!(a.names.ends, b.names.ends);
-        assert_eq!(a.normalized.text, b.normalized.text);
-        assert_eq!(a.normalized.ends, b.normalized.ends);
+        assert_eq!(a.names.orig.text, b.names.orig.text);
+        assert_eq!(a.names.orig.ends, b.names.orig.ends);
+        assert_eq!(a.names.norm.text, b.names.norm.text);
+        assert_eq!(a.names.norm.ends, b.names.norm.ends);
+        assert_eq!(a.name_ids, b.name_ids);
         assert_eq!(a.parents, b.parents);
         assert_eq!(a.flags, b.flags);
         assert_eq!(a.sizes, b.sizes);
         assert_eq!(a.mtimes, b.mtimes);
+        assert_eq!(a.ctimes, b.ctimes);
+        assert_eq!(a.overflow, b.overflow);
+        for id in 0..a.len() as u32 {
+            assert_eq!(a.meta(id), b.meta(id));
+        }
     }
 
     fn sample_bytes() -> Vec<u8> {
@@ -460,6 +586,9 @@ mod tests {
         assert_same(&ix, &loaded);
         assert_eq!(loaded.path(2), ix.path(2));
         assert_eq!(loaded.meta(3), ix.meta(3));
+        assert_eq!(loaded.meta(6).size, 1 << 40);
+        assert_eq!(loaded.meta(6).created, Some(i64::from(u32::MAX) + 7));
+        assert_eq!(loaded.name(6), "link");
         assert_eq!(loaded.normalized_name(2), ix.normalized_name(2));
     }
 
@@ -500,8 +629,8 @@ mod tests {
         assert!(load_err(&b).contains("bad magic"));
 
         let mut b = good.clone();
-        b[8] = 2;
-        assert!(load_err(&b).contains("format version 2"));
+        b[8] = 1;
+        assert!(load_err(&b).contains("format version 1"));
 
         let mut b = good.clone();
         b[12] ^= 1;
@@ -523,18 +652,32 @@ mod tests {
         let h = HEADER_LEN as usize;
 
         // Entry 1 pointing at itself.
+        let parents = h + 4 * n;
         let mut b = good.clone();
-        b[h + 4..h + 8].copy_from_slice(&1u32.to_le_bytes());
+        b[parents + 4..parents + 8].copy_from_slice(&1u32.to_le_bytes());
         fix_checksum(&mut b);
         assert!(load_err(&b).contains("invalid parent"));
 
+        // A name id past the distinct names.
         let mut b = good.clone();
-        b[h + 4 * n] = 0x80;
+        b[h + 4..h + 8].copy_from_slice(&999u32.to_le_bytes());
+        fix_checksum(&mut b);
+        assert!(load_err(&b).contains("invalid name id"));
+
+        let mut b = good.clone();
+        b[h + 8 * n] = 0x80;
         fix_checksum(&mut b);
         assert!(load_err(&b).contains("unknown flags"));
 
+        // The size overflow item's id moved out of range.
+        let overflow = h + n * BYTES_PER_ENTRY as usize;
+        let mut b = good.clone();
+        b[overflow..overflow + 4].copy_from_slice(&(n as u32).to_le_bytes());
+        fix_checksum(&mut b);
+        assert!(load_err(&b).contains("overflow list"));
+
         // First name end moved inside a multi-byte character / past the next one.
-        let ends = h + n * (4 + 1 + 8 + 8);
+        let ends = overflow + 3 * BYTES_PER_OVERFLOW as usize;
         let mut b = good.clone();
         b[ends + 4..ends + 8].copy_from_slice(&10u32.to_le_bytes());
         fix_checksum(&mut b);

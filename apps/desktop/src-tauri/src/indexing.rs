@@ -37,7 +37,7 @@
 //! - A root that comes back, a new root, or another volume on the same path is handled by an
 //!   *update* job on the indexing thread: only those roots are walked (with `scanning` in the
 //!   status), then the current entries minus the replaced roots and the new walk are
-//!   concatenated ([`FileIndex::concat`]) and installed as a new base. Watched changes under a
+//!   concatenated ([`IndexSnapshot::concat`]) and installed as a new base. Watched changes under a
 //!   root being walked are only buffered (and applied after the install), never applied to
 //!   the old live index, which would walk that drive inside its lock.
 //! - Requests are queued like walks (latest wins): a pending full walk absorbs an update, and
@@ -919,14 +919,15 @@ impl Indexer {
             .chain(&work.add)
             .map(|r| path_key(r))
             .collect();
+        // Straight from the snapshot: no intermediate copy of the current entries (the peak is
+        // the live index, the walk and the result).
         let merged = catch_unwind(AssertUnwindSafe(|| {
-            let current = snapshot.to_file_index();
-            drop(snapshot);
-            FileIndex::concat(&[&current, &walked], |part, root| {
+            snapshot.concat(&[&walked], |part, root| {
                 part == 1 || !replaced.contains(&path_key(Path::new(root)))
             })
         }))
         .map_err(|_| None)?;
+        drop((snapshot, walked));
         self.install_walked(merged, roots, &work.add)
             .map(Some)
             .map_err(Some)
@@ -1932,10 +1933,22 @@ mod tests {
 
         // Pulled out before the drive monitor noticed: offline, not deleted, no re-walk.
         fs::remove_dir_all(&usb).unwrap();
-        assert!(eventually(|| indexer.offline_roots() == [usb.clone()]));
-        assert!(!finds(&indexer.index().unwrap(), "usb-file"));
-        assert!(finds(&indexer.index().unwrap(), "fixed-file"));
-        assert_eq!(indexer.watched_roots(), [fixed.path().to_path_buf()]);
+        // The root is marked offline, its entries hidden (a new view published) and the
+        // watcher restarted without it in steps on other threads: wait for all of them
+        // rather than checking the later ones right after the first.
+        let gone = || {
+            let view = indexer.index().unwrap();
+            indexer.offline_roots() == [usb.clone()]
+                && !finds(&view, "usb-file")
+                && finds(&view, "fixed-file")
+                && indexer.watched_roots() == [fixed.path().to_path_buf()]
+        };
+        assert!(
+            eventually(gone),
+            "offline {:?}, watched {:?}",
+            indexer.offline_roots(),
+            indexer.watched_roots()
+        );
     }
 
     /// A folder holding one file named `name`.

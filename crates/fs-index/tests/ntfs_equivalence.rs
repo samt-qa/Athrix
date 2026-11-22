@@ -100,7 +100,17 @@ fn volume_tree(root: &Path) -> VolumeTree {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        tree.set_metadata(i, Some(if md.is_dir() { 0 } else { md.len() }), Some(mtime));
+        let ctime = md
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        tree.set_metadata(
+            i,
+            Some(if md.is_dir() { 0 } else { md.len() }),
+            Some(mtime),
+            ctime,
+        );
     }
     tree.mark_metadata();
     tree
@@ -116,8 +126,8 @@ fn adapter_index(tree: &VolumeTree, root: &Path, opts: &WalkOptions) -> FileInde
     ix
 }
 
-/// Every entry as `(path, normalized name, is_dir, is_symlink, size, modified)`.
-type Row = (String, String, bool, bool, u64, Option<i64>);
+/// Every entry as `(path, normalized name, is_dir, is_symlink, size, modified, created)`.
+type Row = (String, String, bool, bool, u64, Option<i64>, Option<i64>);
 
 fn rows(ix: &FileIndex) -> BTreeSet<Row> {
     (0..ix.len() as EntryId)
@@ -130,6 +140,7 @@ fn rows(ix: &FileIndex) -> BTreeSet<Row> {
                 m.is_symlink,
                 m.size,
                 m.modified,
+                m.created,
             )
         })
         .collect()

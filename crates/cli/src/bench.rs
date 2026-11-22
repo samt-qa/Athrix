@@ -135,6 +135,11 @@ fn name_keystroke(index: &FileIndex, text: &str, limit: usize) -> Option<(usize,
 /// the words retyped on the other keyboard layout, then the query with the `fuzzy:` switch,
 /// each a count-only search, stopping at the first that finds something. Approximation: a
 /// token is swapped whole unless it holds `:` (a filter); the app swaps the parsed terms only.
+///
+/// An upper bound of the app's cost: the app also skips layout candidates that its gram
+/// filter proves empty and stops all probes after `PROBE_BUDGET`, which need the desktop
+/// crate. Its ignored test `suggest::tests::probe_timings` times the real `suggest` on a
+/// snapshot, against these unfiltered probes.
 fn suggestion_probes(index: &FileIndex, text: &str, query: &Query, limit: usize, c: &AtomicBool) {
     let mut changed = false;
     let swapped: Vec<String> = text

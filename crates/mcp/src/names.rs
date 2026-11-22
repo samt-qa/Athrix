@@ -12,8 +12,9 @@
 //! their children), deciding each entry from its parent and, on the way down to an allowed
 //! folder, from its path. Entries outside are skipped without being stored; the allowed
 //! folders, their contents and the folders leading to them are copied into a small
-//! [`FileIndex`]. Memory while loading is about 5 bytes per snapshot entry plus the kept part,
-//! instead of the whole snapshot. A snapshot in a format this reader does not know is loaded
+//! [`FileIndex`]. Memory while loading is about 5 bytes per snapshot entry plus the distinct
+//! original names (about 12 bytes per entry on a whole computer) and the kept part, instead of
+//! the whole snapshot (about 42 bytes per entry). A snapshot in a format this reader does not know is loaded
 //! whole by [`FileIndex::load`] and cut down the same way.
 //!
 //! **Released when idle.** [`Names::release_if_idle`] drops the loaded part after a quiet
@@ -251,28 +252,41 @@ fn cut_loaded(full: &FileIndex, guard: &Guard) -> (FileIndex, Vec<bool>) {
 }
 
 /// A streaming reader of the snapshot format written by `FileIndex::save` (`athrix-fs-index`,
-/// `snapshot.rs`, format version 1): header, then the columns parents, flags, sizes, mtimes,
-/// name ends, names, normalized ends, normalized names, CRC-32. Each needed column gets its own
-/// buffered reader, so the entries are read in one pass without holding any column.
+/// `snapshot.rs`, format version 2): header with seven counts, then the per-entry columns name
+/// ids, parents, flags, sizes, mtimes, ctimes (`u32` each but flags), the overflow lists of
+/// sizes, mtimes and ctimes (`(u32 id, 8-byte value)`, ids increasing), the distinct original
+/// names (end offsets, then text), the distinct normalized names, CRC-32. Each needed column
+/// gets its own buffered reader, so the entries are read in one pass without holding any
+/// column; only the distinct original names (end offsets and text) are held while reading,
+/// since any entry may use any of them.
 ///
 /// Every structural invariant the cut index relies on is checked (lengths, parent order,
-/// flags, offsets, UTF-8 of every name read). Unlike the full loader it does not verify the
-/// checksum or the normalizer version: names are normalized again as they are copied, and
-/// every result is checked against the disk before it is returned.
+/// flags, name ids, offsets, overflow order, UTF-8 of every name used). Unlike the full loader
+/// it does not verify the checksum or the normalizer version: names are normalized again as
+/// they are copied, and every result is checked against the disk before it is returned.
 mod stream {
     use super::*;
     use std::io::{Seek, SeekFrom};
 
     const MAGIC: [u8; 8] = *b"ATHRXIDX";
     /// The only format version this reader knows.
-    const FORMAT_VERSION: u32 = 1;
-    const HEADER_LEN: u64 = 8 + 4 + 4 + 8 + 8 + 8;
+    const FORMAT_VERSION: u32 = 2;
+    const HEADER_LEN: u64 = 8 + 4 + 4 + 7 * 8;
     const CHECKSUM_LEN: u64 = 4;
-    const BYTES_PER_ENTRY: u64 = 4 + 1 + 8 + 8 + 4 + 4;
+    /// Name id 4 + parent 4 + flags 1 + size 4 + mtime 4 + ctime 4.
+    const BYTES_PER_ENTRY: u64 = 21;
+    const BYTES_PER_NAME: u64 = 4 + 4;
+    const BYTES_PER_OVERFLOW: u64 = 4 + 8;
     const NO_PARENT: u32 = u32::MAX;
     const KNOWN_FLAGS: u8 = 0b11;
     const FLAG_DIR: u8 = 1;
     const FLAG_SYMLINK: u8 = 2;
+    /// Time column: unknown.
+    const TIME_NONE: u32 = u32::MAX;
+    /// Time column: in the overflow list.
+    const TIME_BIG: u32 = u32::MAX - 1;
+    /// Size column: in the overflow list.
+    const SIZE_BIG: u32 = u32::MAX;
     const BUFFER: usize = 64 * 1024;
 
     fn invalid(message: impl Into<String>) -> io::Error {
@@ -294,40 +308,144 @@ mod stream {
         Ok(b)
     }
 
+    fn u32_of(r: &mut impl Read) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(bytes(r)?))
+    }
+
+    /// Where each part of a snapshot starts (from its header counts).
+    struct Layout {
+        /// Entries.
+        n: u64,
+        /// Distinct names.
+        u: u64,
+        names_len: u64,
+        /// Overflow list lengths: sizes, mtimes, ctimes.
+        big: [u64; 3],
+    }
+
+    impl Layout {
+        /// Start of per-entry column `k` (0 name ids, 1 parents, 2 flags, 3 sizes, 4 mtimes,
+        /// 5 ctimes).
+        fn column(&self, k: usize) -> u64 {
+            const STARTS: [u64; 6] = [0, 4, 8, 9, 13, 17];
+            HEADER_LEN + STARTS[k] * self.n
+        }
+
+        /// Start of overflow list `k` (0 sizes, 1 mtimes, 2 ctimes; 3 is the end of the lists).
+        fn overflow(&self, k: usize) -> u64 {
+            let before: u64 = self.big[..k].iter().sum();
+            HEADER_LEN + BYTES_PER_ENTRY * self.n + BYTES_PER_OVERFLOW * before
+        }
+
+        /// Start of the original names' end offsets.
+        fn name_ends(&self) -> u64 {
+            self.overflow(3)
+        }
+
+        /// Start of the original names' text.
+        fn names(&self) -> u64 {
+            self.name_ends() + 4 * self.u
+        }
+    }
+
+    /// Reads one overflow list alongside the entries (its ids increase), checking its order.
+    struct Overflow {
+        reader: BufReader<File>,
+        left: u64,
+        n: u64,
+        /// The item read but not yet reached.
+        next: Option<(u32, [u8; 8])>,
+    }
+
+    impl Overflow {
+        fn new(file: &Path, at: u64, len: u64, n: u64) -> io::Result<Overflow> {
+            let mut o = Overflow {
+                reader: section(file, at)?,
+                left: len,
+                n,
+                next: None,
+            };
+            o.advance(None)?;
+            Ok(o)
+        }
+
+        fn advance(&mut self, prev: Option<u32>) -> io::Result<()> {
+            self.next = None;
+            if self.left == 0 {
+                return Ok(());
+            }
+            self.left -= 1;
+            let b = bytes::<12>(&mut self.reader)?;
+            let id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if u64::from(id) >= self.n || prev.is_some_and(|p| p >= id) {
+                return Err(invalid("overflow list ids out of order or range"));
+            }
+            let mut v = [0; 8];
+            v.copy_from_slice(&b[4..]);
+            self.next = Some((id, v));
+            Ok(())
+        }
+
+        /// The value listed for entry `id` (zero when it is missing, as the full loader reads
+        /// it). Items of earlier entries are passed over.
+        fn get(&mut self, id: u32) -> io::Result<[u8; 8]> {
+            while let Some((at, v)) = self.next {
+                if at > id {
+                    break;
+                }
+                self.advance(Some(at))?;
+                if at == id {
+                    return Ok(v);
+                }
+            }
+            Ok([0; 8])
+        }
+
+        /// Checks the rest of the list.
+        fn finish(mut self) -> io::Result<()> {
+            while let Some((at, _)) = self.next {
+                self.advance(Some(at))?;
+            }
+            Ok(())
+        }
+    }
+
     /// Most roots looked at by [`all_roots_allowed`]; a snapshot with more is cut normally.
     const MAX_ROOTS: usize = 1024;
 
     /// Whether every root of the snapshot (an entry without a parent, named by its full path)
     /// is an allowed folder or lies under one, so the whole snapshot is kept. Reads the parent
-    /// and name-end columns, then the names of the roots only.
-    fn all_roots_allowed(
-        file: &Path,
-        count: u64,
-        names_len: u64,
-        guard: &Guard,
-    ) -> io::Result<bool> {
-        let mut parents = section(file, HEADER_LEN)?;
-        let mut ends = section(file, HEADER_LEN + 21 * count)?;
-        let mut roots: Vec<(u32, u32)> = Vec::new();
-        let mut prev_end = 0u32;
-        for _ in 0..count {
-            let parent = u32::from_le_bytes(bytes(&mut parents)?);
-            let end = u32::from_le_bytes(bytes(&mut ends)?);
-            if parent == NO_PARENT {
-                if roots.len() == MAX_ROOTS || end < prev_end || u64::from(end) > names_len {
+    /// and name-id columns, then the names of the roots only.
+    fn all_roots_allowed(file: &Path, at: &Layout, guard: &Guard) -> io::Result<bool> {
+        let mut ids = section(file, at.column(0))?;
+        let mut parents = section(file, at.column(1))?;
+        let mut roots: Vec<u32> = Vec::new();
+        for _ in 0..at.n {
+            let nid = u32_of(&mut ids)?;
+            if u32_of(&mut parents)? == NO_PARENT {
+                if roots.len() == MAX_ROOTS || u64::from(nid) >= at.u {
                     return Ok(false);
                 }
-                roots.push((prev_end, end));
+                roots.push(nid);
             }
-            prev_end = end;
         }
-        let names_at = HEADER_LEN + 25 * count;
-        let mut names = File::open(file)?;
+        let mut f = File::open(file)?;
         let mut name = Vec::new();
-        for (start, end) in roots.iter().copied() {
-            names.seek(SeekFrom::Start(names_at + u64::from(start)))?;
+        for nid in roots.iter().copied() {
+            let start = if nid == 0 {
+                0
+            } else {
+                f.seek(SeekFrom::Start(at.name_ends() + 4 * u64::from(nid - 1)))?;
+                u32_of(&mut f)?
+            };
+            f.seek(SeekFrom::Start(at.name_ends() + 4 * u64::from(nid)))?;
+            let end = u32_of(&mut f)?;
+            if end < start || u64::from(end) > at.names_len {
+                return Ok(false);
+            }
+            f.seek(SeekFrom::Start(at.names() + u64::from(start)))?;
             name.resize((end - start) as usize, 0);
-            names.read_exact(&mut name)?;
+            f.read_exact(&mut name)?;
             let Ok(text) = std::str::from_utf8(&name) else {
                 return Ok(false);
             };
@@ -336,6 +454,31 @@ mod stream {
             }
         }
         Ok(!roots.is_empty())
+    }
+
+    /// Reads the distinct original names: their end offsets (checked) and their text.
+    fn original_names(file: &Path, at: &Layout) -> io::Result<(Vec<u32>, Vec<u8>)> {
+        let mut r = section(file, at.name_ends())?;
+        // Sizes were checked against the file length, so these allocations are bounded.
+        let mut ends = Vec::with_capacity(at.u as usize);
+        let mut prev_end = 0u32;
+        for k in 0..at.u {
+            let end = u32_of(&mut r)?;
+            if end < prev_end || u64::from(end) > at.names_len {
+                return Err(invalid(format!("names: bad end offset {end} for name {k}")));
+            }
+            ends.push(end);
+            prev_end = end;
+        }
+        if u64::from(prev_end) != at.names_len {
+            return Err(invalid(format!(
+                "names: offsets end at {prev_end}, text is {} bytes",
+                at.names_len
+            )));
+        }
+        let mut text = vec![0; at.names_len as usize];
+        r.read_exact(&mut text)?;
+        Ok((ends, text))
     }
 
     /// `Ok(None)` when the format version is not one this reader knows.
@@ -348,29 +491,48 @@ mod stream {
         if bytes::<8>(&mut head)? != MAGIC {
             return Err(invalid("not an Athrix index snapshot (bad magic)"));
         }
-        if u32::from_le_bytes(bytes(&mut head)?) != FORMAT_VERSION {
+        if u32_of(&mut head)? != FORMAT_VERSION {
             return Ok(None);
         }
         let _normalizer = bytes::<4>(&mut head)?;
-        let count = u64::from_le_bytes(bytes(&mut head)?);
-        let names_len = u64::from_le_bytes(bytes(&mut head)?);
-        let normalized_len = u64::from_le_bytes(bytes(&mut head)?);
+        let mut counts = [0u64; 7];
+        for c in &mut counts {
+            *c = u64::from_le_bytes(bytes(&mut head)?);
+        }
         drop(head);
-        if count >= u64::from(NO_PARENT) {
-            return Err(invalid(format!("entry count {count} out of range")));
+        let [n, u, names_len, normalized_len, s, m, c] = counts;
+        if n >= u64::from(NO_PARENT) || u >= u64::from(u32::MAX) {
+            return Err(invalid(format!(
+                "entry count {n} or name count {u} out of range"
+            )));
         }
         if names_len > u64::from(u32::MAX) || normalized_len > u64::from(u32::MAX) {
             return Err(invalid("name arena exceeds 4 GiB"));
         }
-        let expected =
-            HEADER_LEN + count * BYTES_PER_ENTRY + names_len + normalized_len + CHECKSUM_LEN;
+        if [s, m, c].iter().any(|&len| len > n) {
+            return Err(invalid("overflow list longer than the entries"));
+        }
+        // All terms are bounded above, so this cannot overflow.
+        let expected = HEADER_LEN
+            + n * BYTES_PER_ENTRY
+            + (s + m + c) * BYTES_PER_OVERFLOW
+            + u * BYTES_PER_NAME
+            + names_len
+            + normalized_len
+            + CHECKSUM_LEN;
         if expected != file_len {
             return Err(invalid(format!(
                 "file is {file_len} bytes, header implies {expected}"
             )));
         }
+        let at = Layout {
+            n,
+            u,
+            names_len,
+            big: [s, m, c],
+        };
 
-        if all_roots_allowed(file, count, names_len, guard)? {
+        if all_roots_allowed(file, &at, guard)? {
             // Everything is kept: the plain loader is faster (no names normalized again). It
             // refuses a snapshot written with another name normalizer (an app of another
             // version); the cut below normalizes again, so it reads that one too.
@@ -380,64 +542,68 @@ mod stream {
             }
         }
 
-        let mut parents = section(file, HEADER_LEN)?;
-        let mut flags = section(file, HEADER_LEN + 4 * count)?;
-        let mut sizes = section(file, HEADER_LEN + 5 * count)?;
-        let mut mtimes = section(file, HEADER_LEN + 13 * count)?;
-        let mut ends = section(file, HEADER_LEN + 21 * count)?;
-        let mut names = section(file, HEADER_LEN + 25 * count)?;
+        // Any entry may use any distinct name, so those are held while reading.
+        let (ends, text) = original_names(file, &at)?;
+        let mut ids = section(file, at.column(0))?;
+        let mut parents = section(file, at.column(1))?;
+        let mut flags = section(file, at.column(2))?;
+        let mut sizes = section(file, at.column(3))?;
+        let mut mtimes = section(file, at.column(4))?;
+        let mut ctimes = section(file, at.column(5))?;
+        let mut big_sizes = Overflow::new(file, at.overflow(0), s, n)?;
+        let mut big_mtimes = Overflow::new(file, at.overflow(1), m, n)?;
+        let mut big_ctimes = Overflow::new(file, at.overflow(2), c, n)?;
+        let time = |v: u32, id: u32, big: &mut Overflow| -> io::Result<Option<i64>> {
+            Ok(match v {
+                TIME_NONE => None,
+                TIME_BIG => Some(i64::from_le_bytes(big.get(id)?)),
+                v => Some(i64::from(v)),
+            })
+        };
 
-        let n = usize::try_from(count).map_err(|_| invalid("too many entries"))?;
-        let mut cut = Cutter::new(guard, n);
-        let mut name = Vec::new();
-        let mut prev_end = 0u32;
-        for i in 0..count {
-            let parent = match u32::from_le_bytes(bytes(&mut parents)?) {
-                NO_PARENT => None,
-                p if u64::from(p) < i => Some(p),
-                p => return Err(invalid(format!("entry {i} has invalid parent {p}"))),
-            };
-            let end = u32::from_le_bytes(bytes(&mut ends)?);
-            if end < prev_end || u64::from(end) > names_len {
-                return Err(invalid(format!(
-                    "names: bad end offset {end} for entry {i}"
-                )));
+        let count = usize::try_from(n).map_err(|_| invalid("too many entries"))?;
+        let mut cut = Cutter::new(guard, count);
+        for id in 0..count as u32 {
+            let nid = u32_of(&mut ids)?;
+            if u64::from(nid) >= u {
+                return Err(invalid(format!("entry {id} has invalid name id {nid}")));
             }
-            let len = end - prev_end;
-            prev_end = end;
+            let parent = match u32_of(&mut parents)? {
+                NO_PARENT => None,
+                p if p < id => Some(p),
+                p => return Err(invalid(format!("entry {id} has invalid parent {p}"))),
+            };
+            let [flag] = bytes::<1>(&mut flags)?;
+            let size = u32_of(&mut sizes)?;
+            let mtime = u32_of(&mut mtimes)?;
+            let ctime = u32_of(&mut ctimes)?;
             let Some(place) = cut.need(parent) else {
-                // Outside: read past its name and metadata without keeping them. (Reading,
-                // not `seek_relative`: a seek past an empty buffer is a system call each time.)
-                name.resize(len as usize, 0);
-                names.read_exact(&mut name)?;
-                bytes::<1>(&mut flags)?;
-                bytes::<8>(&mut sizes)?;
-                bytes::<8>(&mut mtimes)?;
                 continue;
             };
-            name.resize(len as usize, 0);
-            names.read_exact(&mut name)?;
-            let text = std::str::from_utf8(&name)
-                .map_err(|_| invalid(format!("name of entry {i} is not UTF-8")))?;
-            let [flag] = bytes::<1>(&mut flags)?;
             if flag & !KNOWN_FLAGS != 0 {
-                return Err(invalid(format!("entry {i} has unknown flags {flag:#x}")));
+                return Err(invalid(format!("entry {id} has unknown flags {flag:#x}")));
             }
-            let size = u64::from_le_bytes(bytes(&mut sizes)?);
-            let mtime = i64::from_le_bytes(bytes(&mut mtimes)?);
+            let start = match nid {
+                0 => 0,
+                k => ends[k as usize - 1] as usize,
+            };
+            let name = std::str::from_utf8(&text[start..ends[nid as usize] as usize])
+                .map_err(|_| invalid(format!("name of entry {id} is not UTF-8")))?;
             let meta = EntryMeta {
                 is_dir: flag & FLAG_DIR != 0,
                 is_symlink: flag & FLAG_SYMLINK != 0,
-                size,
-                modified: (mtime != i64::MIN).then_some(mtime),
+                size: match size {
+                    SIZE_BIG => u64::from_le_bytes(big_sizes.get(id)?),
+                    v => u64::from(v),
+                },
+                modified: time(mtime, id, &mut big_mtimes)?,
+                created: time(ctime, id, &mut big_ctimes)?,
             };
-            cut.push(parent, place, text, meta);
+            cut.push(parent, place, name, meta);
         }
-        if u64::from(prev_end) != names_len {
-            return Err(invalid(format!(
-                "names: offsets end at {prev_end}, text is {names_len} bytes"
-            )));
-        }
+        big_sizes.finish()?;
+        big_mtimes.finish()?;
+        big_ctimes.finish()?;
         Ok(Some(cut.finish()))
     }
 }
@@ -519,7 +685,17 @@ mod tests {
         );
         let root_b = b.push(None, &base.join("b").to_string_lossy(), dir());
         b.push(Some(root_b), "b.txt", plain(3, Some(3)));
-        b.push(Some(allowed), "late.txt", plain(9, Some(9)));
+        // Values outside the packed `u32` columns (overflow lists), a creation time, and a
+        // name already used by another entry (stored once in the snapshot).
+        b.push(
+            Some(allowed),
+            "late.txt",
+            EntryMeta {
+                created: Some(-86_400),
+                ..plain(5 << 30, Some(1 << 33))
+            },
+        );
+        b.push(Some(sub), "b.txt", plain(9, Some(9)));
         Tree {
             index: b.finish(),
             base,
@@ -557,6 +733,7 @@ mod tests {
                 allowed.join("تقارير").join("تَقْرِير 2025.PDF"),
                 allowed.join("link"),
                 allowed.join("late.txt"),
+                allowed.join("تقارير").join("b.txt"),
             ]
         );
         // The root leading to it is kept (for paths) but not searchable; nothing else is.
@@ -568,6 +745,10 @@ mod tests {
             .find(|r| r.0.ends_with("تَقْرِير 2025.PDF"))
             .unwrap();
         assert_eq!(pdf.1, plain(42, Some(1_700_000_000)));
+        let late = got.iter().find(|r| r.0.ends_with("late.txt")).unwrap();
+        assert_eq!(late.1.size, 5 << 30);
+        assert_eq!(late.1.modified, Some(1 << 33));
+        assert_eq!(late.1.created, Some(-86_400));
         assert!(
             got.iter()
                 .find(|r| r.0.ends_with("link"))
@@ -654,7 +835,7 @@ mod tests {
         assert!(load_allowed(&file, &guard).is_err());
         // A parent pointing forward (entry 1's parent set to 5).
         let mut bad = good.clone();
-        let at = stream_parent_offset(1);
+        let at = stream_parent_offset(1, t.index.len());
         bad[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
         std::fs::write(&file, &bad).unwrap();
         assert!(load_allowed(&file, &guard).is_err());
@@ -671,8 +852,10 @@ mod tests {
         }
     }
 
-    fn stream_parent_offset(entry: usize) -> usize {
-        40 + 4 * entry
+    /// Offset of entry `entry`'s parent in a snapshot of `count` entries (format v2: a
+    /// 72-byte header, then the name ids, then the parents).
+    fn stream_parent_offset(entry: usize, count: usize) -> usize {
+        72 + 4 * count + 4 * entry
     }
 
     #[test]
@@ -694,7 +877,7 @@ mod tests {
             .iter()
             .filter(|m| **m)
             .count();
-        assert_eq!(n1, 5);
+        assert_eq!(n1, 6);
         assert!(names.is_loaded() && names.heap_bytes() > 0);
         // Other folders: cut again.
         let n2 = names

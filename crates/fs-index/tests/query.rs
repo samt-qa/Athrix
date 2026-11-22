@@ -57,6 +57,21 @@ fn file(size: u64, modified: Option<i64>) -> EntryMeta {
 ///     └── تقرير قديم.docx    5 KB    2024-12-31 23:00
 /// ```
 fn fixture() -> FileIndex {
+    fixture_with(|meta| meta)
+}
+
+/// The same tree with every time moved from "modified" to "created" (and the modification
+/// time unknown), so `dc:` must find exactly what `dm:` finds in [`fixture`].
+fn created_fixture() -> FileIndex {
+    fixture_with(|meta| EntryMeta {
+        modified: None,
+        created: meta.modified,
+        ..meta
+    })
+}
+
+fn fixture_with(map: impl Fn(EntryMeta) -> EntryMeta) -> FileIndex {
+    let file = |size, modified| map(file(size, modified));
     let mut b = IndexBuilder::new();
     let root = b.push(None, "D:\\Data", dir());
     let docs = b.push(Some(root), "Docs", dir());
@@ -233,6 +248,47 @@ fn date_filter_resolves_against_a_fixed_clock() {
 }
 
 #[test]
+fn creation_date_filter_has_the_semantics_of_the_modification_date_filter() {
+    let ix = fixture();
+    let created = created_fixture();
+    for date in [
+        "today",
+        "yesterday",
+        "thisweek",
+        "lastweek",
+        "thismonth",
+        "lastmonth",
+        "thisyear",
+        "lastyear",
+        "2024",
+        "2026-03",
+        "2026-03-15",
+        "2026-03-14",
+        "<2026",
+        "<=2025",
+        ">2026-11-16",
+        ">=2026-11-16",
+        "2025-01..2026-03",
+        ">2000",
+    ] {
+        let by_mtime = find(&ix, &format!("dm:{date}"));
+        assert_eq!(find(&created, &format!("dc:{date}")), by_mtime, "dc:{date}");
+        assert!(
+            find(&ix, &format!("dc:{date}")).is_empty(),
+            "no creation times"
+        );
+        assert!(
+            find(&created, &format!("dm:{date}")).is_empty(),
+            "no mtimes"
+        );
+    }
+    // Combined with other filters and the Arabic synonym-free form.
+    assert_eq!(find(&created, "dc:today ext:pdf"), ["تقرير_2026.pdf"]);
+    assert_eq!(find(&created, "!dc:>2000"), find(&ix, "!dm:>2000"));
+    assert_eq!(find(&created, "dc:2026 | dc:2024").len(), 7);
+}
+
+#[test]
 fn week_starts_on_monday_and_month_rolls_over_the_year() {
     let ix = fixture();
     // On a Monday, "thisweek" starts that same day.
@@ -377,7 +433,6 @@ fn unsupported_filters_are_typed_errors() {
         ("dupe:", FilterName::Dupe),
         ("similar:a.jpg", FilterName::Similar),
         ("tag:work", FilterName::Tag),
-        ("dc:today", FilterName::DateCreated),
         ("da:2026", FilterName::DateAccessed),
         ("محتوى:فاتورة", FilterName::Content),
     ] {

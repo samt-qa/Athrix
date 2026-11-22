@@ -359,12 +359,17 @@ fn meta_from(md: &std::fs::Metadata) -> EntryMeta {
         is_dir: md.is_dir(),
         is_symlink: md.file_type().is_symlink(),
         size: if md.is_dir() { 0 } else { md.len() },
-        modified: md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .and_then(|d| i64::try_from(d.as_secs()).ok()),
+        modified: md.modified().ok().and_then(unix_seconds),
+        // Not every file system records it (`created()` then fails): unknown.
+        created: md.created().ok().and_then(unix_seconds),
     }
+}
+
+/// Seconds since the Unix epoch (`None` before 1970).
+fn unix_seconds(t: std::time::SystemTime) -> Option<i64> {
+    t.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 fn read_meta(path: &Path, follow_links: bool, counters: &Counters) -> Option<EntryMeta> {

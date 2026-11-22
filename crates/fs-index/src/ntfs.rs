@@ -134,6 +134,7 @@ fn push_tree(
             is_symlink,
             size: if e.is_dir() { 0 } else { e.size.unwrap_or(0) },
             modified: e.modified,
+            created: e.created,
         };
         let Some(parent) = e.parent else {
             // The root: never excluded, as in the walk.
@@ -414,6 +415,7 @@ mod tests {
                 i,
                 Some(u64::from(i) * 10),
                 Some(1_700_000_000 + i64::from(i)),
+                Some(1_600_000_000 + i64::from(i)),
             );
         }
         t.mark_metadata();
@@ -525,6 +527,7 @@ mod tests {
         assert_eq!(ix.normalized_name(doc), "محاضره docx");
         assert_eq!(ix.meta(doc).size, u64::from(i) * 10);
         assert_eq!(ix.meta(doc).modified, Some(1_700_000_000 + i64::from(i)));
+        assert_eq!(ix.meta(doc).created, Some(1_600_000_000 + i64::from(i)));
         assert!(!ix.meta(doc).is_symlink);
         assert!(ix.meta(0).is_dir);
         assert_eq!(ix.name(0), root().to_string_lossy());

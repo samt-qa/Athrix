@@ -36,10 +36,10 @@
 //! entry uses a `PathLookup` built once per name-index base: a sorted table of
 //! `(hash of the path key, base id)` for every base *file whose format the extractor knows*
 //! (`Kind::from_path`, the same cheap test the scheduler uses before anything else), so
-//! folders and the many files without text never cost anything. That is 12 bytes per
-//! content-candidate file (a few MB for a few hundred thousand documents), the same per-entry
-//! cost as the live index's own child table, and much less than a `path → id` map of strings
-//! (100+ bytes per entry). A lookup is a binary search plus one path key rebuilt from the
+//! folders and the many files without text never cost anything. The top 16 bits of a hash
+//! pick its bucket and only the low 32 bits are stored, so that is 8 bytes per
+//! content-candidate file (a few MB for a few hundred thousand documents), much less than a
+//! `path → id` map of strings (100+ bytes per entry). A lookup is a binary search plus one path key rebuilt from the
 //! entry's ancestors (`entry_key`) to rule out hash collisions. Entries added since the base
 //! (the live delta, bounded by compaction) are resolved through a small `path key → id` map
 //! built per view, only when a hit is not in the base. Building the table costs one path key
@@ -979,7 +979,10 @@ fn ui_snippet(s: Snippet) -> ContentSnippet {
 #[derive(Debug)]
 struct PathLookup {
     base: Weak<FileIndex>,
-    hashes: Vec<u64>,
+    /// Low 32 bits of each hash, sorted within its bucket (the bucket holds the top bits; the
+    /// bits in between are not kept, so a few more candidates may come back, and every
+    /// candidate is checked against its path key anyway).
+    hashes: Vec<u32>,
     ids: Vec<EntryId>,
     /// `starts[b]..starts[b + 1]`: the part of `hashes` whose top [`BUCKET_BITS`] bits are
     /// `b`, so a lookup binary-searches a few dozen hashes instead of millions (256 KiB, and
@@ -993,8 +996,9 @@ const BUCKET_BITS: u32 = 16;
 impl PathLookup {
     fn build(base: &Arc<FileIndex>) -> Self {
         let mut pairs: Vec<(u64, EntryId)> = Vec::new();
-        // The key of the last parent seen: files of one folder are consecutive in walk order.
-        let mut parent_key: Option<(EntryId, String)> = None;
+        // The unfinished key of the last parent seen (see `raw_entry_key`): files of one
+        // folder are consecutive in walk order.
+        let mut parent_key: Option<(EntryId, String, bool)> = None;
         let mut key = String::new();
         for id in 0..base.len() {
             let Ok(id) = EntryId::try_from(id) else {
@@ -1005,16 +1009,16 @@ impl PathLookup {
             }
             match base.parent(id) {
                 Some(p) => {
-                    if parent_key.as_ref().is_none_or(|(cached, _)| *cached != p) {
+                    if parent_key.as_ref().is_none_or(|(cached, ..)| *cached != p) {
                         let mut pk = String::new();
-                        entry_key(&**base, p, &mut pk);
-                        parent_key = Some((p, pk));
+                        let ends_with_separator = raw_entry_key(&**base, p, &mut pk);
+                        parent_key = Some((p, pk, ends_with_separator));
                     }
-                    let (_, pk) = parent_key.as_ref().expect("just set");
+                    let (_, pk, ends_with_separator) = parent_key.as_ref().expect("just set");
                     key.clear();
                     key.push_str(pk);
-                    key.push('/');
-                    push_key_chars(&mut key, base.name(id));
+                    join_key(&mut key, *ends_with_separator, base.name(id));
+                    trim_key(&mut key);
                 }
                 None => {
                     entry_key(&**base, id, &mut key);
@@ -1022,18 +1026,20 @@ impl PathLookup {
             }
             pairs.push((key_hash(&key), id));
         }
-        pairs.sort_unstable();
-        let (hashes, ids): (Vec<u64>, Vec<EntryId>) = pairs.into_iter().unzip();
+        // Ordered by (bucket, low bits): exactly the order `candidates` searches.
+        pairs.sort_unstable_by_key(|&(h, id)| (bucket(h), h as u32, id));
         let buckets = 1usize << BUCKET_BITS;
         let mut starts = Vec::with_capacity(buckets + 1);
         let mut at = 0;
         for b in 0..buckets {
-            while at < hashes.len() && bucket(hashes[at]) < b {
+            while at < pairs.len() && bucket(pairs[at].0) < b {
                 at += 1;
             }
             starts.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
-        starts.push(u32::try_from(hashes.len()).unwrap_or(u32::MAX));
+        starts.push(u32::try_from(pairs.len()).unwrap_or(u32::MAX));
+        let (hashes, ids): (Vec<u32>, Vec<EntryId>) =
+            pairs.into_iter().map(|(h, id)| (h as u32, id)).unzip();
         PathLookup {
             base: Arc::downgrade(base),
             hashes,
@@ -1046,13 +1052,14 @@ impl PathLookup {
         std::ptr::eq(self.base.as_ptr(), Arc::as_ptr(base))
     }
 
-    /// Base ids whose path key hashes to `hash`.
+    /// Base ids whose path key may hash to `hash` (same bucket and low 32 bits).
     fn candidates(&self, hash: u64) -> &[EntryId] {
         let b = bucket(hash);
+        let low = hash as u32;
         let (lo, hi) = (self.starts[b] as usize, self.starts[b + 1] as usize);
         let part = &self.hashes[lo..hi];
-        let start = lo + part.partition_point(|&h| h < hash);
-        let end = start + self.hashes[start..hi].partition_point(|&h| h == hash);
+        let start = lo + part.partition_point(|&h| h < low);
+        let end = start + self.hashes[start..hi].partition_point(|&h| h == low);
         &self.ids[start..end]
     }
 }
@@ -1118,6 +1125,15 @@ fn str_key(path: &str) -> String {
 /// [`path_key`] of the path of entry `id` (its root's full path, then each name), built into
 /// `out` (cleared first) from the names, without building the `PathBuf`. Returns `out`.
 fn entry_key<'a, E: Entries + ?Sized>(entries: &E, id: EntryId, out: &'a mut String) -> &'a str {
+    raw_entry_key(entries, id, out);
+    trim_key(out);
+    out
+}
+
+/// The key characters of the path of `id` as [`Path::join`] would spell it, before the final
+/// trim of trailing `/` that [`path_key`] does (see [`join_key`]). Returns whether the path
+/// text ends with a separator of this OS.
+fn raw_entry_key<E: Entries + ?Sized>(entries: &E, id: EntryId, out: &mut String) -> bool {
     let mut chain: Vec<EntryId> = Vec::with_capacity(16);
     let mut cur = id;
     while let Some(p) = entries.parent(cur) {
@@ -1126,15 +1142,39 @@ fn entry_key<'a, E: Entries + ?Sized>(entries: &E, id: EntryId, out: &'a mut Str
     }
     out.clear();
     // `cur` is the root: its name is its full path.
-    push_key_chars(out, entries.name(cur));
+    let root = entries.name(cur);
+    push_key_chars(out, root);
+    let mut ends_with_separator = ends_in_separator(root);
+    for &c in chain.iter().rev() {
+        let name = entries.name(c);
+        join_key(out, ends_with_separator, name);
+        ends_with_separator = ends_in_separator(name);
+    }
+    ends_with_separator
+}
+
+/// Appends `name` to a raw key the way [`Path::push`] joins it: with a separator unless the
+/// path so far ends with one **of this OS** (`\` is one on Windows only, so a root named
+/// `C:\` on Unix gets a `/` after it, which the key spells `C://`, exactly like [`path_key`]
+/// of the joined path).
+fn join_key(out: &mut String, ends_with_separator: bool, name: &str) {
+    if !ends_with_separator {
+        out.push('/');
+    }
+    push_key_chars(out, name);
+}
+
+fn ends_in_separator(path: &str) -> bool {
+    path.chars()
+        .next_back()
+        .is_some_and(std::path::is_separator)
+}
+
+/// Drops the trailing `/` of a key, as [`path_key`] does.
+fn trim_key(out: &mut String) {
     while out.ends_with('/') {
         out.pop();
     }
-    for &c in chain.iter().rev() {
-        out.push('/');
-        push_key_chars(out, entries.name(c));
-    }
-    out
 }
 
 fn key_hash(key: &str) -> u64 {
@@ -1558,12 +1598,27 @@ mod tests {
         };
         let file = EntryMeta::default();
         let mut b = IndexBuilder::new();
-        for root in [r"C:\", r"D:\Data", r"E:\Ünïcode Ä\", "/", "/home/u"] {
+        // Windows-style roots too on Unix, where `\` is an ordinary character: the keys must
+        // still agree with `path_key` of the joined `PathBuf` (`C:\` + `x` = `C:\/x` there).
+        for root in [
+            r"C:\",
+            r"D:\Data",
+            r"E:\Ünïcode Ä\",
+            "/",
+            "/home/u",
+            "/srv/",
+        ] {
             let r = b.push(None, root, dir);
             let sub = b.push(Some(r), "مُحَاضَرَات İSTANBUL", dir);
             b.push(Some(sub), "Report.TXT", file);
             b.push(Some(sub), "تقرير ẞ.docx", file);
             b.push(Some(r), "a.md", file);
+            // A name ending in a backslash (legal on Unix only) is joined like Path does.
+            #[cfg(not(windows))]
+            {
+                let odd = b.push(Some(r), r"odd\", dir);
+                b.push(Some(odd), "x.txt", file);
+            }
         }
         let ix = Arc::new(b.finish());
         let mut buf = String::new();
@@ -1576,7 +1631,8 @@ mod tests {
         assert_eq!(str_key(r"C:\Users\"), path_key(Path::new(r"C:\Users\")));
         // The table built with the parent cache hashes the same keys.
         let lookup = PathLookup::build(&ix);
-        assert_eq!(lookup.ids.len(), 15);
+        let files = if cfg!(windows) { 18 } else { 24 };
+        assert_eq!(lookup.ids.len(), files);
         for &id in &lookup.ids {
             let key = path_key(&ix.path(id));
             assert!(lookup.candidates(key_hash(&key)).contains(&id), "{key}");

@@ -39,8 +39,10 @@ pub struct InterpretPart {
 pub fn interpret_query(text: String, today: Option<String>) -> Option<Interpretation> {
     let options = InterpretOptions {
         today: today.as_deref().and_then(parse_day),
-        // The name index has no creation / access times: keep every date `dm:`.
-        ..Default::default()
+        // The name index stores creation times (`dc:`) but not access times: "opened" dates
+        // stay `dm:`.
+        created_dates: true,
+        accessed_dates: false,
     };
     let found = interpret_with(&text, &options)?;
     Some(Interpretation {
@@ -101,8 +103,10 @@ mod tests {
     #[test]
     fn date_kinds_and_size_words() {
         let q = |s: &str| interpret_query(s.into(), Some("2026-11-22".into())).map(|i| i.query);
-        assert_eq!(q("ملفات أُنشئت أمس").as_deref(), Some("dm:yesterday"));
+        assert_eq!(q("ملفات أُنشئت أمس").as_deref(), Some("dc:yesterday"));
+        assert_eq!(q("files created in 2024").as_deref(), Some("dc:2024"));
         assert_eq!(q("files opened last week").as_deref(), Some("dm:lastweek"));
+        assert_eq!(q("ملفات فُتحت أمس").as_deref(), Some("dm:yesterday"));
         assert_eq!(q("الملفات الضخمة").as_deref(), Some("size:>1gb"));
     }
 }
