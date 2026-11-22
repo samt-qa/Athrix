@@ -21,6 +21,8 @@ athrix-text-ar.workspace = true
 athrix-content-index.workspace = true
 athrix-extract.workspace = true
 athrix-query.workspace = true
+# `athrix interpret`: today's local date for relative phrases («قبل 3 أيام»).
+chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 athrix-ranking.workspace = true
 sysinfo = { workspace = true, features = ["system"] }
 

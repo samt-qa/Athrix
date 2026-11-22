@@ -6,6 +6,8 @@
 //! - [`content`]: the content index, its background indexing, content search and frecency;
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
+//! - [`dupes`]: `dupe:` searches (identical files, BLAKE3 hashes cached in SQLite);
+//! - [`similar`]: `similar:` and "find similar images" (perceptual hashes cached in SQLite);
 //! - [`preview`]: previews for the preview pane and the scheme serving previewed images;
 //! - [`suggest`]: the "did you mean…" rewrite offered when a search finds nothing (asked
 //!   separately, `search_suggest`);
@@ -18,14 +20,18 @@
 //! - [`shortcut`]: the global shortcut that toggles the popup;
 //! - [`tray`]: the system-tray icon and its menu;
 //! - [`launch_args`]: `--search-in <folder>` from Explorer's context menu;
-//! - [`updater`]: manual update checks / install and the update settings.
+//! - [`updater`]: manual update checks / install and the update settings;
+//! - [`mcp`]: the settings of the `athrix-mcp` server for AI assistants (off by default).
 
 pub mod commands;
 pub mod content;
 pub mod drives;
+pub mod dupes;
 pub mod indexing;
+pub mod interpret;
 pub mod launch_args;
 pub mod library;
+pub mod mcp;
 pub mod model;
 pub mod pdf_worker;
 pub mod popup;
@@ -34,6 +40,7 @@ pub mod query;
 pub mod results;
 pub mod roots;
 pub mod shortcut;
+pub mod similar;
 pub mod state;
 pub mod suggest;
 pub mod tray;
@@ -111,6 +118,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(launch_args::SearchInState::default())
@@ -121,6 +129,8 @@ pub fn run() {
         .setup(|app| {
             commands::start_default_indexing(app.handle());
             library::open(app.handle());
+            dupes::configure(app.handle());
+            similar::configure(app.handle());
             shortcut::register(app.handle());
             if let Err(err) = tray::create(app.handle()) {
                 tracing::warn!("couldn't create the tray icon: {err}");
@@ -151,6 +161,8 @@ pub fn run() {
             drives::set_drive_settings,
             commands::search,
             commands::search_suggest,
+            similar::find_similar,
+            interpret::interpret_query,
             commands::open_entry,
             commands::reveal_entry,
             commands::entry_path,
@@ -178,6 +190,10 @@ pub fn run() {
             updater::update_install,
             updater::get_update_settings,
             updater::set_update_settings,
+            mcp::get_mcp_settings,
+            mcp::set_mcp_settings,
+            mcp::mcp_server_path,
+            mcp::mcp_pick_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Athrix app")

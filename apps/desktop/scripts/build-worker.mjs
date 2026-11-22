@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Builds the isolated extraction worker (`athrix-extract-worker`, with PDF support) and
-// stages it as a Tauri sidecar:
+// Builds the Tauri sidecars and stages them in src-tauri/binaries:
 //
-//   src-tauri/binaries/athrix-extract-worker-<target-triple>[.exe]
+//   src-tauri/binaries/athrix-extract-worker-<target-triple>[.exe]  (isolated PDF extraction)
+//   src-tauri/binaries/athrix-mcp-<target-triple>[.exe]             (MCP server for AI clients)
 //
 // `bundle.externalBin` in tauri.conf.json lists it, so:
 // - tauri-build (the app's build script) copies it next to the app executable in
@@ -12,9 +12,10 @@
 //   (`npm run worker`) before `cargo build -p athrix-desktop`.
 // - `tauri build` installs it next to Athrix.exe (without the triple suffix).
 //
-// Why a separate cargo invocation and target dir: cargo features are per package, so building
-// the worker with `--features pdf` in the same invocation as the app would turn PDF parsing on
-// in-process for the app too (feature unification). A separate target dir (target/worker) keeps
+// Why separate cargo invocations and target dir: cargo features are per package, so building
+// the worker with `--features pdf` in the same invocation as the app (or as athrix-mcp, which
+// must not parse PDFs in-process either) would turn PDF parsing on there too (feature
+// unification). So each sidecar gets its own cargo invocation. A separate target dir (target/worker) keeps
 // the two feature sets from invalidating each other's artifacts and avoids waiting on the main
 // target dir's lock while `tauri dev` / an IDE builds the app.
 //
@@ -29,7 +30,11 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BIN = "athrix-extract-worker";
+// Each sidecar: its binary name and the cargo arguments that build it.
+const SIDECARS = [
+  { bin: "athrix-extract-worker", args: ["-p", "athrix-extract", "--bin", "athrix-extract-worker", "--features", "pdf"] },
+  { bin: "athrix-mcp", args: ["-p", "athrix-mcp", "--bin", "athrix-mcp"] },
+];
 const here = dirname(fileURLToPath(import.meta.url));
 const appDir = resolve(here, "..");
 const tauriDir = join(appDir, "src-tauri");
@@ -78,31 +83,33 @@ const triple = opts.target || process.env.TAURI_ENV_TARGET_TRIPLE || host;
 const exe = triple.includes("windows") ? ".exe" : "";
 const profile = opts.release ? "release" : "debug";
 
-const args = ["build", "-p", "athrix-extract", "--bin", BIN, "--features", "pdf"];
-args.push("--target-dir", targetDir);
-if (opts.release) args.push("--release");
 // Only pass --target when cross-compiling: it changes the output path.
 const cross = triple !== host;
-if (cross) args.push("--target", triple);
-
-console.error(`[build-worker] cargo ${args.join(" ")}`);
-const built = spawnSync("cargo", args, { cwd: workspace, stdio: "inherit" });
-if (built.error) fail(`cannot run cargo: ${built.error.message}`);
-if (built.status !== 0) fail(`cargo exited with ${built.status}`);
-
-const source = join(targetDir, ...(cross ? [triple] : []), profile, `${BIN}${exe}`);
-if (!existsSync(source)) fail(`built worker not found at ${source}`);
-
 const binaries = join(tauriDir, "binaries");
 mkdirSync(binaries, { recursive: true });
-const dest = join(binaries, `${BIN}-${triple}${exe}`);
-// Unchanged binary: leave it (and its mtime) alone, so tauri-build does not rerun for nothing.
-if (sameFile(source, dest)) {
-  console.error(`[build-worker] up to date: ${dest}`);
-} else {
-  // Copy then rename: tauri-build never sees a half-written file.
-  const tmp = `${dest}.tmp`;
-  copyFileSync(source, tmp);
-  renameSync(tmp, dest);
-  console.error(`[build-worker] ${profile} worker -> ${dest}`);
+
+for (const { bin, args: buildArgs } of SIDECARS) {
+  const args = ["build", ...buildArgs, "--target-dir", targetDir];
+  if (opts.release) args.push("--release");
+  if (cross) args.push("--target", triple);
+
+  console.error(`[build-worker] cargo ${args.join(" ")}`);
+  const built = spawnSync("cargo", args, { cwd: workspace, stdio: "inherit" });
+  if (built.error) fail(`cannot run cargo: ${built.error.message}`);
+  if (built.status !== 0) fail(`cargo exited with ${built.status}`);
+
+  const source = join(targetDir, ...(cross ? [triple] : []), profile, `${bin}${exe}`);
+  if (!existsSync(source)) fail(`built ${bin} not found at ${source}`);
+
+  const dest = join(binaries, `${bin}-${triple}${exe}`);
+  // Unchanged binary: leave it (and its mtime) alone, so tauri-build does not rerun for nothing.
+  if (sameFile(source, dest)) {
+    console.error(`[build-worker] up to date: ${dest}`);
+  } else {
+    // Copy then rename: tauri-build never sees a half-written file.
+    const tmp = `${dest}.tmp`;
+    copyFileSync(source, tmp);
+    renameSync(tmp, dest);
+    console.error(`[build-worker] ${profile} ${bin} -> ${dest}`);
+  }
 }

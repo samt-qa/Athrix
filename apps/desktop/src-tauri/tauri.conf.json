@@ -66,7 +66,8 @@
       }
     },
     "externalBin": [
-      "binaries/athrix-extract-worker"
+      "binaries/athrix-extract-worker",
+      "binaries/athrix-mcp"
     ],
     "icon": [
       "icons/32x32.png",

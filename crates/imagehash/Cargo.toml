@@ -1,0 +1,22 @@
+[package]
+name = "athrix-imagehash"
+description = "Perceptual image hashes (DCT pHash), similarity grouping and a SQLite hash cache for `similar:`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+image.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

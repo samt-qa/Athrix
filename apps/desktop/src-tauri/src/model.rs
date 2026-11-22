@@ -88,6 +88,55 @@ pub struct ResultItem {
     /// the first [`crate::content::SNIPPET_ROWS`] rows of a response carry it; the UI asks
     /// for the others with `content_snippets` ([`RowSnippet`]).
     pub snippet: Option<ContentSnippet>,
+    /// `dupe:` searches only: this file's duplicate group, numbered 1, 2... in response order
+    /// (members of a group are adjacent). Omitted from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dupe_group: Option<u32>,
+    /// `dupe:` searches only: how many identical copies the group has, this file included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dupe_count: Option<u32>,
+    /// Similar-image searches only (`similar:`, `find_similar`): how alike this picture is to
+    /// the reference image or to its group's first image, 0–100 %. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u8>,
+    /// `similar:` searches only: this image's group of near-identical pictures, numbered 1,
+    /// 2... in response order (members of a group are adjacent). Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar_group: Option<u32>,
+}
+
+/// Totals of a similar-image search (`SearchResponse.similar`), for the status line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarSummary {
+    /// Candidate images (jpg, png, webp, gif, bmp, tiff) the search looked at.
+    pub images: usize,
+    /// Of those, how many were compared (hashed now or before); fewer than `images` when the
+    /// time budget ran out (`similarIncomplete`).
+    pub checked: usize,
+    /// Of the checked ones, how many could not be read (corrupt, unsupported, too large).
+    pub skipped: usize,
+    /// `similar:` only: groups found (all of them, even past `limit`); 0 for one reference.
+    pub groups: usize,
+    /// Rows found (all of them, even past `limit`).
+    pub found: usize,
+}
+
+/// Totals of a `dupe:` search (`SearchResponse.dupe`), for the status line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DupeSummary {
+    /// Duplicate groups found (all of them, even past `limit`).
+    pub groups: usize,
+    /// Files in those groups.
+    pub files: usize,
+    /// Space the extra copies take: the sum of `size × (count − 1)` over the groups.
+    pub wasted_bytes: u64,
+    /// The time/byte budget ran out before every candidate was checked; searching again
+    /// continues the scan (hashes already computed are cached).
+    pub incomplete: bool,
+    /// Candidates skipped: gone, changed, locked or unreadable.
+    pub skipped: usize,
 }
 
 /// One answer of `content_snippets`: the snippet of the result row `id`, or `None` when the
@@ -218,6 +267,16 @@ pub struct SearchResponse {
     pub error: Option<QueryError>,
     /// Set when a newer request cancelled this one (`items` is then empty).
     pub cancelled: bool,
+    /// Totals of a `dupe:` search; omitted from the JSON for other searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dupe: Option<DupeSummary>,
+    /// Totals of a similar-image search; omitted from the JSON for other searches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar: Option<SimilarSummary>,
+    /// A similar-image search ran out of its time budget before every image was compared:
+    /// searching again continues (hashes are cached). Omitted unless true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub similar_incomplete: bool,
 }
 
 /// Response of the `search_suggest` command, asked after a `search` found nothing.
@@ -426,8 +485,47 @@ mod tests {
                 text: "ميزانية".into(),
                 highlights: vec![(0, 7)],
             }),
+            dupe_group: None,
+            dupe_count: None,
+            similarity: None,
+            similar_group: None,
         };
         let json = serde_json::to_value(&item).unwrap();
+        assert!(json.get("dupeGroup").is_none() && json.get("dupeCount").is_none());
+        assert!(json.get("similarity").is_none() && json.get("similarGroup").is_none());
+        let similar = ResultItem {
+            similarity: Some(97),
+            similar_group: Some(4),
+            ..item.clone()
+        };
+        let similar_json = serde_json::to_value(&similar).unwrap();
+        assert_eq!(
+            (&similar_json["similarity"], &similar_json["similarGroup"]),
+            (&97.into(), &4.into())
+        );
+        let dupe = ResultItem {
+            dupe_group: Some(2),
+            dupe_count: Some(3),
+            ..item.clone()
+        };
+        let dupe_json = serde_json::to_value(&dupe).unwrap();
+        assert_eq!(
+            (&dupe_json["dupeGroup"], &dupe_json["dupeCount"]),
+            (&2.into(), &3.into())
+        );
+        let summary = DupeSummary {
+            groups: 1,
+            files: 3,
+            wasted_bytes: 10,
+            incomplete: true,
+            skipped: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap(),
+            serde_json::json!({
+                "groups": 1, "files": 3, "wastedBytes": 10, "incomplete": true, "skipped": 0
+            })
+        );
         assert_eq!(json["isDir"], false);
         assert_eq!(json["highlights"], serde_json::json!([[0, 1]]));
         assert_eq!(json["matched"], "both");

@@ -192,7 +192,7 @@ impl fmt::Display for FilterName {
 /// | `tag` | `Tags` |
 /// | `size` | `Size` |
 /// | `dm` `dc` `da` | `Date` |
-/// | `case` `ww` `fuzzy` `dupe` | `Text`, or `None` when written without a value (a global switch) |
+/// | `case` `ww` `fuzzy` `dupe` `similar` | `Text`, or `None` when written without a value (a global switch) |
 /// | everything else | `Text` |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterValue {

@@ -5,12 +5,14 @@ import { formatCount } from "../lib/format";
 import { clearHistory, historyEnabled, setHistoryEnabled } from "../lib/library";
 import { searchContent, setSearchContent } from "../lib/searchContent";
 import DrivePicker from "./IndexSettings";
+import { autoInterpret, setAutoInterpret } from "./InterpretHint";
 import Modal from "./Modal";
 import UpdateSection from "./UpdateSection";
+import McpSection from "./McpSection";
 import { LanguageSetting, ThemeSetting } from "./SettingsControls";
 
-export type SettingsSection = "general" | "search" | "indexing" | "shortcuts" | "about";
-const SECTIONS: SettingsSection[] = ["general", "search", "indexing", "shortcuts", "about"];
+export type SettingsSection = "general" | "search" | "indexing" | "shortcuts" | "mcp" | "about";
+const SECTIONS: SettingsSection[] = ["general", "search", "indexing", "shortcuts", "mcp", "about"];
 
 type Props = {
   info: AppInfo | null | undefined;
@@ -231,6 +233,12 @@ export default function SettingsDialog(props: Props) {
                   label={t("content.searchToo")}
                   hint={t("content.searchTooHint")}
                 />
+                <SwitchRow
+                  checked={autoInterpret()}
+                  onChange={setAutoInterpret}
+                  label={t("settings.interpretAuto")}
+                  hint={t("settings.interpretAutoHint")}
+                />
               </Section>
               <Section id="set-history" title={t("settings.history")}>
                 <SwitchRow
@@ -336,6 +344,10 @@ export default function SettingsDialog(props: Props) {
                   </For>
                 </dl>
               </Section>
+            </Match>
+
+            <Match when={section() === "mcp"}>
+              <McpSection onNotice={props.onNotice} />
             </Match>
 
             <Match when={section() === "about"}>

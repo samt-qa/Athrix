@@ -49,6 +49,42 @@ export interface ResultItem {
    * response carry it (about a screenful); the others are fetched with `content_snippets`.
    */
   snippet?: ContentSnippet | null;
+  /** `dupe:` searches only: the duplicate group (1, 2… in response order; a group's rows are adjacent). */
+  dupeGroup?: number;
+  /** `dupe:` searches only: identical copies in the group, this file included (≥ 2). */
+  dupeCount?: number;
+  /** Similar-image searches only (`similar:`, `find_similar`): likeness 0–100 % to the reference / the group's first image. */
+  similarity?: number;
+  /** `similar:` searches only: the group of near-identical pictures (1, 2… in response order; a group's rows are adjacent). */
+  similarGroup?: number;
+}
+
+/** Totals of a similar-image search (`SearchResponse.similar`). */
+export interface SimilarSummary {
+  /** Candidate images (jpg, png, webp, gif, bmp, tiff) looked at. */
+  images: number;
+  /** Of those, compared so far (fewer than `images` when `similarIncomplete`). */
+  checked: number;
+  /** Compared ones that could not be read (corrupt, unsupported, too large). */
+  skipped: number;
+  /** `similar:` only: groups found (even past `limit`); 0 for one reference image. */
+  groups: number;
+  /** Rows found (even past `limit`). */
+  found: number;
+}
+
+/** Totals of a `dupe:` search (`SearchResponse.dupe`). */
+export interface DupeSummary {
+  /** Duplicate groups found (all of them, even past `limit`). */
+  groups: number;
+  /** Files in those groups. */
+  files: number;
+  /** Space the extra copies take: Σ size × (count − 1). */
+  wastedBytes: number;
+  /** The time/byte budget ran out: searching again continues the scan (hashes are cached). */
+  incomplete: boolean;
+  /** Files that could not be read (gone, changed, locked, no permission). */
+  skipped: number;
 }
 
 /** One answer of `content_snippets`. */
@@ -106,6 +142,12 @@ export interface SearchResponse {
   elapsedMs: number;
   error: QueryError | null;
   cancelled: boolean;
+  /** Present only for `dupe:` searches. */
+  dupe?: DupeSummary;
+  /** Present only for similar-image searches (`similar:`, `find_similar`). */
+  similar?: SimilarSummary;
+  /** Similar-image searches: the time budget ran out; searching again continues the scan (hashes are cached). */
+  similarIncomplete?: boolean;
 }
 
 /** `search_suggest`, asked after a search found nothing (so the probes never delay the empty answer). */
@@ -115,6 +157,32 @@ export interface SuggestResponse {
   suggestion: SearchSuggestion | null;
   /** A newer search or suggest cancelled this one. */
   cancelled: boolean;
+}
+
+/** `interpret_query`: plain Arabic/English read as filters (task 6.8). */
+export interface Interpretation {
+  /** The suggested query («ملفات PDF من الأسبوع الماضي» → "ext:pdf dm:lastweek"). */
+  query: string;
+  /** Every piece of the input, in order. */
+  parts: InterpretPart[];
+  /** A rough 0-1 score (a hint, not a probability). */
+  confidence: number;
+}
+
+/** One piece of the interpreted text: a UTF-16 [start, end) range and what it became. */
+export interface InterpretPart {
+  start: number;
+  end: number;
+  /** "kind" | "date" | "size" | "content" | "location" | "term" | "ignored" */
+  role: string;
+  /** What it adds to the query; "" for "ignored". */
+  output: string;
+}
+
+/** Today's local date as YYYY-MM-DD (for relative phrases such as «قبل 3 أيام»). */
+export function localDate(d = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** A query to offer instead of one that found nothing. */
@@ -209,6 +277,26 @@ export interface UpdateSettings {
   autoUpdateCheck: boolean;
 }
 
+/** Settings of the `athrix-mcp` server for AI assistants (`<app_data>/mcp.json`). Off by default. */
+export interface McpSettings {
+  /** The server answers tool calls only when on (and at least one folder is allowed). */
+  enabled: boolean;
+  /** Absolute folders the assistant may see; nothing else is visible to it. */
+  allowedFolders: string[];
+  /** Whether the `read_text` tool may return file text. */
+  allowContentRead: boolean;
+  /** Most results per search (1..200, default 50). */
+  maxResults: number;
+}
+
+/** Result of `mcp_server_path`. */
+export interface McpServerPath {
+  /** `athrix-mcp.exe` next to the app executable. */
+  path: string;
+  /** False in a dev build before `npm run worker`. */
+  exists: boolean;
+}
+
 /** A past search (task 5.3). The backend merges repeats of the same query + scope (`count`). */
 export interface HistoryEntry {
   id: number;
@@ -261,6 +349,13 @@ export interface Commands {
    * A newer `search` cancels it (and it cancels a running search).
    */
   search_suggest: [{ query: string; limit: number; requestId: number; scope: string | null; searchContent?: boolean }, SuggestResponse];
+  /**
+   * Images like the image result `id`, closest first, each with `similarity` (the image itself left out).
+   * Cancels / is cancelled like `search`. Rejects (English) for a stale id, a non-image or an unreadable image.
+   */
+  find_similar: [{ id: number; requestId: number; scope?: string | null; limit?: number }, SearchResponse];
+  /** Plain words read as filters; null = nothing to suggest. `today`: local YYYY-MM-DD. Cheap, no index access. */
+  interpret_query: [{ text: string; today?: string }, Interpretation | null];
   open_entry: [{ id: number }, void];
   reveal_entry: [{ id: number }, void];
   entry_path: [{ id: number }, string];
@@ -306,6 +401,13 @@ export interface Commands {
   update_install: [undefined, void];
   get_update_settings: [undefined, UpdateSettings];
   set_update_settings: [{ settings: UpdateSettings }, UpdateSettings];
+  // ---- MCP server for AI assistants (task 7.2) ----
+  get_mcp_settings: [undefined, McpSettings];
+  /** Rejects (English) when a folder is not an existing absolute local folder. */
+  set_mcp_settings: [{ settings: McpSettings }, McpSettings];
+  mcp_server_path: [undefined, McpServerPath];
+  /** The native folder picker; null when cancelled. */
+  mcp_pick_folder: [undefined, string | null];
 }
 export type CommandName = keyof Commands;
 export type CommandArgs<C extends CommandName> = Commands[C][0];
@@ -393,6 +495,9 @@ export const api = {
     call("search", { query, limit, requestId, scope, searchContent }),
   searchSuggest: (query: string, limit: number, requestId: number, scope: string | null = null, searchContent = false) =>
     call("search_suggest", { query, limit, requestId, scope, searchContent }),
+  findSimilar: (id: number, requestId: number, scope: string | null = null, limit?: number) =>
+    call("find_similar", limit === undefined ? { id, requestId, scope } : { id, requestId, scope, limit }),
+  interpretQuery: (text: string) => call("interpret_query", { text, today: localDate() }),
   openEntry: (id: number) => call("open_entry", { id }),
   revealEntry: (id: number) => call("reveal_entry", { id }),
   entryPath: (id: number) => call("entry_path", { id }),
@@ -421,6 +526,10 @@ export const api = {
   updateInstall: () => call("update_install"),
   getUpdateSettings: () => call("get_update_settings"),
   setUpdateSettings: (settings: UpdateSettings) => call("set_update_settings", { settings }),
+  getMcpSettings: () => call("get_mcp_settings"),
+  setMcpSettings: (settings: McpSettings) => call("set_mcp_settings", { settings }),
+  mcpServerPath: () => call("mcp_server_path"),
+  mcpPickFolder: () => call("mcp_pick_folder"),
 };
 
 /**

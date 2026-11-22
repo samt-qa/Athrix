@@ -26,3 +26,11 @@ export function categoryOf(ext: string, isDir: boolean): FileCategory {
   if (isDir) return "folder";
   return BY_EXT.get(ext) ?? "other";
 }
+
+/** Pictures the backend can compare (`find_similar`, `similar:`): athrix-imagehash's IMAGE_EXTENSIONS. */
+const SIMILAR_EXTS = new Set(["jpg", "jpeg", "jpe", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff"]);
+
+/** Whether «صور مشابهة» / "Similar images" is offered for this result. */
+export function canFindSimilar(item: { ext: string; isDir: boolean; size: number | null }): boolean {
+  return !item.isDir && !!item.size && SIMILAR_EXTS.has(item.ext);
+}

@@ -87,9 +87,10 @@ jobs:
         with:
           key: ${{ matrix.toolchain }}
 
-      # tauri-build (bundle.externalBin) requires the isolated PDF worker to be
-      # staged in src-tauri/binaries before cargo compiles athrix-desktop.
-      - name: Stage PDF worker
+      # tauri-build (bundle.externalBin) requires the sidecars (isolated PDF worker,
+      # athrix-mcp server) to be staged in src-tauri/binaries before cargo compiles
+      # athrix-desktop.
+      - name: Stage sidecars (PDF worker, MCP server)
         working-directory: apps/desktop
         run: npm run worker
 

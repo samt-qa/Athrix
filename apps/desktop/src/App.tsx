@@ -8,8 +8,11 @@ import { applySuggestion, composeQuery, suggestionInput, type ChipKind } from ".
 import SearchField from "./components/SearchField";
 import FilterChips from "./components/FilterChips";
 import QueryErrorBar from "./components/QueryErrorBar";
+import InterpretHint, { type InterpretHintHandle } from "./components/InterpretHint";
 import ResultList, { optionId, type ResultListHandle } from "./components/ResultList";
-import { EmptyState, NoResults, NotReady } from "./components/EmptyState";
+import { EmptyState, NoResults, NotReady, StateBlock } from "./components/EmptyState";
+import { canFindSimilar } from "./lib/fileKinds";
+import { formatCount } from "./lib/format";
 import HintBar from "./components/HintBar";
 import StatusBar from "./components/StatusBar";
 import ContentStatusControl from "./components/ContentStatusControl";
@@ -62,6 +65,7 @@ export default function App(props: { mode: WindowMode }) {
   const quick = props.mode === "quick";
   let input!: HTMLInputElement;
   let list: ResultListHandle | undefined;
+  let interpretHint: InterpretHintHandle | undefined;
 
   const [info] = createResource(() => api.appInfo().catch(() => null));
 
@@ -119,6 +123,9 @@ export default function App(props: { mode: WindowMode }) {
   const [suggestion, setSuggestion] = createSignal<SearchSuggestion | null>(null);
   let suggestTimer: ReturnType<typeof setTimeout> | undefined;
   onCleanup(() => clearTimeout(suggestTimer));
+  // "Similar images" (find_similar): while set, the results are the images like this one and the
+  // field shows its name as a chip; the query text is kept, so Esc / ✕ goes back to it.
+  const [similarTo, setSimilarTo] = createSignal<{ id: number; name: string } | null>(null);
   async function askSuggestion(query: string, where: string, withContent: boolean, requestId: number) {
     if (requestId !== lastRequest) return;
     try {
@@ -130,10 +137,10 @@ export default function App(props: { mode: WindowMode }) {
       console.warn("no suggestion", err);
     }
   }
-  async function runSearch(query: string, where: string, withContent = searchContent()) {
+  async function runSearch(query: string, where: string, withContent = searchContent(), similar = similarTo()?.id ?? null) {
     const requestId = ++lastRequest;
     clearTimeout(suggestTimer);
-    if (!query.trim()) {
+    if (similar === null && !query.trim()) {
       batch(() => {
         setResponse(null);
         setSuggestion(null);
@@ -145,7 +152,9 @@ export default function App(props: { mode: WindowMode }) {
     }
     setSearchPending(true);
     try {
-      const r = await api.search(query, LIMIT, requestId, where || null, withContent);
+      const r = similar !== null
+        ? await api.findSimilar(similar, requestId, where || null, LIMIT)
+        : await api.search(query, LIMIT, requestId, where || null, withContent);
       // Drop anything older than the latest request, and cancelled ones.
       if (requestId !== lastRequest) return;
       if (r.requestId !== lastRequest || r.cancelled) {
@@ -159,15 +168,21 @@ export default function App(props: { mode: WindowMode }) {
         setSelected(0);
         setSearchPending(false);
       });
-      if (!r.items.length && !r.error) {
+      if (similar === null && !r.items.length && !r.error) {
         suggestTimer = setTimeout(() => void askSuggestion(query, where, withContent, requestId), SUGGEST_DELAY_MS);
       }
     } catch (err) {
       if (requestId === lastRequest) {
+        // A reference from an older index: back to the query, whose search refreshes the ids.
+        if (similar !== null && isStaleIdError(err)) {
+          setSimilarTo(null);
+          showNotice(t("notice.stale"));
+          return;
+        }
         batch(() => {
           setSearchPending(false);
           setResponse(null);
-          setFailure(t("queryError.searchFailed", { message: errorMessage(err) }));
+          setFailure(t(similar !== null ? "similar.failed" : "queryError.searchFailed", { message: errorMessage(err) }));
         });
       }
     }
@@ -175,8 +190,8 @@ export default function App(props: { mode: WindowMode }) {
   // No debounce: a search takes a few ms, and stale responses are dropped by requestId.
   // Re-runs when the index becomes ready, so a query typed during indexing fills in, and when
   // the scope or the "search contents too" setting changes.
-  createEffect(on([sent, () => index()?.state, scope, searchContent], ([q, , where, withContent]) =>
-    void runSearch(q, where, withContent)));
+  createEffect(on([sent, () => index()?.state, scope, searchContent, similarTo], ([q, , where, withContent, sim]) =>
+    void runSearch(q, where, withContent, sim?.id ?? null)));
 
   const items = () => response()?.items ?? [];
   // "Did you mean": the backend rewrote the query as sent; the field gets it without the chip suffix.
@@ -294,7 +309,20 @@ export default function App(props: { mode: WindowMode }) {
     { label: t("hints.reveal"), shortcut: "Ctrl+Enter", onSelect: () => void open(i, true) },
     { label: t("hints.copy"), shortcut: "Ctrl+C", onSelect: () => void copyPath() },
     { label: t("library.addFavorite"), shortcut: "Ctrl+D", onSelect: () => void favorite(i) },
+    ...(items()[i] && canFindSimilar(items()[i]) ? [{ label: t("similar.action"), onSelect: () => findSimilar(i) }] : []),
   ];
+  /** «صور مشابهة» on image result `i`: its look-alikes replace the results until Esc / ✕. */
+  function findSimilar(i = selected()) {
+    const it = items()[i];
+    if (!it || !canFindSimilar(it)) return;
+    setSimilarTo({ id: it.id, name: it.name });
+    input.focus();
+  }
+  /** Back to the query the similar-image search replaced. */
+  function exitSimilar() {
+    setSimilarTo(null);
+    input.focus();
+  }
   function closeMenu() {
     setMenu(null);
     input.focus();
@@ -368,6 +396,11 @@ export default function App(props: { mode: WindowMode }) {
 
   function onKeyDown(e: KeyboardEvent) {
     if (e.isComposing) return;
+    // Tab / Esc on the "understood as" suggestion (natural-language query) come first.
+    if (interpretHint?.handleKey(e)) {
+      e.preventDefault();
+      return;
+    }
     const n = items().length;
     const page = list?.pageSize() ?? 8;
     const ctrl = e.ctrlKey || e.metaKey;
@@ -423,8 +456,10 @@ export default function App(props: { mode: WindowMode }) {
         void open(selected(), ctrl);
         break;
       case "Escape":
-        // First Esc clears the query; Esc on an empty field closes the popup.
-        if (text()) setText("");
+        // First Esc clears the query; Esc on an empty field closes the popup. Showing similar
+        // images, Esc goes back to the query first.
+        if (similarTo()) exitSimilar();
+        else if (text()) setText("");
         else if (quick) hideWindow();
         else return;
         break;
@@ -630,10 +665,34 @@ export default function App(props: { mode: WindowMode }) {
     <section class="panel" classList={{ "quick-panel": quick }} aria-label={t("search.region")}>
       <SearchField
         ref={(el) => (input = el)}
-        value={text()}
-        onInput={setText}
+        // Showing similar images: the field is empty behind the reference chip; typing starts a new search.
+        value={similarTo() ? "" : text()}
+        onInput={(v) => batch(() => {
+          setSimilarTo(null);
+          setText(v);
+        })}
+        placeholder={similarTo() ? t("similar.placeholder") : undefined}
+        prefix={
+          <Show when={similarTo()}>
+            {(s) => (
+              <span class="similar-chip" title={s().name}>
+                {t("similar.chip")}
+                {/* Stem and extension isolated, like a result row: "شاطئ.jpg" never reads "jpg.شاطئ". */}
+                <span class="similar-chip-name">
+                  <bdi dir="auto">{s().name.includes(".") ? s().name.slice(0, s().name.lastIndexOf(".")) : s().name}</bdi>
+                  <bdi dir="ltr">{s().name.includes(".") ? s().name.slice(s().name.lastIndexOf(".")) : ""}</bdi>
+                </span>
+                <button type="button" class="similar-chip-clear" aria-label={t("similar.clear")} title={t("similar.clear")}
+                  aria-keyshortcuts="Escape" onMouseDown={(e) => e.preventDefault()} onClick={exitSimilar}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25"
+                    stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                </button>
+              </span>
+            )}
+          </Show>
+        }
         onKeyDown={onKeyDown}
-        errorSpan={errorSpan()}
+        errorSpan={similarTo() ? null : errorSpan()}
         listId={LIST_ID}
         expanded={items().length > 0}
         activeDescendant={activeDescendant()}
@@ -663,6 +722,25 @@ export default function App(props: { mode: WindowMode }) {
         failure={failure()}
         onApplySuggestion={useSuggestion}
       />
+      <InterpretHint ref={(h) => (interpretHint = h)} text={similarTo() ? "" : text()} onApply={setQuery} />
+      {/* Similar images: how many were compared, and "continue" when the time budget ran out. */}
+      <Show when={response()?.similar && !response()?.error ? response()!.similar : null}>
+        {(s) => (
+          <div class="similar-bar" role="status">
+            <span>
+              {s().groups
+                ? t("similar.summaryGroups", { groups: formatCount(s().groups, locale()), checked: formatCount(s().checked, locale()) })
+                : t("similar.summary", { checked: formatCount(s().checked, locale()) })}
+              {s().skipped ? ` · ${t("similar.skipped", { count: formatCount(s().skipped, locale()) })}` : ""}
+            </span>
+            <Show when={response()?.similarIncomplete}>
+              <span>· {t("similar.incomplete", { checked: formatCount(s().checked, locale()), total: formatCount(s().images, locale()) })}</span>
+              <button type="button" class="link-btn" onMouseDown={(e) => e.preventDefault()}
+                onClick={() => void runSearch(sent(), scope())}>{t("similar.continue")}</button>
+            </Show>
+          </div>
+        )}
+      </Show>
 
       {/* In the popup the area is as tall as its rows (--list-h), so the window grows with them. */}
       <div
@@ -671,7 +749,7 @@ export default function App(props: { mode: WindowMode }) {
         onContextMenu={onResultsContextMenu}
       >
         <Switch>
-          <Match when={!text().trim()}>
+          <Match when={!text().trim() && !similarTo()}>
             <LibraryPanel
               ref={(h) => (library = h)}
               compact={quick}
@@ -692,6 +770,10 @@ export default function App(props: { mode: WindowMode }) {
               onRetry={retryIndexing}
               onStart={() => void api.startIndexing()}
             />
+          </Match>
+          <Match when={similarTo() && response() && !items().length}>
+            <StateBlock icon="noResults" live title={t("similar.noneTitle")}
+              body={t(response()?.similarIncomplete ? "similar.noneYet" : "similar.none")} />
           </Match>
           <Match when={response() && !items().length}>
             <NoResults
@@ -842,6 +924,7 @@ export default function App(props: { mode: WindowMode }) {
               onReveal={() => void open(selected(), true)}
               onClose={closePreview}
               onStale={searchAgain}
+              onFindSimilar={() => findSimilar(selected())}
             />
           </div>
         </Show>
@@ -853,6 +936,7 @@ export default function App(props: { mode: WindowMode }) {
         notice={notice()}
         mock={usingMock}
         onRetry={retryIndexing}
+        onContinueDupes={() => void runSearch(sent(), scope())}
         content={
           <ContentStatusControl
             onError={(message) => showNotice(t("content.actionFailed", { message }))}

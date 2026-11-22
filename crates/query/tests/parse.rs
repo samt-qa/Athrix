@@ -244,6 +244,8 @@ fn text_filters() {
     );
     assert_eq!(filter("وسم:عمل").name, FilterName::Tag);
     assert_eq!(value("dupe:"), FilterValue::None);
+    assert_eq!(value("similar:"), FilterValue::None);
+    assert_eq!(value("مشابه:"), FilterValue::None);
     assert_eq!(value("case:"), FilterValue::None);
 }
 

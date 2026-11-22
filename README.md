@@ -52,6 +52,7 @@
 - **معاينة** للنصوص والكود والمستندات والصور وPDF، مع التنقّل بين المطابقات.
 - **المكتبة:** السجلّ، والبحوث المحفوظة، والمفضّلة.
 - **قائمة الزر الأيمن في المستكشف:** «ابحث هنا بـ Athrix».
+- **خادم MCP للمساعدات الذكية** (Claude Desktop وClaude Code): بحث للقراءة فقط في مجلدات تختارها أنت، مطفأ افتراضيًا ([التفاصيل](docs/MCP.md)).
 - سهولة الوصول: قارئ الشاشة، وتركيز ظاهر، وتباين مدروس، والوضع الداكن، والتباين العالي.
 
 <p align="center">
@@ -73,6 +74,11 @@
 | `infolder:"D:\Work"` | داخل مجلد بعينه |
 | `fuzzy:rpt` | بحث تقريبي واختصارات |
 | `report \| تقرير` و `!tmp` | «أو» والاستثناء |
+
+**البحث بالكلام العادي:** اكتب جملة عادية بالعربية أو الإنجليزية، فيقترح Athrix تحت الحقل ما فهمه منها بصيغة الفلاتر، وتطبّقه بـ Tab (وتتجاهله بـ Esc). القواعد محلية بلا أي نموذج أو اتصال، ولا يُغيَّر نصك دون إذنك.
+
+- «ملفات PDF من الأسبوع الماضي أكبر من 5 ميجا» ← `ext:pdf dm:lastweek size:>5mb`
+- «مستندات تحتوي على عقد الإيجار» ← `type:doc content:"عقد الإيجار"`
 
 ## الاختصارات
 
@@ -122,6 +128,7 @@ npm run tauri build    # مثبّت NSIS في target/release/bundle/nsis
 | `crates/daemon` | جدولة فهرسة المحتوى في الخلفية |
 | `crates/store` | السجلّ والبحوث المحفوظة والمفضّلة (SQLite) |
 | `crates/cli` | أداة سطر الأوامر `athrix` (فهرسة، وبحث، وقياس أداء) |
+| `crates/mcp` | خادم MCP `athrix-mcp` للمساعدات الذكية (للقراءة فقط، مطفأ افتراضيًا) |
 | `apps/desktop` | تطبيق سطح المكتب: Tauri 2 + SolidJS |
 
 **التوثيق:** [البحث والمزايا](docs/01-RESEARCH-AND-FEATURES.md) · [نظام التصميم](docs/02-DESIGN-SYSTEM.md) · [عقد الواجهة](docs/IPC-CONTRACT.md) · [تدقيق الأداء](docs/PERF-AUDIT.md) · [الإصدار](docs/RELEASE.md)
@@ -169,6 +176,7 @@ Athrix is a desktop app that finds any file on your computer as you type, and se
   - PDFs are parsed in a separate process, so a damaged file can't crash the app.
 - **A query language** with English and Arabic filters: `ext:`, `type:`, `size:`, `dm:`, `content:`, `infolder:`, `fuzzy:`, OR and NOT.
 - **Quick search popup** from anywhere (`Ctrl+Shift+Space`), a preview pane, history, saved searches, favorites, and "Search here with Athrix" in Explorer.
+- **MCP server for AI assistants** (Claude Desktop, Claude Code): read-only search limited to folders you choose, off by default ([docs/MCP.md](docs/MCP.md)).
 - **Private by design:** no network access by default, no telemetry, no admin rights needed.
 
 **Status:** under active development; no stable release yet. Windows first. See the [progress tracker](docs/03-PROGRESS-TRACKER.md).

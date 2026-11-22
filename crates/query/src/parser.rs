@@ -430,7 +430,11 @@ impl<'a> Parser<'a> {
         if raw.trim().is_empty() {
             if matches!(
                 f,
-                FilterName::Case | FilterName::WholeWord | FilterName::Fuzzy | FilterName::Dupe
+                FilterName::Case
+                    | FilterName::WholeWord
+                    | FilterName::Fuzzy
+                    | FilterName::Dupe
+                    | FilterName::Similar
             ) {
                 return Ok(filter(FilterValue::None, value_span));
             }

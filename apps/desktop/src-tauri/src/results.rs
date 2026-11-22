@@ -505,6 +505,10 @@ pub fn build_row(
         highlights: highlights(name),
         matched: Matched::Name,
         snippet: None,
+        dupe_group: None,
+        dupe_count: None,
+        similarity: None,
+        similar_group: None,
     }
 }
 

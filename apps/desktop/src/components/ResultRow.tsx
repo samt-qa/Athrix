@@ -1,9 +1,10 @@
 import { createMemo, For, Show } from "solid-js";
-import { locale, t } from "../i18n";
+import { locale, t, tPlural } from "../i18n";
 import type { ContentSnippet, ResultItem } from "../lib/api";
 import { categoryOf } from "../lib/fileKinds";
 import {
-  formatDateTime, formatRelative, formatSize, highlightParts, snippetParts, splitName, splitPath, type TextPart,
+  formatCount, formatDateTime, formatRelative, formatSize, highlightParts, intlLocale, snippetParts, splitName, splitPath,
+  type TextPart,
 } from "../lib/format";
 import { ContentMatchIcon, TypeIcon } from "./icons";
 
@@ -59,6 +60,11 @@ function firstStrongDir(s: string): "rtl" | "ltr" {
   return "ltr";
 }
 
+/** A whole percentage in the UI's number format ("94%", "94٪"). */
+function formatPercent(pct: number, loc: Parameters<typeof intlLocale>[0]): string {
+  return new Intl.NumberFormat(intlLocale(loc), { style: "percent", maximumFractionDigits: 0 }).format(pct / 100);
+}
+
 function Parts(props: { parts: TextPart[] }) {
   return (
     <For each={props.parts}>
@@ -106,6 +112,9 @@ export default function ResultRow(props: Props) {
       role="option"
       class="row"
       classList={{ "row-tall": tall() }}
+      // `dupe:`: every other duplicate group is tinted, so a group's copies read as one block.
+      data-dupe={props.item.dupeGroup ? (props.item.dupeGroup % 2 ? "odd" : "even") : undefined}
+      data-similar={props.item.similarGroup ? (props.item.similarGroup % 2 ? "odd" : "even") : undefined}
       aria-selected={props.selected}
       aria-setsize={props.setSize}
       aria-posinset={props.index + 1}
@@ -126,6 +135,25 @@ export default function ResultRow(props: Props) {
               aria-label={sourceLabel()} title={sourceLabel()}>
               <ContentMatchIcon />
             </span>
+          </Show>
+          {/* `dupe:`: how many identical copies this file's group has (itself included). */}
+          <Show when={props.item.dupeCount}>
+            {(n) => (
+              <span class="row-dupe" dir="auto" title={t("results.dupeCopiesTitle")}>
+                {tPlural("results.dupeCopies", n(), formatCount(n(), locale()))}
+              </span>
+            )}
+          </Show>
+          {/* Similar images: likeness to the reference (or to the first picture of its group). */}
+          <Show when={props.item.similarity !== undefined ? props.item.similarity : null}>
+            {(pct) => (
+              <span class="row-similar" classList={{ exact: pct() === 100 }} dir="auto"
+                title={t(props.item.similarGroup ? "similar.badgeGroupTitle" : "similar.badgeTitle", {
+                  percent: formatPercent(pct(), locale()), group: formatCount(props.item.similarGroup ?? 0, locale()),
+                })}>
+                {formatPercent(pct(), locale())}
+              </span>
+            )}
           </Show>
         </span>
         <Show when={showPath()}>

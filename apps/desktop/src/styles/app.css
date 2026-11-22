@@ -234,6 +234,26 @@ body {
 .suggestion:hover { border-color: var(--accent); }
 .query-error-live { flex: none; }
 
+/* ---- "Understood as" (natural-language query suggestion) ---- */
+.interpret-live { flex: none; }
+.interpret-hint {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px;
+  padding-block: 6px; padding-inline: 16px;
+  border-block-end: 1px solid var(--border);
+  background: var(--accent-subtle);
+  color: var(--text-secondary); font-size: 13px;
+}
+.interpret-query { color: var(--text-primary); font: 500 12px/1.4 var(--font-mono); overflow-wrap: anywhere; }
+.interpret-sep { color: var(--text-tertiary, var(--text-secondary)); }
+.interpret-dismiss {
+  margin-inline-start: auto; padding-inline: 6px; block-size: 22px;
+  border: 0; border-radius: var(--radius-sm); background: transparent;
+  color: var(--text-secondary); font: inherit; cursor: pointer;
+}
+.interpret-dismiss:hover { color: var(--text-primary); background: var(--border); }
+.interpret-hint .suggestion { font-family: inherit; }
+.interpret-hint button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ---- Results (virtual listbox) ---- */
 .results-area { position: relative; flex: 1; min-block-size: 0; display: flex; flex-direction: column; }
 .results {
@@ -324,6 +344,24 @@ body {
   color: var(--accent); background: var(--accent-subtle);
 }
 .row-source.both { box-shadow: inset 0 0 0 1px var(--border-strong); }
+/* `dupe:`: "3 copies" after the name, and every other duplicate group tinted so a group's
+   copies read as one block (hover and selection keep their own background). */
+.row-dupe {
+  flex: none; align-self: center; margin-inline-start: 8px; padding: 0 6px;
+  border-radius: var(--radius-sm); font-size: 11px; line-height: 16px;
+  color: var(--text-secondary); background: var(--bg-sunken);
+}
+.row[data-dupe="even"]:not(:hover):not([aria-selected="true"]) { background: var(--bg-surface); }
+/* Similar images: "94%" after the name (likeness to the reference / the group's first picture);
+   `similar:` groups are tinted every other one, like duplicates. */
+.row-similar {
+  flex: none; align-self: center; margin-inline-start: 8px; padding: 0 6px;
+  border-radius: var(--radius-sm); font: 600 11px/16px var(--font-ui);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent); background: var(--accent-subtle);
+}
+.row-similar.exact { color: var(--text-on-accent); background: var(--accent); }
+.row[data-similar="even"]:not(:hover):not([aria-selected="true"]) { background: var(--bg-surface); }
 
 mark.match {
   background: var(--match-bg); color: var(--match-fg);
@@ -473,6 +511,33 @@ kbd {
 }
 .status-end { margin-inline-start: auto; display: inline-flex; align-items: center; gap: 12px; }
 .notice { color: var(--accent); }
+.dupe-summary { color: var(--text-secondary); white-space: nowrap; }
+.dupe-summary .dupe-partial { color: var(--text-muted); }
+.dupe-summary .link-btn { margin-inline-start: 6px; }
+.similar-summary { color: var(--text-secondary); white-space: nowrap; }
+
+/* "Similar to: beach.jpg ✕": the reference image of a find-similar search, in place of the query. */
+.similar-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; max-inline-size: 60%;
+  block-size: 26px; padding-inline: 10px 4px; margin-inline-end: 8px;
+  border-radius: 999px; background: var(--accent-subtle); color: var(--accent);
+  font: 500 13px/1 var(--font-ui); white-space: nowrap;
+}
+.similar-chip-name { overflow: hidden; text-overflow: ellipsis; color: var(--text-primary); }
+.similar-chip-clear {
+  flex: none; display: inline-grid; place-items: center; inline-size: 20px; block-size: 20px;
+  border: 0; border-radius: 50%; padding: 0; background: transparent; color: inherit; cursor: pointer;
+}
+.similar-chip-clear:hover { background: var(--bg-row-hover); }
+.similar-chip-clear:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* A similar-image search cut short by its time budget: what was compared, and "continue". */
+.similar-bar {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding-block: 6px; padding-inline: 16px;
+  border-block-end: 1px solid var(--border); background: var(--bg-surface);
+  color: var(--text-secondary); font-size: 12px;
+}
+.similar-bar .link-btn { margin-inline-start: 0; }
 .elapsed { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .index-roots { color: var(--text-muted); }
 .index-scanning { color: var(--text-secondary); }

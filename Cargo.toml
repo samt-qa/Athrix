@@ -25,6 +25,9 @@ athrix-semantic = { path = "crates/semantic" }
 athrix-ranking = { path = "crates/ranking" }
 athrix-store = { path = "crates/store" }
 athrix-ntfs = { path = "crates/ntfs" }
+athrix-dedupe = { path = "crates/dedupe" }
+athrix-imagehash = { path = "crates/imagehash" }
+athrix-mcp = { path = "crates/mcp" }
 
 # Desktop app
 tauri = { version = "2", features = [] }
@@ -32,6 +35,8 @@ tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
+# Native folder picker (Settings → MCP), called from Rust only: no JS dialog permission.
+tauri-plugin-dialog = "2"
 # Manual update checks (off by default: no internet unless the user asks). native-tls = the OS
 # TLS (SChannel on Windows): no C build, smaller than rustls+ring. No `zip`: NSIS updates only.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls"] }
@@ -70,6 +75,14 @@ starship-battery = "0.10.2"
 thread-priority = "3.1"
 # athrix-store: SQLite with the bundled C library (no system sqlite). Pinned: builds on 1.85.
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
+# athrix-dedupe: file hashes for `dupe:`. `pure` = Rust SIMD intrinsics only (no C/asm build).
+blake3 = { version = "1.8.7", default-features = false, features = ["std", "pure"] }
+# athrix-dedupe: parallel hashing (the same 1.12 tantivy already builds).
+rayon = "1.12"
+# athrix-imagehash: decoders for `similar:`. Pure-Rust codecs only (zune-jpeg, png, gif,
+# image-webp, tiff), none of the others (avif/exr/dds/hdr/...), no `rayon` feature. Pinned:
+# 0.25.10 declares a newer rust-version than the 1.85 MSRV.
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

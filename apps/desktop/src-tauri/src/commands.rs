@@ -269,12 +269,21 @@ pub async fn search(
         elapsed_ms: 0.0,
         error: None,
         cancelled: false,
+        dupe: None,
+        similar: None,
+        similar_incomplete: false,
     };
     match outcome {
         SearchOutcome::Hits { items, truncated } => {
             response.items = items;
             response.truncated = truncated;
         }
+        SearchOutcome::Dupes(hits) => {
+            response.items = hits.items;
+            response.truncated = hits.truncated;
+            response.dupe = Some(hits.summary);
+        }
+        SearchOutcome::Similar(hits) => hits.fill(&mut response),
         SearchOutcome::Empty => {}
         SearchOutcome::Invalid(e) => response.error = Some(e),
         SearchOutcome::Cancelled => response.cancelled = true,
@@ -291,11 +300,36 @@ enum SearchOutcome {
         items: Vec<ResultItem>,
         truncated: bool,
     },
+    /// A `dupe:` search (see [`crate::dupes`]).
+    Dupes(crate::dupes::DupeHits),
+    /// A `similar:` search (see [`crate::similar`]).
+    Similar(crate::similar::SimilarHits),
     /// Empty query, or no index yet.
     Empty,
     Invalid(QueryError),
     Cancelled,
     Failed(String),
+}
+
+/// The blocking part of a `dupe:` search; `rest` is the query without the switch.
+fn dupe_outcome(
+    index: Option<Arc<IndexView>>,
+    text: &str,
+    rest: &athrix_query::Query,
+    request: &SearchRequest,
+    cancel: &AtomicBool,
+) -> SearchOutcome {
+    use crate::dupes::{DupeFailure, dupe_search};
+    let Some(index) = index else {
+        return SearchOutcome::Empty;
+    };
+    let scope = request.scope.as_ref();
+    match dupe_search(&index, text, rest, request.limit, scope, cancel) {
+        Ok(hits) => SearchOutcome::Dupes(hits),
+        Err(DupeFailure::Invalid(e)) => SearchOutcome::Invalid(e),
+        Err(DupeFailure::Search(SearchFailure::Cancelled)) => SearchOutcome::Cancelled,
+        Err(DupeFailure::Search(SearchFailure::Failed(e))) => SearchOutcome::Failed(e),
+    }
 }
 
 /// The options of one `search` call.
@@ -324,6 +358,40 @@ fn execute_search(
         Ok(ast) => ast,
         Err(e) => return SearchOutcome::Invalid(map_parse_error(text, &e)),
     };
+    // `similar:` (see `crate::similar`): the rest of the query picks the candidate images.
+    match crate::similar::split_similar(text, &ast) {
+        Ok(Some(split)) => {
+            let Some(index) = index else {
+                return SearchOutcome::Empty;
+            };
+            let scope = request.scope.as_ref();
+            return match crate::similar::similar_search(
+                &index,
+                text,
+                &split,
+                request.limit,
+                scope,
+                cancel,
+            ) {
+                Ok(hits) => SearchOutcome::Similar(hits),
+                Err(crate::similar::SimilarFailure::Invalid(e)) => SearchOutcome::Invalid(e),
+                Err(crate::similar::SimilarFailure::Search(SearchFailure::Cancelled)) => {
+                    SearchOutcome::Cancelled
+                }
+                Err(crate::similar::SimilarFailure::Search(SearchFailure::Failed(e))) => {
+                    SearchOutcome::Failed(e)
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(e) => return SearchOutcome::Invalid(e),
+    }
+    // `dupe:` (see `crate::dupes`): the rest of the query picks the candidates, by name.
+    match crate::dupes::split_dupe(text, &ast) {
+        Ok(Some(rest)) => return dupe_outcome(index, text, &rest, request, cancel),
+        Ok(None) => {}
+        Err(e) => return SearchOutcome::Invalid(e),
+    }
     let options = PlanOptions {
         plain_words_search_content: request.search_content,
     };
@@ -573,7 +641,10 @@ fn resolve(indexer: &Indexer, id: u64) -> Result<PathBuf, String> {
 }
 
 /// [`resolve`], keeping the view and the entry (for previews, which read metadata too).
-fn resolve_entry(indexer: &Indexer, id: u64) -> Result<(Arc<IndexView>, EntryId), String> {
+pub(crate) fn resolve_entry(
+    indexer: &Indexer,
+    id: u64,
+) -> Result<(Arc<IndexView>, EntryId), String> {
     if indexer.index().is_none() {
         return Err("the index is not ready yet".to_owned());
     }

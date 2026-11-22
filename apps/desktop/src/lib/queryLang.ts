@@ -83,7 +83,7 @@ export const SIZE_UNITS: readonly (readonly [string, UnitId])[] = [
 ];
 
 /** Filters that may stand alone without a value (`case:`, `dupe:` …). */
-export const SWITCH_FILTERS: ReadonlySet<FilterId> = new Set(["case", "ww", "fuzzy", "dupe"]);
+export const SWITCH_FILTERS: ReadonlySet<FilterId> = new Set(["case", "ww", "fuzzy", "dupe", "similar"]);
 /** Filters whose value may start with a comparison operator (`size:>1mb`, `dm:>=2026`). */
 export const COMPARE_FILTERS: ReadonlySet<FilterId> = new Set(["size", "dm", "dc", "da"]);
 

@@ -20,10 +20,12 @@
 // `?mockContentError` (the content indexer fails), `?mockContentRate=N` (docs per second).
 import type {
   CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, DriveSettings, Favorite, HistoryEntry, IndexRoots,
+  McpSettings,
   IndexStatus, MatchSource, PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, RowSnippet,
   SavedSearch, SearchResponse, SearchSuggestion, SuggestResponse, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
+import { mockInterpret } from "./mockInterpret";
 import { tokenize, type Token } from "./queryLang";
 import { findMatches, normalizeWithMap, toOriginalRange as toOriginal } from "./textMatch";
 
@@ -71,6 +73,19 @@ const FOLDERS = [
   "Pictures\\رحلة إسطنبول 2025", "Pictures\\Screenshots", "Music\\تِلَاوَات", "Videos\\Family",
   "Projects\\athrix\\src", "Projects\\athrix\\crates\\query\\src", "Projects\\website", "Archive\\Backups",
   "Documents\\كُتُب\\العقيدة", "Documents\\Personal\\Receipts",
+];
+
+/** Planted duplicate groups for `dupe:`: [key, size, ext, [name, folder][]]. */
+const MOCK_DUPES: [string, number, string, [string, string][]][] = [
+  ["installer", 86_507_520, "exe", [["athrix-setup", "Downloads"], ["athrix-setup (1)", "Downloads"]]],
+  ["family", 3_565_158, "jpg", [
+    ["صورة العائلة", "Pictures\\رحلة إسطنبول 2025"], ["صورة العائلة - نسخة", "Desktop"], ["IMG_2041", "Downloads"],
+  ]],
+  ["report", 1_258_291, "pdf", [["التقرير السنوي 2025", "Documents\\العمل\\التقارير"], ["Annual Report 2025", "Archive\\Backups"]]],
+  ["lease", 49_152, "docx", [
+    ["عقد الإيجار", "Documents\\العمل\\العقود"], ["عقد الإيجار (نسخة)", "Desktop"],
+    ["عقد الإيجار - نهائي", "Downloads"], ["lease", "Archive\\Backups"],
+  ]],
 ];
 
 /** [base name, allowed extensions]. Arabic bases carry diacritics on purpose. */
@@ -131,7 +146,25 @@ interface MockEntry {
   contentOrder?: number;
   /** A hand-written demo document: its preview is exactly its body. */
   demo?: boolean;
+  /** Planted duplicate (`dupe:`): files with the same key are "byte-identical". */
+  dupeKey?: string;
+  /** Planted similar image (`similar:`): same key = "the same picture", `similarStep` bits apart. */
+  similarKey?: string;
+  similarStep?: number;
 }
+
+/** Planted groups of near-identical pictures for `similar:` / «صور مشابهة»: [key, [name, ext, folder][]]. */
+const MOCK_SIMILAR: [string, [string, string, string][]][] = [
+  ["beach", [
+    ["شاطئ الإسكندرية", "jpg", "Pictures\\رحلة إسطنبول 2025"], ["شاطئ الإسكندرية - معدّلة", "jpg", "Desktop"],
+    ["beach-small", "webp", "Downloads"],
+  ]],
+  ["mosque", [["المسجد الأزرق", "jpg", "Pictures\\رحلة إسطنبول 2025"], ["Blue Mosque (edit)", "png", "Pictures\\Screenshots"]]],
+  ["sunset", [
+    ["غروب البوسفور", "png", "Pictures\\رحلة إسطنبول 2025"], ["sunset-bosphorus", "jpg", "Downloads"],
+    ["غروب البوسفور (2)", "jpg", "Pictures\\رحلة إسطنبول 2025"], ["IMG_3310", "jpg", "Desktop"],
+  ]],
+];
 
 // ---------- file contents ----------
 
@@ -295,6 +328,29 @@ function buildIndex(count: number): MockEntry[] {
     });
   }
 
+  // `dupe:`: planted copies (same key = same bytes), in different folders and under other names.
+  for (const [key, size, ext, copies] of MOCK_DUPES) {
+    for (const [name, folder] of copies) {
+      push({
+        name: `${name}.${ext}`, parent: `${baseOf(folder)}\\${folder}`, isDir: false, size,
+        modified: nowSec - 3 * 86400 - (entries.length % 7) * 3600, ext,
+      });
+      entries[entries.length - 1].dupeKey = key;
+      // Byte-identical pictures are also "similar" (distance 0).
+      if (ext === "jpg") Object.assign(entries[entries.length - 1], { similarKey: key, similarStep: 0 });
+    }
+  }
+  // `similar:`: planted near-identical pictures (resized, re-encoded, edited copies).
+  for (const [key, copies] of MOCK_SIMILAR) {
+    copies.forEach(([name, ext, folder], step) => {
+      push({
+        name: `${name}.${ext}`, parent: `${baseOf(folder)}\\${folder}`, isDir: false,
+        size: 2_400_000 - step * 410_000, modified: nowSec - 9 * 86400 + step * 3600, ext,
+      });
+      Object.assign(entries[entries.length - 1], { similarKey: key, similarStep: step });
+    });
+  }
+
   // A few files on the USB stick (found only while E: is indexed and plugged in).
   const usbFolder = "نسخة احتياطية";
   push({ name: usbFolder, parent: "E:", isDir: true, size: null, modified: nowSec - 5 * 86400, ext: "" });
@@ -324,12 +380,12 @@ const KNOWN_FILTERS = [
 ];
 const ARABIC_FILTERS: Record<string, string> = {
   "امتداد": "ext", "نوع": "type", "حجم": "size", "تاريخ": "dm", "مسار": "path", "مجلد": "infolder",
-  "محتوى": "content", "وسم": "tag",
+  "محتوى": "content", "وسم": "tag", "مكرر": "dupe", "مشابه": "similar",
 };
 const VALUE_FILTERS = new Set(["ext", "type", "size", "dm", "dc", "da", "path", "parent", "infolder", "tag"]);
 /** Valid filters the mock cannot answer (contract: QueryError.kind "Unsupported"). `content:` is
  *  taken out of the query before parsing (see contentFilters). */
-const UNSUPPORTED = new Set(["sem", "tag", "regex", "dupe", "similar", "dc", "da"]);
+const UNSUPPORTED = new Set(["sem", "tag", "regex", "dc", "da"]);
 const KINDS: Record<string, string> = {
   doc: "doc", docs: "doc", document: "doc", documents: "doc", "مستند": "doc", "مستندات": "doc",
   image: "image", images: "image", "صورة": "image", "صور": "image",
@@ -349,6 +405,10 @@ interface Parsed {
   fuzzy: string[];
   /** The valueless `fuzzy:` switch: every plain word is fuzzy. */
   fuzzyAll: boolean;
+  /** The `dupe:` switch: only files with an identical copy. */
+  dupe?: boolean;
+  /** `similar:` (true: group near-identical images) or `similar:name` (rank against that image). */
+  similar?: true | string;
 }
 
 class MockParseError extends Error {
@@ -451,6 +511,14 @@ function applyFilter(out: Parsed, name: string, value: string, start: number, va
   else if (name === "fuzzy") {
     if (value) out.fuzzy.push(value);
     else out.fuzzyAll = true;
+  }
+  else if (name === "dupe") {
+    if (value) fail("DupeTakesNoValue", start, valueStart + value.length, "`dupe:` takes no value; write it alone, for example `dupe: ext:jpg`");
+    out.dupe = true;
+  }
+  else if (name === "similar") {
+    if (out.similar !== undefined) fail("SimilarRepeated", start, valueStart + value.length, "use `similar:` only once in a query");
+    out.similar = value || true;
   }
   else if (UNSUPPORTED.has(name)) {
     fail("Unsupported", start, valueStart + value.length, `\`${name}:\` is not supported by name search yet`);
@@ -970,6 +1038,34 @@ function search(
       hits.push({ e, score: name.score + base, highlights: name.highlights, matched: "name", snippet: null });
     }
   }
+  if (p.similar !== undefined) {
+    if (p.dupe || clauses.length) {
+      return done([], false, p.dupe
+        ? { kind: "SimilarWithDupe", start: 0, end: query.length, suggestion: null, message: "`similar:` and `dupe:` cannot be combined: use one of them" }
+        : { kind: "SimilarWithContent", start: 0, end: query.length, suggestion: null, message: "`similar:` cannot be combined with `content:` yet" });
+    }
+    if (p.similar === true) return mockSimilarGroups(hits, query, scope, limit, withSuggestion, done);
+    const wanted = p.similar.toLowerCase();
+    const images = index.filter((e) => isMockImage(e));
+    const ref = images.find((e) => e.item.name.toLowerCase() === wanted) ?? images.find((e) => e.item.name.toLowerCase().includes(wanted));
+    if (!ref) {
+      const at = query.search(/(similar|مشابه):/i);
+      return done([], false, {
+        kind: "SimilarReferenceNotFound", start: Math.max(0, at), end: query.length, suggestion: null,
+        message: "no indexed image has this name",
+      });
+    }
+    return mockSimilarTo(ref, hits.map((h) => h.e), `${query}\u0000${scope ?? ""}`, limit, withSuggestion, done);
+  }
+  if (p.dupe) {
+    if (clauses.length) {
+      return done([], false, {
+        kind: "DupeWithContent", start: 0, end: query.length, suggestion: null,
+        message: "`dupe:` cannot be combined with `content:` yet",
+      });
+    }
+    return mockDupes(hits, query, scope, limit, withSuggestion, done);
+  }
   hits.sort((a, b) => a.score - b.score || a.e.item.name.localeCompare(b.e.item.name));
   // Like the Rust side: only the first SNIPPET_ROWS rows carry their snippet; the others come
   // from `content_snippets`, which uses the content words of the last search remembered here.
@@ -984,6 +1080,140 @@ function search(
     ...h.e.item, highlights: h.highlights, matched: h.matched, snippet: i < SNIPPET_ROWS ? h.snippet : null,
   }));
   return done(items, hits.length > limit);
+}
+
+/** `dupe:` queries already scanned once: the first scan "runs out of budget" (as a big folder
+ *  would), the next one finishes from the "cache". */
+const dupeScanned = new Set<string>();
+
+/**
+ * `dupe:` (like the app's dupes.rs): the planted copies among `hits`, grouped, biggest wasted
+ * space first, each row tagged with its group and copy count. Folders never match.
+ */
+function mockDupes(
+  hits: { e: MockEntry; highlights: Range16[] }[], query: string, scope: string | null, limit: number, real: boolean,
+  done: (items: ResultItem[], truncated: boolean) => SearchResponse,
+): SearchResponse {
+  const byKey = new Map<string, { e: MockEntry; highlights: Range16[] }[]>();
+  for (const h of hits) {
+    if (!h.e.dupeKey || h.e.item.isDir || !h.e.item.size) continue;
+    const g = byKey.get(h.e.dupeKey) ?? [];
+    g.push(h);
+    byKey.set(h.e.dupeKey, g);
+  }
+  const waste = (g: { e: MockEntry }[]) => (g[0].e.item.size ?? 0) * (g.length - 1);
+  let groups = [...byKey.values()].filter((g) => g.length >= 2).sort((a, b) => waste(b) - waste(a));
+  const key = `${query}\u0000${scope ?? ""}`;
+  const incomplete = real && !dupeScanned.has(key) && groups.length > 2;
+  if (real) dupeScanned.add(key);
+  if (incomplete) groups = groups.slice(0, 2);
+  const rows = groups.flatMap((g, n) => g.map((h): ResultItem => ({
+    ...h.e.item, highlights: h.highlights, matched: "name", snippet: null, dupeGroup: n + 1, dupeCount: g.length,
+  })));
+  return {
+    ...done(rows.slice(0, limit), rows.length > limit),
+    dupe: {
+      groups: groups.length, files: rows.length, wastedBytes: groups.reduce((s, g) => s + waste(g), 0),
+      incomplete, skipped: incomplete ? 0 : 1,
+    },
+  };
+}
+
+// ---------- similar images (fake perceptual hashes, like the app's similar.rs) ----------
+
+const MOCK_IMAGE_EXTS = new Set(["jpg", "jpeg", "jpe", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff"]);
+const isMockImage = (e: MockEntry) => !e.item.isDir && !!e.item.size && MOCK_IMAGE_EXTS.has(e.item.ext);
+/** Largest distance (of 64 bits) inside a `similar:` group / listed for one reference (similar.rs). */
+const MOCK_GROUP_MAX = 8;
+const MOCK_REFERENCE_MAX = 12;
+
+function hash32(s: string, seed: number): number {
+  let h = seed >>> 0;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x5bd1e995) >>> 0;
+  return (h ^ (h >>> 15)) >>> 0;
+}
+const popcount32 = (n: number) => {
+  n -= (n >>> 1) & 0x55555555;
+  n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
+  return (Math.imul((n + (n >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24);
+};
+/** A fake 64-bit pHash as two 32-bit halves: planted copies share a base and differ by 2 bits per step. */
+function mockHash(e: MockEntry): [number, number] {
+  const key = e.similarKey ?? `#${e.item.id}`;
+  let hi = hash32(key, 0x9e3779b9);
+  const lo = hash32(key, 0x85ebca6b);
+  const step = e.similarStep ?? 0;
+  for (let b = 0; b < step * 2; b++) hi ^= 1 << ((b * 7) % 32);
+  return [hi >>> 0, lo];
+}
+const mockDistance = (a: [number, number], b: [number, number]) => popcount32((a[0] ^ b[0]) >>> 0) + popcount32((a[1] ^ b[1]) >>> 0);
+const similarityOf = (d: number) => Math.round(((64 - Math.min(d, 64)) * 100) / 64);
+
+/** Similar-image keys already scanned once: the first scan "runs out of time" (like a big photo folder). */
+const similarScanned = new Set<string>();
+
+/** Splits `images` into the part "hashed" before the budget ran out, the first time `key` is scanned. */
+function budgeted(images: MockEntry[], key: string, real: boolean): { checked: MockEntry[]; incomplete: boolean } {
+  const incomplete = real && !similarScanned.has(key) && images.length > 40;
+  if (real) similarScanned.add(key);
+  return { checked: incomplete ? images.slice(0, Math.ceil(images.length * 0.6)) : images, incomplete };
+}
+
+/** `similar:`: groups of near-identical pictures among `hits` (leader first, then by distance). */
+function mockSimilarGroups(
+  hits: { e: MockEntry; highlights: Range16[] }[], query: string, scope: string | null, limit: number, real: boolean,
+  done: (items: ResultItem[], truncated: boolean) => SearchResponse,
+): SearchResponse {
+  const images = hits.filter((h) => isMockImage(h.e));
+  const { checked, incomplete } = budgeted(images.map((h) => h.e), `${query}\u0000${scope ?? ""}`, real);
+  const inBudget = new Set(checked);
+  const pool = images.filter((h) => inBudget.has(h.e)).map((h) => ({ ...h, hash: mockHash(h.e) }));
+  const taken = new Set<number>();
+  const groups: { h: (typeof pool)[number]; d: number }[][] = [];
+  for (const leader of pool) {
+    if (taken.has(leader.e.item.id)) continue;
+    const members = pool
+      .filter((o) => !taken.has(o.e.item.id))
+      .map((o) => ({ h: o, d: mockDistance(leader.hash, o.hash) }))
+      .filter((m) => m.d <= MOCK_GROUP_MAX)
+      .sort((a, b) => a.d - b.d);
+    if (members.length < 2) continue;
+    for (const m of members) taken.add(m.h.e.item.id);
+    groups.push(members);
+  }
+  groups.sort((a, b) => b.length - a.length);
+  const rows = groups.flatMap((g, n) => g.map(({ h, d }): ResultItem => ({
+    ...h.e.item, highlights: h.highlights, matched: "name", snippet: null, similarGroup: n + 1, similarity: similarityOf(d),
+  })));
+  return {
+    ...done(rows.slice(0, limit), rows.length > limit),
+    similar: { images: images.length, checked: checked.length, skipped: 0, groups: groups.length, found: rows.length },
+    ...(incomplete ? { similarIncomplete: true } : {}),
+  };
+}
+
+/** `find_similar` / `similar:name`: the images of `candidates` like `ref`, closest first (ref left out). */
+function mockSimilarTo(
+  ref: MockEntry, candidates: MockEntry[], key: string, limit: number, real: boolean,
+  done: (items: ResultItem[], truncated: boolean) => SearchResponse,
+): SearchResponse {
+  const images = candidates.filter((e) => isMockImage(e) && e !== ref);
+  // The reference's folder first, so an incomplete answer still covers its neighbours.
+  images.sort((a, b) => Number(a.item.parent !== ref.item.parent) - Number(b.item.parent !== ref.item.parent));
+  const { checked, incomplete } = budgeted(images, key, real);
+  const target = mockHash(ref);
+  const found = checked
+    .map((e) => ({ e, d: mockDistance(target, mockHash(e)) }))
+    .filter((m) => m.d <= MOCK_REFERENCE_MAX)
+    .sort((a, b) => a.d - b.d || a.e.item.name.localeCompare(b.e.item.name));
+  const rows = found.map(({ e, d }): ResultItem => ({
+    ...e.item, highlights: [], matched: "name", snippet: null, similarity: similarityOf(d),
+  }));
+  return {
+    ...done(rows.slice(0, limit), rows.length > limit),
+    similar: { images: images.length, checked: checked.length, skipped: 0, groups: 0, found: rows.length },
+    ...(incomplete ? { similarIncomplete: true } : {}),
+  };
 }
 
 /** Rows of a response that carry their snippet (`SNIPPET_ROWS` in the app's content.rs). */
@@ -1250,6 +1480,12 @@ function findFavorite(path: string): Favorite {
 /** The "check for updates at start-up" setting (Rust keeps it in its settings file). */
 let mockAutoUpdate = false;
 
+/** The MCP settings (Rust keeps them in `mcp.json`). */
+let mockMcp: McpSettings = { enabled: false, allowedFolders: [], allowContentRead: false, maxResults: 50 };
+/** Folders the mock folder picker hands out, in turn. */
+const MOCK_PICKED_FOLDERS = ["C:\\Users\\Sara\\Documents", "D:\\مشاريع", "C:\\Users\\Sara\\Desktop"];
+let mockPicks = 0;
+
 /** Dispatches one command. Rejections carry an English string, like Tauri commands. */
 export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs<C> | undefined): Promise<CommandResult<C>> {
   const args = (rawArgs ?? {}) as Record<string, unknown>;
@@ -1310,6 +1546,8 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       let h = 0;
       for (let i = 0; i < query.length; i++) h = (h * 31 + query.charCodeAt(i)) | 0;
       await sleep(2 + (Math.abs(h) % 25));
+      // `dupe:` reads files: noticeably slower (and still cancelled by a newer search).
+      if (/(^|\s)(dupe|مكرر|similar|مشابه):/i.test(query)) await sleep(350);
       if (requestId < latestRequest) {
         result = { requestId, items: [], truncated: false, elapsedMs: 0, error: null, cancelled: true };
       } else {
@@ -1335,6 +1573,32 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       }
       break;
     }
+    case "find_similar": {
+      // Like `search`: cancels and is cancelled by newer searches; decoding pictures takes a moment.
+      const requestId = args.requestId as number;
+      latestRequest = Math.max(latestRequest, requestId);
+      const ref = findMockEntry(args.id as number);
+      if (!isMockImage(ref)) throw "only images (jpg, png, webp, gif, bmp, tiff) can be compared";
+      await sleep(300);
+      if (requestId < latestRequest) {
+        result = { requestId, items: [], truncated: false, elapsedMs: 0, error: null, cancelled: true };
+        break;
+      }
+      const scope = ((args.scope as string | null | undefined) ?? "").trim() || null;
+      const t0 = performance.now();
+      const offline = status.offline ?? [];
+      const candidates = (index ?? []).filter((e) =>
+        (!scope || under(`${e.item.parent}\\${e.item.name}`, scope)) && !offline.some((o) => under(e.item.parent, o)));
+      const limit = Math.min((args.limit as number | undefined) ?? 1000, 10_000);
+      result = mockSimilarTo(ref, candidates, `#${ref.item.id}\u0000${scope ?? ""}`, limit, true, (items, truncated) => ({
+        requestId, items, truncated, error: null, cancelled: false, elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
+      }));
+      break;
+    }
+    case "interpret_query":
+      // A tiny subset of the Rust rules (see mockInterpret.ts).
+      result = mockInterpret(args.text as string);
+      break;
     case "open_entry":
       console.info("[mock] open_entry", findEntry(args.id as number));
       break;
@@ -1456,6 +1720,33 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
     case "set_update_settings":
       mockAutoUpdate = (args.settings as { autoUpdateCheck?: boolean } | undefined)?.autoUpdateCheck === true;
       result = { autoUpdateCheck: mockAutoUpdate };
+      break;
+    case "get_mcp_settings":
+      result = { ...mockMcp, allowedFolders: [...mockMcp.allowedFolders] };
+      break;
+    case "set_mcp_settings": {
+      const s = args.settings as McpSettings;
+      const bad = s.allowedFolders.find((f) => !/^[a-zA-Z]:[\\/]/.test(f.trim()));
+      if (bad !== undefined) throw `${bad}: the path must be absolute`;
+      const folders: string[] = [];
+      for (const f of s.allowedFolders.map((x) => x.trim())) {
+        if (!folders.some((x) => pathKey(x) === pathKey(f))) folders.push(f);
+      }
+      mockMcp = {
+        enabled: s.enabled,
+        allowedFolders: folders,
+        allowContentRead: s.allowContentRead,
+        maxResults: Math.min(200, Math.max(1, Math.round(s.maxResults) || 50)),
+      };
+      result = { ...mockMcp, allowedFolders: [...mockMcp.allowedFolders] };
+      break;
+    }
+    case "mcp_server_path":
+      result = { path: "C:\\Users\\Sara\\AppData\\Local\\Athrix\\athrix-mcp.exe", exists: true };
+      break;
+    case "mcp_pick_folder":
+      await sleep(150);
+      result = MOCK_PICKED_FOLDERS[mockPicks++ % MOCK_PICKED_FOLDERS.length];
       break;
     default:
       throw `unknown command ${String(cmd)}`;

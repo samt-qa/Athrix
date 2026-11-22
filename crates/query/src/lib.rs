@@ -70,6 +70,12 @@
 //! (`content:` / `محتوى:`), and defines which cross-source combinations are supported; see
 //! the [`plan`](mod@plan) module.
 //!
+//! # Natural language
+//!
+//! [`interpret`] / [`interpret_with`] read plain Arabic or English («ملفات PDF من الأسبوع
+//! الماضي أكبر من 5 ميجا») as a suggested filter query (`ext:pdf dm:lastweek size:>5mb`);
+//! see the [`natural`] module.
+//!
 //! # Purity
 //!
 //! The parser does not read the clock or the file system. Relative dates stay as
@@ -78,6 +84,7 @@
 pub mod ast;
 pub mod error;
 mod lexicon;
+pub mod natural;
 mod parser;
 pub mod plan;
 mod values;
@@ -87,6 +94,7 @@ pub use ast::{
     NamedDate, Query, Span, Term,
 };
 pub use error::{ParseError, ParseErrorKind};
+pub use natural::{InterpretOptions, Interpretation, Part, PartRole, interpret, interpret_with};
 pub use parser::{MAX_DEPTH, parse};
 pub use plan::{
     ContentClause, ContentQuery, PlanError, PlanErrorKind, PlanOptions, SearchPlan, plan,

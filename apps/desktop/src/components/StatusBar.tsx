@@ -1,7 +1,7 @@
 import { Match, Show, Switch, type JSX } from "solid-js";
 import { locale, t, tPlural } from "../i18n";
 import type { IndexStatus, SearchResponse } from "../lib/api";
-import { formatCount, intlLocale } from "../lib/format";
+import { formatCount, formatSize, intlLocale } from "../lib/format";
 import { rootName } from "../lib/scope";
 
 type Props = {
@@ -13,6 +13,8 @@ type Props = {
   onRetry: () => void;
   /** Shown after the index state (the content-indexing control). */
   content?: JSX.Element;
+  /** `dupe:` search cut short by its time budget: run it again to continue (hashes are cached). */
+  onContinueDupes?: () => void;
 };
 
 function formatMs(ms: number): string {
@@ -84,6 +86,24 @@ export default function StatusBar(props: Props) {
       </Show>
       <span class="status-end">
         <span class="notice" role="status">{props.notice ?? ""}</span>
+        {/* `dupe:`: the space the extra copies take, and "continue" after a partial scan. */}
+        <Show when={props.response && !props.response.error ? props.response.dupe : null}>
+          {(d) => (
+            <span class="dupe-summary" title={[
+              tPlural("results.dupeGroups", d().groups, formatCount(d().groups, locale())),
+              ...(d().skipped ? [t("results.dupeSkipped", { count: formatCount(d().skipped, locale()) })] : []),
+            ].join(" · ")}>
+              {t("results.dupeWasted", { size: formatSize(d().wastedBytes, locale()) })}
+              <Show when={d().incomplete}>
+                {" · "}
+                <span class="dupe-partial" title={t("results.dupeIncompleteTitle")}>{t("results.dupeIncomplete")}</span>
+                <Show when={props.onContinueDupes}>
+                  {(go) => <button type="button" class="link-btn" onClick={() => go()()}>{t("results.dupeContinue")}</button>}
+                </Show>
+              </Show>
+            </span>
+          )}
+        </Show>
         {/* Not a live region: the results list announces its count (in the popup too). */}
         <span class="count">{count()}</span>
         <Show when={props.response && !props.response.error}>

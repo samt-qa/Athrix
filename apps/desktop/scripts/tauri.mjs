@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// `npm run tauri -- <args>`: the Tauri CLI, but `dev` and `build` first stage the extraction
-// worker sidecar (scripts/build-worker.mjs), so they work even when `--config` replaces
+// `npm run tauri -- <args>`: the Tauri CLI, but `dev` and `build` first stage the sidecars
+// (PDF extraction worker, athrix-mcp; scripts/build-worker.mjs), so they work even when `--config` replaces
 // beforeDevCommand / beforeBuildCommand (which also stage it). `tauri build --debug` stages a
 // debug worker; any other `build` a release one. `--target <triple>` is passed through.
 

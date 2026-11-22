@@ -381,3 +381,50 @@ fn index_is_shareable_across_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ContentIndex>();
 }
+
+#[test]
+fn a_read_only_open_searches_beside_the_writer_and_refuses_writes() {
+    let (dir, writer) = index_with(&[("C:/a/عقد.txt", "عقد الإيجار")]);
+    // The writer still holds its lock: a read-only open works anyway.
+    let ro = ContentIndex::open_read_only(dir.path()).unwrap();
+    assert!(ro.is_read_only() && !writer.is_read_only());
+    assert_eq!(ro.search("عقد", 10).unwrap().len(), 1);
+    assert!(matches!(
+        ro.add_or_update("C:/a/b.txt", META, "x"),
+        Err(Error::ReadOnly(_))
+    ));
+    assert!(matches!(ro.commit(), Err(Error::ReadOnly(_))));
+    assert!(matches!(ro.delete_prefix("C:/a"), Err(Error::ReadOnly(_))));
+    assert!(matches!(ro.retain(|_, _| false), Err(Error::ReadOnly(_))));
+    ro.delete("C:/a/عقد.txt");
+    // Later commits of the writer show after opening again.
+    writer
+        .add_or_update("C:/a/b.txt", META, "عقد جديد")
+        .unwrap();
+    writer.commit().unwrap();
+    assert_eq!(ro.search("عقد", 10).unwrap().len(), 1);
+    let again = ContentIndex::open_read_only(dir.path()).unwrap();
+    assert_eq!(again.search("عقد", 10).unwrap().len(), 2);
+}
+
+#[test]
+fn a_read_only_open_never_creates_or_rebuilds() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("nothing");
+    assert!(matches!(
+        ContentIndex::open_read_only(&missing),
+        Err(Error::Io { .. })
+    ));
+    assert!(!missing.exists(), "nothing created");
+    std::fs::write(
+        dir.path().join("athrix-content-index.version"),
+        "schema=0\n",
+    )
+    .unwrap();
+    assert!(
+        ContentIndex::open_read_only(dir.path())
+            .unwrap_err()
+            .is_corrupt()
+    );
+    assert!(dir.path().join("athrix-content-index.version").exists());
+}

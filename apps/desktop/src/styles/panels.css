@@ -307,3 +307,19 @@
 .update-banner .btn-ghost { block-size: 26px; }
 .update-banner .update-banner-text { margin-inline-end: auto; }
 .settings-inline + .switch-row { margin-block-start: 10px; }
+/* ---- MCP / AI assistants (settings → mcp) ---- */
+.mcp-subtitle { margin: 16px 0 6px; font: 600 13px/1.5 var(--font-display); }
+.mcp-attention { color: var(--warning); }
+.mcp-folders {
+  list-style: none; margin: 0; padding: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  max-block-size: 200px; overflow-y: auto;
+}
+.mcp-folder { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; }
+.mcp-folder + .mcp-folder { border-block-start: 1px solid var(--border); }
+.mcp-folder-path {
+  flex: 1; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; text-align: start;
+}
+.mcp-folder .btn-ghost { block-size: 26px; flex: none; }
+.mcp-folder-empty { padding: 8px 10px; color: var(--text-muted); font-size: 13px; }

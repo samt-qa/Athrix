@@ -236,7 +236,8 @@ pub struct ContentIndex {
     options: IndexOptions,
     fields: Fields,
     reader: IndexReader,
-    writer: Mutex<IndexWriter>,
+    /// `None` for an index opened with [`ContentIndex::open_read_only`].
+    writer: Option<Mutex<IndexWriter>>,
     rebuilt: Option<RebuildReason>,
 }
 
@@ -342,6 +343,58 @@ impl ContentIndex {
         Self::finish(dir, index, fields, options, None)
     }
 
+    /// Opens the existing index in `dir` for searching only: no writer (so no writer lock;
+    /// another process, such as the app, may keep writing), nothing created, rebuilt or wiped.
+    ///
+    /// The searches see the commits made before this call (reload by opening again). Every
+    /// write method returns [`Error::ReadOnly`] ([`delete`](Self::delete) does nothing). A
+    /// missing directory or index gives [`Error::Io`] (`NotFound`); an index of another schema
+    /// or analyzer version gives [`Error::Corrupt`].
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let found =
+            std::fs::read_to_string(dir.join(MARKER_FILE)).map_err(|e| Error::io(dir, e))?;
+        if found != marker_contents() {
+            return Err(Error::Corrupt {
+                path: dir.to_owned(),
+                message: format!("index versions {:?} differ from this build", found.trim()),
+            });
+        }
+        let index = Index::open_in_dir(dir).map_err(|e| Error::from_tantivy(dir, e))?;
+        let (expected, fields) = Fields::schema();
+        if index.schema() != expected {
+            return Err(Error::Corrupt {
+                path: dir.to_owned(),
+                message: "schema differs from this version".to_owned(),
+            });
+        }
+        let reader = Self::register_and_read(dir, &index)?;
+        Ok(ContentIndex {
+            dir: dir.to_owned(),
+            options: IndexOptions::default(),
+            fields,
+            reader,
+            writer: None,
+            rebuilt: None,
+        })
+    }
+
+    /// Whether this index was opened with [`open_read_only`](Self::open_read_only).
+    pub fn is_read_only(&self) -> bool {
+        self.writer.is_none()
+    }
+
+    fn register_and_read(dir: &Path, index: &Index) -> Result<IndexReader> {
+        index
+            .tokenizers()
+            .register(TOKENIZER_NAME, ArabicTokenizer::default());
+        index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| Error::from_tantivy(dir, e))
+    }
+
     fn finish(
         dir: &Path,
         index: Index,
@@ -349,14 +402,7 @@ impl ContentIndex {
         options: IndexOptions,
         rebuilt: Option<RebuildReason>,
     ) -> Result<Self> {
-        index
-            .tokenizers()
-            .register(TOKENIZER_NAME, ArabicTokenizer::default());
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(|e| Error::from_tantivy(dir, e))?;
+        let reader = Self::register_and_read(dir, &index)?;
         let budget = options.memory_budget.clamp(15_000_000, 2_000_000_000);
         let writer = index
             .writer_with_num_threads(1, budget)
@@ -366,7 +412,7 @@ impl ContentIndex {
             options,
             fields,
             reader,
-            writer: Mutex::new(writer),
+            writer: Some(Mutex::new(writer)),
             rebuilt,
         })
     }
@@ -386,10 +432,13 @@ impl ContentIndex {
         Error::from_tantivy(&self.dir, e)
     }
 
-    fn writer(&self) -> std::sync::MutexGuard<'_, IndexWriter> {
+    fn writer(&self) -> Result<std::sync::MutexGuard<'_, IndexWriter>> {
+        let Some(writer) = &self.writer else {
+            return Err(Error::ReadOnly(self.dir.clone()));
+        };
         // A panic while holding the lock leaves the writer usable: tantivy's own state is
         // consistent between calls, and uncommitted work is simply lost on rollback.
-        self.writer.lock().unwrap_or_else(|p| p.into_inner())
+        Ok(writer.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Indexes the text of `path`, replacing any earlier version of it. Visible after
@@ -409,28 +458,29 @@ impl ContentIndex {
         if self.options.stored_text_limit > 0 {
             doc.add_text(f.preview, prefix(text, self.options.stored_text_limit));
         }
-        let w = self.writer();
+        let w = self.writer()?;
         w.delete_term(Term::from_field_text(f.pkey, &pkey));
         w.add_document(doc).map_err(|e| self.err(e))?;
         Ok(key)
     }
 
     /// Removes `path` (compared by [`path_key`]) from the index. Visible after
-    /// [`commit`](Self::commit).
+    /// [`commit`](Self::commit). Does nothing on a read-only index.
     pub fn delete(&self, path: &str) {
-        self.writer()
-            .delete_term(Term::from_field_text(self.fields.pkey, &path_key(path)));
+        if let Ok(w) = self.writer() {
+            w.delete_term(Term::from_field_text(self.fields.pkey, &path_key(path)));
+        }
     }
 
     /// Persists pending changes and makes them visible to searches.
     pub fn commit(&self) -> Result<()> {
-        self.writer().commit().map_err(|e| self.err(e))?;
+        self.writer()?.commit().map_err(|e| self.err(e))?;
         self.reader.reload().map_err(|e| self.err(e))
     }
 
     /// Discards changes since the last commit.
     pub fn rollback(&self) -> Result<()> {
-        self.writer().rollback().map_err(|e| self.err(e))?;
+        self.writer()?.rollback().map_err(|e| self.err(e))?;
         Ok(())
     }
 
@@ -718,11 +768,13 @@ impl ContentIndex {
         let field = self.fields.path;
         let mut batch: Vec<Term> = Vec::new();
         let mut removed = 0u64;
+        // Fails before deleting anything on a read-only index.
+        drop(self.writer()?);
         let flush = |batch: &mut Vec<Term>| {
             if batch.is_empty() {
                 return;
             }
-            let w = self.writer();
+            let Ok(w) = self.writer() else { return };
             for term in batch.drain(..) {
                 w.delete_term(term);
             }
@@ -750,12 +802,13 @@ impl ContentIndex {
         let Some(q) = scope::prefix_query(self.fields.pkey, &path_key(prefix)) else {
             return Ok(0);
         };
+        let writer = self.writer()?;
         let n = self
             .reader
             .searcher()
             .search(&q, &Count)
             .map_err(|e| self.err(e))?;
-        self.writer().delete_query(q).map_err(|e| self.err(e))?;
+        writer.delete_query(q).map_err(|e| self.err(e))?;
         Ok(n as u64)
     }
 }

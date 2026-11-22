@@ -3,6 +3,7 @@
 //! tool for now; the full CLI comes in M7 (task 7.1).
 
 mod bench;
+mod interpret;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,6 +17,9 @@ const USAGE: &str = "usage:
   athrix --version
   athrix normalize <text>
       print <text> as the name index stores it
+  athrix interpret <TEXT>... [--explain] [--today YYYY-MM-DD]
+      read plain Arabic or English as filters («ملفات PDF من الأسبوع الماضي» →
+      ext:pdf dm:lastweek); prints the query, or exits 1 when there is nothing to suggest
   athrix index <ROOT>... [--method auto|walk|ntfs] [--save FILE] [--exclude GLOB]...
                [--no-default-excludes]
       index the roots and print entries, time, method per root and memory.
@@ -62,6 +66,7 @@ fn main() -> ExitCode {
         Some("index") => cmd_index(&args[1..]),
         Some("search") => cmd_search(&args[1..]),
         Some("bench") => bench::cmd_bench(&args[1..]),
+        Some("interpret") => interpret::cmd_interpret(&args[1..]),
         _ => Err(Usage(None).into()),
     };
     match result {

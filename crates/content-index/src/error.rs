@@ -35,6 +35,10 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A write on an index opened with
+    /// [`ContentIndex::open_read_only`](crate::ContentIndex::open_read_only).
+    #[error("content index at {0} is open read-only")]
+    ReadOnly(PathBuf),
     /// Any other tantivy error.
     #[error("content index error: {0}")]
     Index(#[source] TantivyError),

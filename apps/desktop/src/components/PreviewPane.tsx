@@ -1,7 +1,7 @@
 import { batch, createEffect, createMemo, createSignal, For, Match, on, onCleanup, Show, Switch, type JSX } from "solid-js";
 import { locale, t, tPlural, type MessageKey } from "../i18n";
 import { api, errorMessage, isStaleIdError, type Preview, type PreviewBody, type Range16, type ResultItem, type UnsupportedReason } from "../lib/api";
-import { categoryOf } from "../lib/fileKinds";
+import { canFindSimilar, categoryOf } from "../lib/fileKinds";
 import { formatCount, formatDateTime, formatSize } from "../lib/format";
 import { highlightSyntax, type SyntaxSpan } from "../lib/syntax";
 import { findMatches, queryTerms } from "../lib/textMatch";
@@ -31,6 +31,8 @@ type Props = {
   onClose: () => void;
   /** The id is from an older index: the results must be refreshed. */
   onStale: () => void;
+  /** «صور مشابهة»: offered on image results (see `canFindSimilar`). */
+  onFindSimilar?: () => void;
   ref?: (handle: PreviewHandle) => void;
 };
 
@@ -212,6 +214,13 @@ export default function PreviewPane(props: Props) {
           <Show when={props.item}>
             <button type="button" class="btn-ghost" onClick={() => props.onOpen()}>{t("preview.open")}</button>
             <button type="button" class="btn-ghost" onClick={() => props.onReveal()}>{t("preview.reveal")}</button>
+          </Show>
+          <Show when={props.item && props.onFindSimilar && canFindSimilar(props.item) ? props.onFindSimilar : null}>
+            {(find) => (
+              <button type="button" class="btn-ghost" title={t("similar.actionTitle")} onClick={() => find()()}>
+                {t("similar.action")}
+              </button>
+            )}
           </Show>
           <button type="button" class="icon-btn" aria-label={t("preview.hide")} title={t("preview.hide")}
             aria-controls={props.id} aria-expanded="true" onClick={() => props.onClose()}>

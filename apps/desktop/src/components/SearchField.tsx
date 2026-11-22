@@ -19,9 +19,14 @@ type Props = {
   describedBy: string | undefined;
   /** Shown at the inline end of the bar, outside the input's label (e.g. the scope selector). */
   addon?: JSX.Element;
+  /** Shown before the input, inside the bar (e.g. the "similar to: name ✕" chip). */
+  prefix?: JSX.Element;
+  /** Replaces the default placeholder. */
+  placeholder?: string;
 };
 
 const SUGGEST_ID = "search-suggestions";
+const INPUT_ID = "search-input";
 const suggestionId = (i: number) => `${SUGGEST_ID}-${i}`;
 
 type Segment = { text: string; cls: string };
@@ -178,8 +183,10 @@ export default function SearchField(props: Props) {
   return (
     <div class="search-wrap">
       <div class="search">
-        <label class="search-main">
+        {/* `for`: the input stays the label's control even with a button in `prefix`. */}
+        <label class="search-main" for={INPUT_ID}>
           <SearchIcon />
+          {props.prefix}
           <div class="search-field" classList={{ composing: composing() }}>
             <div ref={layer} class="search-mirror" dir="auto" aria-hidden="true">
               <For each={parts()}>{(p) => (p.cls ? <span class={p.cls}>{p.text}</span> : p.text)}</For>
@@ -189,6 +196,7 @@ export default function SearchField(props: Props) {
                 input = el;
                 props.ref(el);
               }}
+              id={INPUT_ID}
               dir="auto"
               autofocus
               spellcheck={false}
@@ -201,7 +209,7 @@ export default function SearchField(props: Props) {
               aria-activedescendant={open() ? (active() >= 0 ? suggestionId(active()) : undefined) : props.activeDescendant}
               aria-invalid={props.errorSpan ? true : undefined}
               aria-describedby={props.describedBy}
-              placeholder={t("search.placeholder")}
+              placeholder={props.placeholder ?? t("search.placeholder")}
               value={props.value}
               onInput={(e) => {
                 setDismissed(null);

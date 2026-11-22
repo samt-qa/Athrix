@@ -43,7 +43,7 @@ jobs:
         with:
           key: release
 
-      # `npm run tauri` stages the release PDF worker (src-tauri/binaries) before building.
+      # `npm run tauri` stages the release sidecars (PDF worker, athrix-mcp; src-tauri/binaries) before building.
       # createUpdaterArtifacts is enabled only here, so local builds need no signing key.
       - uses: tauri-apps/tauri-action@v0
         env:
