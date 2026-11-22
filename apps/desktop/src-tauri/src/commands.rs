@@ -15,17 +15,17 @@ use athrix_fs_index::EntryId;
 use athrix_query::{PlanOptions, SearchPlan};
 
 use crate::content::{ContentService, StatusSink};
+use crate::drives::{apply_plan, current_plan};
 use crate::indexing::{IndexObserver, IndexView, Indexer, SnapshotStore, StatusListener};
 use crate::model::{
     ContentStatus, IndexState, IndexStatus, PreviewResponse, QueryError, ResultItem, RowSnippet,
-    SearchResponse, SearchSuggestion,
+    SearchResponse, SearchSuggestion, SuggestResponse,
 };
 use crate::preview::{DEFAULT_MAX_CHARS, build_preview};
 use crate::query::{CompiledQuery, compile_ast, map_parse_error, map_plan_error};
 use crate::results::{SearchFailure, SearchScope, decode_id, run_search};
 use crate::roots::{
-    IndexRoots, ROOTS_SETTING_FILE, RootsChoice, RootsSetting, normalize_roots,
-    resolve as resolve_roots,
+    DRIVE_SETTINGS_FILE, IndexRoots, ROOTS_SETTING_FILE, RootPlan, RootsChoice, normalize_roots,
 };
 use crate::state::AppState;
 use crate::suggest::suggest;
@@ -62,8 +62,13 @@ pub async fn start_indexing(app: AppHandle, roots: Option<Vec<String>>) -> Resul
     let roots = match roots {
         Some(r) if !r.is_empty() => normalize_roots(&r)?,
         _ => {
-            let choice = app.state::<AppState>().roots.choice();
-            blocking(move || resolve_roots(&choice, &volumes::list_volumes())).await??
+            // The setting's roots; those on unplugged drives stay, offline (hidden, not walked).
+            let handle = app.clone();
+            let plan = blocking(move || current_plan(&handle.state::<AppState>())).await??;
+            app.state::<AppState>()
+                .indexer
+                .set_offline_roots(&plan.offline);
+            plan.roots
         }
     };
     let outcome = app
@@ -82,13 +87,11 @@ pub async fn list_volumes() -> Result<Vec<Volume>, String> {
 
 /// The indexed-roots setting and the folders it indexes now.
 #[tauri::command]
-pub async fn get_index_roots(state: State<'_, AppState>) -> Result<IndexRoots, String> {
-    let choice = state.roots.choice();
-    let resolved = {
-        let choice = choice.clone();
-        blocking(move || resolve_roots(&choice, &volumes::list_volumes())).await??
-    };
-    Ok(index_roots(&choice, &resolved))
+pub async fn get_index_roots(app: AppHandle) -> Result<IndexRoots, String> {
+    let choice = app.state::<AppState>().roots.choice();
+    let handle = app.clone();
+    let plan = blocking(move || current_plan(&handle.state::<AppState>())).await??;
+    Ok(index_roots(&choice, &plan))
 }
 
 /// Sets what to index: `roots: null` (or absent) = the whole computer (every fixed drive),
@@ -105,29 +108,45 @@ pub async fn set_index_roots(
         None => RootsChoice::WholeComputer,
         Some(r) => RootsChoice::Custom(normalize_roots(&r)?),
     };
-    let resolved = {
-        let choice = choice.clone();
-        blocking(move || resolve_roots(&choice, &volumes::list_volumes())).await??
-    };
     let state = app.state::<AppState>();
     if let Err(e) = state.roots.set(choice.clone()) {
         tracing::warn!(error = %e, "cannot save the indexed-roots setting");
     }
-    let current = state.indexer.status();
-    let wanted = root_strings(&resolved);
-    let unchanged = current.roots == wanted
-        && matches!(current.state, IndexState::Ready | IndexState::Indexing);
-    if !unchanged {
-        let outcome = state.indexer.start(resolved.clone(), status_listener(&app));
-        tracing::info!(?outcome, roots = ?wanted, "indexed roots changed");
-    }
-    Ok(index_roots(&choice, &resolved))
+    // Only the new roots are walked; roots taken out are dropped, with their content documents
+    // (an explicit removal, unlike an unplugged drive whose documents are kept).
+    let handle = app.clone();
+    let plan = blocking(move || {
+        let state = handle.state::<AppState>();
+        let plan = current_plan(&state)?;
+        let current = state.indexer.status();
+        let usable = matches!(current.state, IndexState::Ready | IndexState::Indexing);
+        if !usable {
+            state.indexer.set_offline_roots(&plan.offline);
+            let outcome = state
+                .indexer
+                .start(plan.roots.clone(), status_listener(&handle));
+            tracing::info!(?outcome, roots = ?plan.roots, "indexed roots set");
+        } else {
+            apply_plan(&handle, &plan, Vec::new());
+        }
+        let removed: Vec<PathBuf> = current
+            .roots
+            .iter()
+            .map(PathBuf::from)
+            .filter(|r| !plan.roots.contains(r))
+            .collect();
+        state.content.forget_roots(&removed, &plan.roots);
+        Ok::<_, String>(plan)
+    })
+    .await??;
+    Ok(index_roots(&choice, &plan))
 }
 
-fn index_roots(choice: &RootsChoice, resolved: &[PathBuf]) -> IndexRoots {
+fn index_roots(choice: &RootsChoice, plan: &RootPlan) -> IndexRoots {
     IndexRoots {
         whole_computer: *choice == RootsChoice::WholeComputer,
-        roots: root_strings(resolved),
+        roots: root_strings(&plan.roots),
+        offline: root_strings(&plan.offline),
     }
 }
 
@@ -159,6 +178,9 @@ pub fn start_default_indexing(app: &AppHandle) {
         Ok(dir) => {
             indexer.set_snapshot_store(SnapshotStore::new(dir.join(SNAPSHOT_DIR)));
             state.roots.load_from(dir.join(ROOTS_SETTING_FILE));
+            state
+                .drive_settings
+                .load_from(dir.join(DRIVE_SETTINGS_FILE));
             state.content.configure(&dir);
         }
         Err(e) => tracing::warn!(
@@ -170,23 +192,29 @@ pub fn start_default_indexing(app: &AppHandle) {
     state.content.set_status_sink(content_status_sink(app));
     let observer: Arc<dyn IndexObserver> = state.content.clone();
     indexer.set_observer(observer);
-    match startup_roots(&state.roots) {
-        Ok(roots) => {
-            tracing::info!(?roots, "start-up indexing");
-            let outcome = indexer.start_from_snapshot(roots, status_listener(app));
+    // The roots of the setting with the drives present now (and the external drives the
+    // settings take in); chosen roots on unplugged drives start offline.
+    let volumes = volumes::list_volumes();
+    state
+        .drive_monitor
+        .prime(volumes.clone(), volumes::signature());
+    match state
+        .drive_monitor
+        .plan(&state.roots.choice(), &volumes, state.drive_settings.get())
+    {
+        Ok(plan) => {
+            tracing::info!(roots = ?plan.roots, offline = ?plan.offline, "start-up indexing");
+            indexer.set_offline_roots(&plan.offline);
+            let outcome = indexer.start_from_snapshot(plan.roots, status_listener(app));
             tracing::info!(?outcome, "start-up indexing requested");
         }
         Err(e) => tracing::error!(error = %e, "cannot start indexing"),
     }
-}
-
-/// The roots to index at start-up, from the setting and the drives present now.
-fn startup_roots(setting: &RootsSetting) -> Result<Vec<PathBuf>, String> {
-    resolve_roots(&setting.choice(), &volumes::list_volumes())
+    crate::drives::start_monitor(app);
 }
 
 /// Emits every status change as [`STATUS_EVENT`].
-fn status_listener(app: &AppHandle) -> StatusListener {
+pub(crate) fn status_listener(app: &AppHandle) -> StatusListener {
     let handle = app.clone();
     Arc::new(move |status: &IndexStatus| {
         if let Err(e) = handle.emit(STATUS_EVENT, status) {
@@ -241,17 +269,11 @@ pub async fn search(
         elapsed_ms: 0.0,
         error: None,
         cancelled: false,
-        suggestion: None,
     };
     match outcome {
-        SearchOutcome::Hits {
-            items,
-            truncated,
-            suggestion,
-        } => {
+        SearchOutcome::Hits { items, truncated } => {
             response.items = items;
             response.truncated = truncated;
-            response.suggestion = suggestion;
         }
         SearchOutcome::Empty => {}
         SearchOutcome::Invalid(e) => response.error = Some(e),
@@ -268,8 +290,6 @@ enum SearchOutcome {
     Hits {
         items: Vec<ResultItem>,
         truncated: bool,
-        /// Only when `items` is empty (see [`crate::suggest`]).
-        suggestion: Option<SearchSuggestion>,
     },
     /// Empty query, or no index yet.
     Empty,
@@ -287,8 +307,9 @@ struct SearchRequest {
     search_content: bool,
 }
 
-/// The blocking part of `search`: parse and plan, then either the name-index fast path (with a
-/// "did you mean" rewrite when nothing is found) or a content search.
+/// The blocking part of `search`: parse and plan, then either the name-index fast path or a
+/// content search. "Did you mean" is not computed here: the UI asks [`search_suggest`] after
+/// an empty result, so its probes never delay the (empty) answer.
 fn execute_search(
     index: Option<Arc<IndexView>>,
     content: &ContentService,
@@ -329,24 +350,91 @@ fn execute_search(
         Err(SearchFailure::Cancelled) => return SearchOutcome::Cancelled,
         Err(SearchFailure::Failed(e)) => return SearchOutcome::Failed(e),
     };
-    let suggestion = if hits.items.is_empty() && limit > 0 {
-        match suggest(&index, text, &query, limit, scope, cancel) {
-            Ok(s) => s,
-            Err(SearchFailure::Cancelled) => return SearchOutcome::Cancelled,
-            // The search itself worked: a failed probe only means no suggestion.
-            Err(SearchFailure::Failed(e)) => {
-                tracing::warn!(error = %e, "suggestion search failed");
-                None
-            }
-        }
-    } else {
-        None
-    };
     SearchOutcome::Hits {
         items: hits.items,
         truncated: hits.truncated,
-        suggestion,
     }
+}
+
+/// "Did you mean…" for a query whose `search` (same arguments) found nothing: a rewrite of it
+/// that finds something (see [`crate::suggest`]), or `null`. The UI asks after an empty result
+/// and a short pause, so the probes (a layout swap, then a ranked `fuzzy:` scan) never delay
+/// the results. Like a search, a newer `search` or `search_suggest` cancels it, and it runs on
+/// the blocking pool.
+#[tauri::command]
+pub async fn search_suggest(
+    state: State<'_, AppState>,
+    query: String,
+    limit: u32,
+    request_id: u64,
+    scope: Option<String>,
+    search_content: Option<bool>,
+) -> Result<SuggestResponse, String> {
+    let scope = SearchScope::parse(scope.as_deref())?;
+    let cancel = state.begin_search();
+    let index = state.indexer.index();
+    let request = SearchRequest {
+        limit: (limit as usize).min(MAX_LIMIT),
+        scope,
+        search_content: search_content.unwrap_or(false),
+    };
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        execute_suggest(index, &query, &request, &cancel)
+    })
+    .await
+    .map_err(|e| format!("suggest task failed: {e}"))?;
+    let (suggestion, cancelled) = match outcome {
+        Ok(suggestion) => (suggestion, false),
+        Err(SearchFailure::Cancelled) => (None, true),
+        // A failed probe only means no suggestion.
+        Err(SearchFailure::Failed(e)) => {
+            tracing::warn!(error = %e, "suggestion search failed");
+            (None, false)
+        }
+    };
+    Ok(SuggestResponse {
+        request_id,
+        suggestion,
+        cancelled,
+    })
+}
+
+/// The blocking part of `search_suggest`. `None` for anything `search` would not answer from
+/// the name index with a valid query: empty or invalid text, content plans (no "did you mean"
+/// there), no index yet.
+fn execute_suggest(
+    index: Option<Arc<IndexView>>,
+    text: &str,
+    request: &SearchRequest,
+    cancel: &AtomicBool,
+) -> Result<Option<SearchSuggestion>, SearchFailure> {
+    if text.trim().is_empty() || request.limit == 0 {
+        return Ok(None);
+    }
+    let Ok(ast) = athrix_query::parse(text) else {
+        return Ok(None);
+    };
+    let options = PlanOptions {
+        plain_words_search_content: request.search_content,
+    };
+    match athrix_query::plan(&ast, &options) {
+        Ok(plan) if !plan.uses_content() => {}
+        _ => return Ok(None),
+    }
+    let (Ok(query), Some(index)) = (compile_ast(text, &ast), index) else {
+        return Ok(None);
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchFailure::Cancelled);
+    }
+    suggest(
+        &index,
+        text,
+        &query,
+        request.limit,
+        request.scope.as_ref(),
+        cancel,
+    )
 }
 
 /// A plan that needs the content index: compiles its name parts (reporting what the name
@@ -382,7 +470,6 @@ fn content_search(
         Ok(hits) => SearchOutcome::Hits {
             items: hits.items,
             truncated: hits.truncated,
-            suggestion: None,
         },
         Err(SearchFailure::Cancelled) => SearchOutcome::Cancelled,
         Err(SearchFailure::Failed(e)) => SearchOutcome::Failed(e),
@@ -609,13 +696,8 @@ mod tests {
         let ix = sample();
         let no = AtomicBool::new(false);
         match name_search(Some(Arc::clone(&ix)), "فاتورة 123", 10, None, &no) {
-            SearchOutcome::Hits {
-                items,
-                truncated,
-                suggestion,
-            } => {
+            SearchOutcome::Hits { items, truncated } => {
                 assert_eq!(items.len(), 1);
-                assert_eq!(suggestion, None);
                 assert_eq!(items[0].id, encode_id(3, 1));
                 assert!(!truncated);
                 assert_eq!(items[0].highlights.len(), 2);
@@ -629,46 +711,54 @@ mod tests {
         ));
     }
 
+    /// `execute_suggest` as the UI calls it after an empty result, without `searchContent`.
+    fn name_suggest(index: Option<Arc<IndexView>>, text: &str) -> Option<SearchSuggestion> {
+        let request = SearchRequest {
+            limit: 10,
+            scope: None,
+            search_content: false,
+        };
+        execute_suggest(index, text, &request, &AtomicBool::new(false)).unwrap()
+    }
+
     #[test]
-    fn an_empty_result_carries_a_suggestion() {
+    fn an_empty_result_answers_at_once_and_the_suggestion_comes_apart() {
         use crate::model::SuggestionKind;
         let ix = sample();
         let no = AtomicBool::new(false);
-        // `فاتورة` typed with the English layout active, plus a filter kept as is.
-        let s = match name_search(Some(Arc::clone(&ix)), "thj,vm ext:pdf", 10, None, &no) {
-            SearchOutcome::Hits {
-                items, suggestion, ..
-            } => {
-                assert!(items.is_empty());
-                suggestion.expect("a layout suggestion")
-            }
-            other => panic!("{other:?}"),
-        };
+        // `فاتورة` typed with the English layout active, plus a filter kept as is: the search
+        // itself is just empty.
+        let text = "thj,vm ext:pdf";
+        assert!(matches!(
+            name_search(Some(Arc::clone(&ix)), text, 10, None, &no),
+            SearchOutcome::Hits { ref items, .. } if items.is_empty()
+        ));
+        let s = name_suggest(Some(Arc::clone(&ix)), text).expect("a layout suggestion");
         assert_eq!(s.kind, SuggestionKind::Layout);
         assert_eq!(s.query, "فاتورة ext:pdf");
         assert_eq!(s.count, 1);
         // A typo: the fuzzy rewrite.
-        match name_search(Some(Arc::clone(&ix)), "فتورة", 10, None, &no) {
-            SearchOutcome::Hits {
-                items, suggestion, ..
-            } => {
-                assert!(items.is_empty());
-                let s = suggestion.expect("a fuzzy suggestion");
-                assert_eq!(
-                    (s.kind, s.query.as_str()),
-                    (SuggestionKind::Fuzzy, "fuzzy: فتورة")
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-        // Nothing close: no suggestion.
-        assert!(matches!(
-            name_search(Some(ix), "zzzzqqqq", 10, None, &no),
-            SearchOutcome::Hits {
-                suggestion: None,
-                ..
-            }
-        ));
+        let s = name_suggest(Some(Arc::clone(&ix)), "فتورة").expect("a fuzzy suggestion");
+        assert_eq!(
+            (s.kind, s.query.as_str()),
+            (SuggestionKind::Fuzzy, "fuzzy: فتورة")
+        );
+        // Nothing close, nothing to suggest for, or no index: no suggestion.
+        assert_eq!(name_suggest(Some(Arc::clone(&ix)), "zzzzqqqq"), None);
+        assert_eq!(name_suggest(Some(Arc::clone(&ix)), "   "), None);
+        assert_eq!(name_suggest(Some(Arc::clone(&ix)), "szie:1 thj,vm"), None);
+        assert_eq!(name_suggest(Some(Arc::clone(&ix)), "content:thj,vm"), None);
+        assert_eq!(name_suggest(None, "thj,vm"), None);
+        // Cancelled like a search.
+        let request = SearchRequest {
+            limit: 10,
+            scope: None,
+            search_content: false,
+        };
+        assert_eq!(
+            execute_suggest(Some(ix), "فتورة", &request, &AtomicBool::new(true)),
+            Err(SearchFailure::Cancelled)
+        );
     }
 
     #[test]

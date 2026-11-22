@@ -244,6 +244,7 @@ name = "athrix-content-index"
 version = "0.0.1"
 dependencies = [
  "athrix-text-ar",
+ "proptest",
  "tantivy",
  "tempfile",
  "thiserror 2.0.21",
@@ -283,6 +284,7 @@ dependencies = [
  "athrix-daemon",
  "athrix-extract",
  "athrix-fs-index",
+ "athrix-ntfs",
  "athrix-query",
  "athrix-ranking",
  "athrix-store",
@@ -390,6 +392,7 @@ name = "athrix-text-ar"
 version = "0.0.1"
 dependencies = [
  "nass",
+ "proptest",
 ]
 
 [[package]]

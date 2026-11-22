@@ -25,8 +25,9 @@ const USAGE: &str = "usage:
       --no-default-excludes is given.
   athrix search <SNAPSHOT> <QUERY>... [--limit N]
       load a snapshot written by `index --save` and print the matching paths
-  athrix bench names <SNAPSHOT> [--rounds N] [--limit N]
+  athrix bench names <SNAPSHOT> [--rounds N] [--limit N] [--query TEXT]...
       load a snapshot (read only) and time realistic typing, keystroke by keystroke
+      (--query: type these texts instead of the built-in list)
   athrix bench content <ROOT>... --index-dir DIR [--max-files N] [--max-bytes N]
                [--names SNAPSHOT] [--rounds N] [--reuse]
       extract documents under the roots into a scratch content index, then time content

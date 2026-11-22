@@ -7,7 +7,8 @@
 //! - [`query`]: query compilation, error mapping, UTF-16 highlights;
 //! - [`results`]: running a search (optionally scoped to a drive) and building result rows;
 //! - [`preview`]: previews for the preview pane and the scheme serving previewed images;
-//! - [`suggest`]: the "did you mean…" rewrite offered when a search finds nothing;
+//! - [`suggest`]: the "did you mean…" rewrite offered when a search finds nothing (asked
+//!   separately, `search_suggest`);
 //! - [`roots`]: which drives / folders are indexed, persisted for the next start;
 //! - [`volumes`]: the drives of this computer;
 //! - [`state`]: state shared by the commands;
@@ -21,6 +22,7 @@
 
 pub mod commands;
 pub mod content;
+pub mod drives;
 pub mod indexing;
 pub mod launch_args;
 pub mod library;
@@ -145,7 +147,10 @@ pub fn run() {
             commands::list_volumes,
             commands::get_index_roots,
             commands::set_index_roots,
+            drives::get_drive_settings,
+            drives::set_drive_settings,
             commands::search,
+            commands::search_suggest,
             commands::open_entry,
             commands::reveal_entry,
             commands::entry_path,

@@ -71,7 +71,7 @@ use crate::indexing::{GENERATION_MASK, IndexObserver, IndexView};
 use crate::model::{ContentSnippet, ContentState, ContentStatus, PauseReason, RowSnippet};
 use crate::query::{CompiledQuery, utf16_offset};
 use crate::results::{SearchFailure, SearchHits, SearchScope, build_row, decode_id, search_ids};
-use crate::roots::path_key;
+use crate::roots::{key_has_prefix, path_key};
 
 /// Folder of the content index inside the app data folder.
 pub const CONTENT_DIR: &str = "content";
@@ -228,6 +228,9 @@ pub struct ContentService {
     snippet_query: Mutex<Option<SnippetQuery>>,
     sink: SinkSlot,
     emit: Mutex<EmitState>,
+    /// Roots of the name index whose drive is unplugged (task 2.5): held in the scheduler, and
+    /// their documents are kept by the start-up prune.
+    offline: RwLock<Vec<PathBuf>>,
 }
 
 impl ContentService {
@@ -252,6 +255,7 @@ impl ContentService {
             snippet_query: Mutex::new(None),
             sink: SinkSlot::default(),
             emit: Mutex::new(EmitState::default()),
+            offline: RwLock::new(Vec::new()),
         })
     }
 
@@ -488,6 +492,7 @@ impl ContentService {
         match builder.start() {
             Ok(s) => {
                 let s = Arc::new(s);
+                s.hold(&self.offline.read().unwrap_or_else(PoisonError::into_inner));
                 *self
                     .scheduler
                     .write()
@@ -551,17 +556,29 @@ impl ContentService {
         self.lookup_for(view);
     }
 
-    /// Deletes the content documents whose file is not in `view` and commits.
+    /// Deletes the content documents whose file is not in `view` and commits. Documents on a
+    /// drive that is not plugged in (an offline root, or a drive letter that does not exist
+    /// now) are kept: they cannot be checked, and come back with their drive.
     fn prune(&self, view: &IndexView) {
         let Some(index) = self.ensure_index() else {
             return;
         };
         let lookup = self.lookup_for(view);
         let mut delta = None;
+        let offline: Vec<String> = self
+            .offline
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|r| path_key(r))
+            .collect();
+        let mut drives: HashMap<u8, bool> = HashMap::new();
         let started = Instant::now();
         let removed = index.retain(|path, _| {
-            self.find_file(view, &lookup, &mut delta, &path_key(Path::new(path)))
-                .is_some()
+            let key = path_key(Path::new(path));
+            offline.iter().any(|o| key_has_prefix(&key, o))
+                || !drive_present(path, &mut drives)
+                || self.find_file(view, &lookup, &mut delta, &key).is_some()
         });
         match removed.and_then(|n| index.commit().map(|()| n)) {
             Ok(removed) => tracing::info!(
@@ -603,6 +620,62 @@ impl ContentService {
             // again through `base_ready`.
             let _ = s.watch_batch(batch);
         }
+    }
+
+    /// The roots whose drive is unplugged are now `offline`: their pending work is dropped and
+    /// held (see [`ContentScheduler::hold`]); their documents stay.
+    fn set_offline(&self, offline: &[PathBuf]) {
+        *self.offline.write().unwrap_or_else(PoisonError::into_inner) = offline.to_vec();
+        if let Some(s) = self.scheduler() {
+            let dropped = s.hold(offline);
+            if dropped > 0 {
+                tracing::info!(dropped, "content work on unplugged drives dropped");
+            }
+        }
+    }
+
+    /// The user removed `removed` from the indexed folders: deletes their documents (except
+    /// under a folder of `kept` that lies inside one of them) and drops their pending work.
+    /// Blocks while deleting; call it off the UI thread.
+    pub fn forget_roots(&self, removed: &[PathBuf], kept: &[PathBuf]) {
+        if removed.is_empty() {
+            return;
+        }
+        if let Some(s) = self.scheduler() {
+            s.forget(removed);
+        }
+        let Some(index) = self.ensure_index() else {
+            return;
+        };
+        let kept_keys: Vec<String> = kept.iter().map(|k| path_key(k)).collect();
+        let mut deleted = 0u64;
+        let mut result = Ok(());
+        for root in removed {
+            let rkey = path_key(root);
+            let nested: Vec<&String> = kept_keys
+                .iter()
+                .filter(|k| key_has_prefix(k, &rkey))
+                .collect();
+            let step = if nested.is_empty() {
+                index.delete_prefix(&root.to_string_lossy())
+            } else {
+                index.retain(|path, _| {
+                    let key = path_key(Path::new(path));
+                    !key_has_prefix(&key, &rkey) || nested.iter().any(|k| key_has_prefix(&key, k))
+                })
+            };
+            match step {
+                Ok(n) => deleted += n,
+                Err(e) => result = Err(e),
+            }
+        }
+        match result.and_then(|()| index.commit()) {
+            Ok(()) => {
+                tracing::info!(deleted, roots = ?removed, "content of removed folders deleted")
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot delete the content of removed folders"),
+        }
+        self.notify(None);
     }
 
     /// Pauses content indexing at the user's request.
@@ -856,6 +929,23 @@ impl IndexObserver for ContentService {
     fn files_changed(&self, batch: &WatchBatch) {
         self.forward_batch(batch);
     }
+
+    fn roots_offline(&self, offline: &[PathBuf]) {
+        self.set_offline(offline);
+    }
+}
+
+/// False if `path` is on a drive letter that does not exist now (Windows; `cache` remembers
+/// each letter). Other paths count as present.
+fn drive_present(path: &str, cache: &mut HashMap<u8, bool>) -> bool {
+    let b = path.as_bytes();
+    if b.len() < 2 || b[1] != b':' || !b[0].is_ascii_alphabetic() {
+        return true;
+    }
+    let letter = b[0].to_ascii_uppercase();
+    *cache
+        .entry(letter)
+        .or_insert_with(|| Path::new(&format!("{}:\\", char::from(letter))).exists())
 }
 
 /// Converts a content-index snippet (byte ranges) to the UI's (UTF-16 ranges).

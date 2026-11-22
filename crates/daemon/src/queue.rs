@@ -181,6 +181,20 @@ impl JobQueue {
         found
     }
 
+    /// Drops the queued jobs whose key `drop` accepts. Returns how many were dropped.
+    pub(crate) fn remove_where(&mut self, drop: impl Fn(&str) -> bool) -> usize {
+        let before = self.live.len();
+        self.live.retain(|k, _| !drop(k));
+        let removed = before - self.live.len();
+        if removed > 0 {
+            // Their heap items are skipped when popped (no live entry); rebuild if mostly stale.
+            if self.heap.len() > 2 * self.live.len() + 1024 {
+                self.rebuild();
+            }
+        }
+        removed
+    }
+
     fn rebuild(&mut self) {
         self.heap = self
             .live
@@ -292,6 +306,20 @@ mod tests {
         assert_eq!(k, "/b");
         assert!(q.pop_where(|k| k == "/a").is_none());
         assert_eq!(drain(&mut q), ["/a"]);
+    }
+
+    #[test]
+    fn removed_jobs_are_never_popped() {
+        let p = Prioritizer::new(Vec::new());
+        let mut q = JobQueue::default();
+        for k in ["/usb/a", "/usb/b", "/disk/c"] {
+            let j = cand(k, 1, 1);
+            let pr = p.priority(&j, Source::Backlog, NOW);
+            q.push(k, j, pr);
+        }
+        assert_eq!(q.remove_where(|k| k.starts_with("/usb/")), 2);
+        assert_eq!(q.len(), 1);
+        assert_eq!(drain(&mut q), ["/disk/c"]);
     }
 
     #[test]

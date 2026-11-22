@@ -104,7 +104,10 @@ export function NoResults(props: {
   /** Searching one drive or folder only: offer the whole computer. */
   scoped?: boolean;
   onClearScope?: () => void;
-  /** A rewrite of the query that finds results (from `SearchResponse.suggestion`). */
+  /**
+   * A rewrite of the query that finds results (`search_suggest`, asked shortly after the empty
+   * result; null until it answers, so the other offers show meanwhile).
+   */
   suggestion?: DidYouMean | null;
   onSuggestion?: (text: string) => void;
   /** Plain words do not search file contents yet: offer to (design §9.3 "no results"). */

@@ -1,6 +1,7 @@
-import { createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { UsbIcon } from "./icons";
 import { t, type MessageKey } from "../i18n";
-import { api, errorMessage, type Volume } from "../lib/api";
+import { api, errorMessage, onVolumesChanged, type IndexRoots, type Volume } from "../lib/api";
 import { rootKey, rootName } from "../lib/scope";
 
 export type DrivePickerHandle = {
@@ -21,8 +22,11 @@ type Props = {
   labelledBy?: string;
 };
 
-/** A row of the picker: a drive, or an indexed folder that is not a drive. */
-type Row = { path: string; name: string; detail: string };
+/**
+ * A row of the picker: a drive, or an indexed folder that is not a drive. `offline`: an indexed
+ * root whose drive is unplugged (kept, indexed again when it is back).
+ */
+type Row = { path: string; name: string; detail: string; removable: boolean; offline: boolean };
 
 const sameSet = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
 
@@ -46,21 +50,37 @@ export default function DrivePicker(props: Props) {
 
   const kindLabel = (v: Volume) => t(`drives.kind.${v.kind}` as MessageKey);
 
+  /** The rows for these volumes and indexed roots. */
+  function buildRows(volumes: Volume[], current: IndexRoots): Row[] {
+    const offline = new Set((current.offline ?? []).map(rootKey));
+    const list: Row[] = volumes.map((v) => ({
+      path: v.path,
+      name: v.name,
+      detail: v.label ? `${v.label} · ${kindLabel(v)}` : kindLabel(v),
+      removable: v.kind === "removable",
+      offline: false,
+    }));
+    // Indexed folders that are not drives, and indexed drives that are unplugged, stay visible.
+    for (const r of current.roots) {
+      if (list.some((x) => rootKey(x.path) === rootKey(r))) continue;
+      const gone = offline.has(rootKey(r));
+      list.push({
+        path: r,
+        name: rootName(r),
+        detail: gone ? t("drives.offline") : t("drives.folder"),
+        removable: false,
+        offline: gone,
+      });
+    }
+    return list;
+  }
+
   async function load() {
     setLoading(true);
     try {
       const [volumes, current] = await Promise.all([api.listVolumes(), api.getIndexRoots()]);
-      const list: Row[] = volumes.map((v) => ({
-        path: v.path,
-        name: v.name,
-        detail: v.label ? `${v.label} · ${kindLabel(v)}` : kindLabel(v),
-      }));
-      // Indexed folders that are not drives (or drives no longer present) stay visible.
-      for (const r of current.roots) {
-        if (!list.some((x) => rootKey(x.path) === rootKey(r))) list.push({ path: r, name: rootName(r), detail: t("drives.folder") });
-      }
       const keys = new Set(current.roots.map(rootKey));
-      setRows(list);
+      setRows(buildRows(volumes, current));
       setWhole(current.wholeComputer);
       setChecked(keys);
       setSavedChoice({ whole: current.wholeComputer, keys });
@@ -76,6 +96,24 @@ export default function DrivePicker(props: Props) {
     }
   }
   onMount(load);
+
+  // A drive plugged in or pulled out: refresh the rows, keeping what the user is choosing.
+  onMount(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void onVolumesChanged((volumes) => {
+      if (loading()) return;
+      api.getIndexRoots().then((current) => {
+        if (disposed) return;
+        setRows(buildRows(volumes, current));
+        if (savedChoice().whole) setWholeRoots(new Set(current.roots.map(rootKey)));
+      }, () => {});
+    }).then((un) => (disposed ? un() : (stop = un)));
+    onCleanup(() => {
+      disposed = true;
+      stop?.();
+    });
+  });
 
   function flip(key: string, on: boolean) {
     const next = new Set(checked());
@@ -132,7 +170,7 @@ export default function DrivePicker(props: Props) {
           <For each={rows()}>
             {(row) => (
               <li>
-                <label class="drives-row" classList={{ disabled: whole() }}>
+                <label class="drives-row" classList={{ disabled: whole(), offline: row.offline }}>
                   <input
                     type="checkbox"
                     disabled={whole()}
@@ -140,6 +178,11 @@ export default function DrivePicker(props: Props) {
                     onChange={(e) => flip(rootKey(row.path), e.currentTarget.checked)}
                   />
                   <bdi class="drives-name" dir="ltr">{row.name}</bdi>
+                  <Show when={row.removable}>
+                    <span class="drives-usb" title={t("drives.kind.removable")}>
+                      <UsbIcon />
+                    </span>
+                  </Show>
                   <span class="drives-detail">{row.detail}</span>
                 </label>
               </li>

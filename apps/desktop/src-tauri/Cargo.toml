@@ -23,6 +23,8 @@ athrix-core.workspace = true
 athrix-daemon.workspace = true
 athrix-extract.workspace = true
 athrix-fs-index.workspace = true
+# Drive-letter probe (serial numbers) for noticing USB drives plugged in / removed.
+athrix-ntfs.workspace = true
 athrix-query.workspace = true
 athrix-ranking.workspace = true
 athrix-store.workspace = true

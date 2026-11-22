@@ -28,12 +28,19 @@ pub struct IndexStatus {
     /// Entries in the index searches currently use (0 until the first walk finishes or a
     /// snapshot is loaded).
     pub entries: u64,
-    /// The roots being indexed (or last indexed).
+    /// The roots being indexed (or last indexed) that are available now (offline ones are in
+    /// `offline` instead). A search scope should be one of these.
     pub roots: Vec<String>,
     /// Duration of the last completed walk.
     pub elapsed_ms: Option<u64>,
     /// English message when `state` is `error`.
     pub error: Option<String>,
+    /// Indexed roots whose drive is unplugged now: their entries are hidden until it returns
+    /// (task 2.5).
+    pub offline: Vec<String>,
+    /// The roots being walked right now (all of them for a full indexing, only the new or
+    /// returning drives for an incremental one); empty when not indexing.
+    pub scanning: Vec<String>,
 }
 
 impl Default for IndexStatus {
@@ -44,6 +51,8 @@ impl Default for IndexStatus {
             roots: Vec::new(),
             elapsed_ms: None,
             error: None,
+            offline: Vec::new(),
+            scanning: Vec::new(),
         }
     }
 }
@@ -209,9 +218,19 @@ pub struct SearchResponse {
     pub error: Option<QueryError>,
     /// Set when a newer request cancelled this one (`items` is then empty).
     pub cancelled: bool,
-    /// "Did you mean…": set only when a valid query found nothing and a rewrite of it does
-    /// find something (see [`crate::suggest`]).
+}
+
+/// Response of the `search_suggest` command, asked after a `search` found nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestResponse {
+    /// Echo of the request's `requestId`.
+    pub request_id: u64,
+    /// "Did you mean…": a rewrite of the query that finds something, if any (see
+    /// [`crate::suggest`]).
     pub suggestion: Option<SearchSuggestion>,
+    /// Set when a newer request cancelled this one (`suggestion` is then `None`).
+    pub cancelled: bool,
 }
 
 /// How a [`SearchSuggestion`] rewrote the query.
@@ -382,13 +401,15 @@ mod tests {
             roots: vec!["C:\\Users\\me".into()],
             elapsed_ms: Some(12),
             error: None,
+            offline: vec!["E:\\".into()],
+            scanning: Vec::new(),
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
                 "state": "ready", "entries": 3, "roots": ["C:\\Users\\me"],
-                "elapsedMs": 12, "error": null
+                "elapsedMs": 12, "error": null, "offline": ["E:\\"], "scanning": []
             })
         );
         let item = ResultItem {

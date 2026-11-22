@@ -47,6 +47,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # athrix-content-index: 0.26+ needs a newer Rust than the 1.85 MSRV. No zstd (C build): lz4 doc store.
 tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
 tempfile = "3"
+# Property tests (dev only). 1.11 declares rust-version 1.85.
+proptest = "1.11.0"
 # athrix-extract: pure-Rust parsers only (no C builds)
 zip = { version = "7.3", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 quick-xml = "0.38"

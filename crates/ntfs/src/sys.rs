@@ -11,7 +11,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetDriveTypeW, GetVolumeInformationW, OPEN_EXISTING, ReadFile,
+    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, OPEN_EXISTING, ReadFile,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -161,6 +161,38 @@ pub(crate) fn drive_type(root: &str) -> u32 {
     let root = wide(root);
     // SAFETY: `root` is a NUL-terminated UTF-16 string valid for the call.
     unsafe { GetDriveTypeW(root.as_ptr()) }
+}
+
+/// `GetLogicalDrives`: bit `n` set = drive letter `A + n` exists. One cheap call, no disk I/O.
+pub(crate) fn logical_drives() -> u32 {
+    // SAFETY: takes no arguments and only reads process-independent state.
+    unsafe { GetLogicalDrives() }
+}
+
+/// Volume serial number of a root such as `E:\` (`GetVolumeInformationW`). Fails fast with
+/// "device not ready" for an empty card-reader slot.
+pub(crate) fn volume_serial(root: &str) -> io::Result<u32> {
+    let root = wide(root);
+    let mut serial = 0u32;
+    // SAFETY: `root` is NUL-terminated; `serial` is a valid out-pointer; the other buffers and
+    // out-parameters are optional and passed as null with size 0.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(serial)
+    }
 }
 
 /// File-system name (`NTFS`, `FAT32`, `exFAT`, `ReFS`, ...) of a root such as `C:\`.

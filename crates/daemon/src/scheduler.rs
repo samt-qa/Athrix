@@ -13,7 +13,9 @@ use athrix_content_index::{ContentIndex, FileMeta};
 use athrix_extract::Kind;
 use athrix_fs_index::{Change, IndexSnapshot, WatchBatch};
 
-use crate::candidate::{Candidate, CandidateFilter, default_priority_folders, path_key};
+use crate::candidate::{
+    Candidate, CandidateFilter, default_priority_folders, path_key, starts_with_ci,
+};
 use crate::extractor::{ExtractFailure, Extractor, InProcessExtractor};
 use crate::probe::{DefaultProbe, SystemProbe};
 use crate::progress::{FailureCounts, FailureKind, PauseReasons, Progress, RunState};
@@ -153,9 +155,22 @@ struct State {
     counters: Counters,
     error_streak: u32,
     docs_per_sec: f64,
+    /// Folders on hold (drives unplugged): no work under them, see [`ContentScheduler::hold`].
+    held: Vec<PathBuf>,
 }
 
 impl State {
+    fn is_held(&self, key: &str) -> bool {
+        !self.held.is_empty() && self.held.iter().any(|h| starts_with_ci(Path::new(key), h))
+    }
+
+    /// Drops the queued jobs `drop` accepts; returns how many.
+    fn drop_queued(&mut self, drop: impl Fn(&str) -> bool) -> usize {
+        let n = self.queue.remove_where(drop);
+        self.outstanding = self.outstanding.saturating_sub(n as u64);
+        n
+    }
+
     fn is_idle(&self) -> bool {
         self.outstanding == 0 && self.uncommitted == 0
     }
@@ -265,6 +280,9 @@ impl Shared {
         let mut st = self.lock();
         let n = jobs.len();
         for ((key, job), prio) in jobs.into_iter().zip(prios) {
+            if st.is_held(&key) {
+                continue;
+            }
             if matches!(job, Job::Index(_)) {
                 st.known.insert(key.clone());
             }
@@ -413,6 +431,7 @@ impl ContentScheduler {
             counters: Counters::default(),
             error_streak: 0,
             docs_per_sec: 0.0,
+            held: Vec::new(),
         };
         let shared = Arc::new(Shared {
             index: b.index,
@@ -569,6 +588,36 @@ impl ContentScheduler {
             }
             WatchBatch::RescanNeeded(_) => false,
         }
+    }
+
+    /// Puts the folders `prefixes` on hold (replacing the previous set), for drives that were
+    /// unplugged: their queued jobs are dropped, nothing under them is queued or started until
+    /// they are released (a later call without them), and the documents already indexed stay
+    /// as they are (a missing file under a held folder is never taken as deleted). Returns the
+    /// number of queued jobs dropped.
+    pub fn hold(&self, prefixes: &[PathBuf]) -> usize {
+        let mut st = self.shared.lock();
+        st.held = prefixes.to_vec();
+        let held = st.held.clone();
+        let n = st.drop_queued(|k| held.iter().any(|h| starts_with_ci(Path::new(k), h)));
+        if st.is_idle() {
+            self.shared.idle_cv.notify_all();
+        }
+        n
+    }
+
+    /// Drops the queued jobs under `prefixes` (folders no longer indexed at all) and forgets
+    /// the files this session saw there. Documents already in the index are not touched (the
+    /// caller deletes them). Returns the number of queued jobs dropped.
+    pub fn forget(&self, prefixes: &[PathBuf]) -> usize {
+        let mut st = self.shared.lock();
+        let n = st.drop_queued(|k| prefixes.iter().any(|h| starts_with_ci(Path::new(k), h)));
+        st.known
+            .retain(|k| !prefixes.iter().any(|h| starts_with_ci(Path::new(k), h)));
+        if st.is_idle() {
+            self.shared.idle_cv.notify_all();
+        }
+        n
     }
 
     /// Pauses: workers finish the file in hand and take no new one; pending changes are
@@ -739,6 +788,11 @@ fn worker_loop(sh: &Shared, tx: &SyncSender<WriterMsg>) {
 }
 
 fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
+    if sh.lock().is_held(&key) {
+        // Put on hold after it was queued (its drive was just unplugged): skip, keep the doc.
+        sh.finish(&key, true);
+        return;
+    }
     match job {
         Job::Index(c) => index_file(sh, tx, key, c),
         Job::Delete(_) => delete_subtree(sh, tx, key),

@@ -723,7 +723,9 @@ impl Node {
             Node::Name(m) => m.matches(e.name),
             Node::CaseSensitive(f) => f.find(e.ix.name(e.id).as_bytes()).is_some(),
             Node::WholeWord(f) => find_words(e.name, f, None),
-            Node::Fuzzy(m) => m.score(e.name, e.ix.name(e.id), &mut s.fuzzy).is_some(),
+            Node::Fuzzy(m) => m
+                .score_at_least(e.name, e.ix.name(e.id), &mut s.fuzzy, 0)
+                .is_some(),
             Node::Ext(exts) => {
                 if e.ix.meta(e.id).is_dir {
                     return false;
@@ -782,8 +784,50 @@ impl Node {
         }
     }
 
-    /// The score of an entry that matches (see the module docs, "Ranking"). Only meaningful
-    /// when [`Node::eval`] returned true for the entry.
+    /// [`Node::eval`] and the rank score in one pass: `Some(score)` if the entry matches with
+    /// `score >= floor` (see the module docs, "Ranking"), else `None`. A ranked scan passes the
+    /// score it already has enough results at or above, so fuzzy terms skip the tiers that
+    /// cannot reach it; `floor = 0` is exactly "matches, and its score".
+    pub(crate) fn eval_score(&self, e: &Entry<'_>, s: &mut Scratch, floor: u32) -> Option<u32> {
+        match self {
+            Node::Fuzzy(m) => m.score_at_least(e.name, e.ix.name(e.id), &mut s.fuzzy, floor),
+            Node::And(xs) => {
+                // The score is the sum of the ranked children's scores; with one ranked child
+                // it is that child's score, so the floor applies to it directly.
+                let ranked = xs.iter().filter(|x| x.is_ranked()).count();
+                let child_floor = if ranked == 1 { floor } else { 0 };
+                let mut total = 0u32;
+                for x in xs {
+                    if x.is_ranked() {
+                        total = total.saturating_add(x.eval_score(e, s, child_floor)?);
+                    } else if !x.eval(e, s) {
+                        return None;
+                    }
+                }
+                (total >= floor).then_some(total)
+            }
+            Node::Or(xs) => {
+                // The score is the best ranked child that matches (0 if only unranked ones
+                // do). A child scoring below the floor cannot lift the result above it.
+                let mut best: Option<u32> = None;
+                let mut matched = false;
+                for x in xs {
+                    if x.is_ranked() {
+                        if let Some(v) = x.eval_score(e, s, floor) {
+                            best = Some(best.map_or(v, |b| b.max(v)));
+                        }
+                    } else if floor == 0 && !matched && best.is_none() {
+                        matched = x.eval(e, s);
+                    }
+                }
+                best.or_else(|| matched.then_some(0))
+            }
+            _ => (floor == 0 && self.eval(e, s)).then_some(0),
+        }
+    }
+
+    /// The score of an entry that matches, the two-pass way (reference for `eval_score`).
+    #[cfg(test)]
     pub(crate) fn score(&self, e: &Entry<'_>, s: &mut Scratch) -> u32 {
         match self {
             Node::Fuzzy(m) => m.score(e.name, e.ix.name(e.id), &mut s.fuzzy).unwrap_or(0),

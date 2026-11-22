@@ -25,6 +25,7 @@
 //! [`NtfsError::Unsupported`].
 
 mod bytes;
+pub mod drives;
 mod error;
 pub mod journal;
 pub mod mft;

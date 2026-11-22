@@ -1,6 +1,6 @@
 import { createSignal, For, Match, onCleanup, onMount, Show, Switch, type JSX } from "solid-js";
 import { locale, t, type MessageKey } from "../i18n";
-import { api, errorMessage, onContentStatus, usingMock, type AppInfo, type ContentStatus } from "../lib/api";
+import { api, errorMessage, onContentStatus, usingMock, type AppInfo, type ContentStatus, type DriveSettings } from "../lib/api";
 import { formatCount } from "../lib/format";
 import { clearHistory, historyEnabled, setHistoryEnabled } from "../lib/library";
 import { searchContent, setSearchContent } from "../lib/searchContent";
@@ -96,6 +96,25 @@ export default function SettingsDialog(props: Props) {
     e.preventDefault();
     setSection(SECTIONS[next]);
     tabs[next]?.focus();
+  }
+
+  // ---- external drives in "the whole computer" (task 2.5) ----
+  const [drives, setDrives] = createSignal<DriveSettings | null>(null);
+  const [drivesBusy, setDrivesBusy] = createSignal(false);
+  onMount(() => {
+    api.getDriveSettings().then(setDrives, (err) => console.warn("drive settings unavailable", err));
+  });
+  async function changeDrives(change: Partial<DriveSettings>) {
+    const current = drives();
+    if (!current) return;
+    setDrivesBusy(true);
+    try {
+      setDrives(await api.setDriveSettings({ ...current, ...change }));
+    } catch (err) {
+      props.onNotice(t("drives.failed", { message: errorMessage(err) }));
+    } finally {
+      setDrivesBusy(false);
+    }
   }
 
   // ---- content indexing (live while the dialog is open) ----
@@ -246,6 +265,28 @@ export default function SettingsDialog(props: Props) {
                   labelledBy="set-drives"
                   onError={(message) => props.onNotice(t("drives.failed", { message }))}
                 />
+              </Section>
+              <Section id="set-external" title={t("drives.externalTitle")}>
+                <Show when={drives()} fallback={<p class="settings-hint">{t("drives.loading")}</p>}>
+                  {(d) => (
+                    <>
+                      <SwitchRow
+                        checked={d().includeRemovable}
+                        disabled={drivesBusy()}
+                        onChange={(on) => void changeDrives({ includeRemovable: on })}
+                        label={t("drives.includeRemovable")}
+                        hint={t("drives.includeRemovableHint")}
+                      />
+                      <SwitchRow
+                        checked={d().includeNetwork}
+                        disabled={drivesBusy()}
+                        onChange={(on) => void changeDrives({ includeNetwork: on })}
+                        label={t("drives.includeNetwork")}
+                        hint={t("drives.includeNetworkHint")}
+                      />
+                    </>
+                  )}
+                </Show>
               </Section>
               <Section id="set-content" title={t("content.title")}>
                 <Show when={content()} fallback={<p class="settings-hint">{t("settings.contentUnavailable")}</p>}>

@@ -60,6 +60,10 @@ const CONSECUTIVE: i32 = 8;
 const GAP_OPEN: i32 = 3;
 const GAP_EXTEND: i32 = 2;
 const NEG: i32 = i32::MIN / 4;
+/// Most one more subsequence character can add: a consecutive match (a character right after
+/// another term character is never at a word start), or a word-start match after a gap.
+const MAX_STEP: i32 = MATCH + CONSECUTIVE;
+const _: () = assert!(BOUNDARY - GAP_OPEN <= CONSECUTIVE);
 
 const TIER_EXACT: u32 = 7;
 const TIER_PREFIX: u32 = 6;
@@ -69,6 +73,11 @@ const TIER_ACRONYM: u32 = 3;
 const TIER_ONE_TYPO: u32 = 2;
 const TIER_SUBSEQUENCE: u32 = 1;
 const TIER_TWO_TYPOS: u32 = 0;
+
+/// Largest `detail` [`pack`] keeps.
+const MAX_DETAIL: u32 = 0xFFFF;
+/// Largest acronym `detail` (see [`FuzzyMatcher::acronym`]).
+const MAX_ACRONYM_DETAIL: u32 = 3;
 
 /// A compiled fuzzy term.
 #[derive(Debug, Clone)]
@@ -83,6 +92,8 @@ pub(crate) struct FuzzyMatcher {
     max_typos: u32,
     /// Bit-parallel pattern table for the whole term (spaces included).
     peq: Peq,
+    /// Pattern table for `compact` (the acronym prefilters' shift-and).
+    compact_peq: Peq,
 }
 
 /// `PM[c]`: bit `i` is set when term character `i` is `c`.
@@ -134,6 +145,7 @@ pub(crate) struct FuzzyBuf {
     dp: Vec<i32>,
     initials: Vec<Initial>,
     norm: String,
+    chars: Vec<(usize, char)>,
 }
 
 /// A word initial: the character, an alternative (after `ال`) and where both are.
@@ -151,7 +163,7 @@ enum Coords {
 }
 
 fn pack(tier: u32, detail: u32, name_len: usize) -> u32 {
-    (tier << 24) | (detail.min(0xFFFF) << 8) | (255 - name_len.min(255) as u32)
+    (tier << 24) | (detail.min(MAX_DETAIL) << 8) | (255 - name_len.min(255) as u32)
 }
 
 fn is_word_start(name: &[u8], i: usize) -> bool {
@@ -177,6 +189,7 @@ impl FuzzyMatcher {
             needle: normalized.into(),
             finder: memmem::Finder::new(normalized.as_bytes()).into_owned(),
             peq: Peq::new(if fuzzy { &chars } else { &[] }),
+            compact_peq: Peq::new(&compact),
             compact,
             max_typos,
         }
@@ -184,15 +197,31 @@ impl FuzzyMatcher {
 
     /// The score of `name` (normalized) whose original is `original`, or `None` if it does
     /// not match.
+    #[cfg(test)]
     pub(crate) fn score(&self, name: &str, original: &str, buf: &mut FuzzyBuf) -> Option<u32> {
-        self.matches(name, original, buf, false).map(|(s, _)| s)
+        self.score_at_least(name, original, buf, 0)
+    }
+
+    /// [`FuzzyMatcher::score`] for a ranked scan that already holds enough results scoring at
+    /// least `floor`: `None` also when the score would be below `floor`, and tiers that cannot
+    /// reach `floor` are not tried (`floor = 0` gives the plain score). Exact: `Some(s)` iff
+    /// the name matches with score `s >= floor`.
+    pub(crate) fn score_at_least(
+        &self,
+        name: &str,
+        original: &str,
+        buf: &mut FuzzyBuf,
+        floor: u32,
+    ) -> Option<u32> {
+        self.matches(name, original, buf, false, floor)
+            .map(|(s, _)| s)
     }
 
     /// Byte ranges of the ORIGINAL name that the term matched, sorted (possibly overlapping).
     pub(crate) fn highlights(&self, original: &str) -> Vec<Range<usize>> {
         let map = athrix_text_ar::normalize_name_with_map(original);
         let mut buf = FuzzyBuf::default();
-        match self.matches(&map.text, original, &mut buf, true) {
+        match self.matches(&map.text, original, &mut buf, true, 0) {
             Some((_, Some(Coords::Original(r)))) => r,
             Some((_, Some(Coords::Normalized(r)))) => {
                 r.into_iter().filter_map(|r| map.source_range(r)).collect()
@@ -201,15 +230,24 @@ impl FuzzyMatcher {
         }
     }
 
+    /// The first tier that matches, best first: `(score, highlight ranges if wanted)`. With
+    /// `floor > 0`, gives up (`None`) as soon as the remaining tiers cannot score `floor`.
     fn matches(
         &self,
         name: &str,
         original: &str,
         buf: &mut FuzzyBuf,
         want_ranges: bool,
+        floor: u32,
     ) -> Option<(u32, Option<Coords>)> {
         let bytes = name.as_bytes();
         let n = self.needle.len();
+        let len = name.len();
+        // Best possible score of each remaining tier for this name, against `floor`.
+        let reachable = |tier, max_detail| pack(tier, max_detail, len) >= floor;
+        if !reachable(TIER_EXACT, 0) {
+            return None;
+        }
         // Substring tiers.
         if let Some(first) = self.finder.find(bytes) {
             let tier = if first == 0
@@ -218,6 +256,9 @@ impl FuzzyMatcher {
                 TIER_EXACT
             } else if first == 0 {
                 TIER_PREFIX
+            } else if !reachable(TIER_WORD_SUBSTRING, 0) {
+                // Neither substring tier can reach the floor: skip the word-start search.
+                return None;
             } else if self
                 .finder
                 .find_iter(bytes)
@@ -227,12 +268,16 @@ impl FuzzyMatcher {
             } else {
                 TIER_SUBSTRING
             };
+            let score = pack(tier, 0, len);
+            if score < floor {
+                return None;
+            }
             let ranges = want_ranges.then(|| {
                 Coords::Normalized(self.finder.find_iter(bytes).map(|i| i..i + n).collect())
             });
-            return Some((pack(tier, 0, name.len()), ranges));
+            return Some((score, ranges));
         }
-        if self.compact.is_empty() {
+        if self.compact.is_empty() || !reachable(TIER_ACRONYM, MAX_ACRONYM_DETAIL) {
             return None;
         }
         // Acronym initials and subsequences are both ordered subsequences of the normalized
@@ -241,18 +286,36 @@ impl FuzzyMatcher {
         let subsequence = is_subsequence(&self.compact, name);
         // Acronyms.
         if subsequence && self.compact.len() >= 2 {
-            normalized_initials(name, &mut buf.initials);
-            if let Some((detail, hits)) = self.acronym(&buf.initials, want_ranges) {
-                let r = want_ranges.then(|| Coords::Normalized(char_ranges(name, &hits)));
-                return Some((pack(TIER_ACRONYM, detail, name.len()), r));
+            // Shift-and over the initials first: most names have no acronym match, and then
+            // the initials are never collected.
+            if self.normalized_acronym_possible(name) {
+                normalized_initials(name, &mut buf.initials);
+            } else {
+                buf.initials.clear();
             }
-            if has_camel_boundary(original) {
-                original_initials(original, &mut buf.initials, &mut buf.norm);
+            if let Some((detail, hits)) = self.acronym(&buf.initials, want_ranges) {
+                let score = pack(TIER_ACRONYM, detail, len);
+                if score < floor {
+                    return None;
+                }
+                let r = want_ranges.then(|| Coords::Normalized(char_ranges(name, &hits)));
+                return Some((score, r));
+            }
+            if has_camel_boundary(original) && self.original_acronym_possible(original) {
+                original_initials(original, &mut buf.initials, &mut buf.norm, &mut buf.chars);
                 if let Some((detail, hits)) = self.acronym(&buf.initials, want_ranges) {
+                    let score = pack(TIER_ACRONYM, detail, len);
+                    if score < floor {
+                        return None;
+                    }
                     let r = want_ranges.then(|| Coords::Original(char_ranges(original, &hits)));
-                    return Some((pack(TIER_ACRONYM, detail, name.len()), r));
+                    return Some((score, r));
                 }
             }
+        }
+        // Tier 2 is the best typo tier: if it cannot reach the floor, no lower tier can.
+        if !reachable(TIER_ONE_TYPO, 0) {
+            return None;
         }
         let typos = if self.max_typos > 0 && self.few_missing(name) {
             let d = osa_substring_distance(&self.peq, name);
@@ -261,20 +324,35 @@ impl FuzzyMatcher {
             None
         };
         let typo_hit = |tier| {
+            let score = pack(tier, 0, len);
+            if score < floor {
+                return None;
+            }
             let r = want_ranges.then(|| {
                 let chars: Vec<char> = self.needle.chars().collect();
                 let (_, span) = osa_substring_naive(&chars, name);
                 Coords::Normalized(vec![span])
             });
-            Some((pack(tier, 0, name.len()), r))
+            Some((score, r))
         };
         if typos == Some(1) {
             return typo_hit(TIER_ONE_TYPO);
         }
-        if subsequence && self.compact.len() >= 3 {
-            if let Some((s, hits)) = self.subsequence(name, buf, want_ranges) {
+        if subsequence && self.compact.len() >= 3 && reachable(TIER_SUBSEQUENCE, MAX_DETAIL) {
+            // Smallest detail that still scores `floor` (0 when the floor is in a lower tier).
+            let min_detail = if floor >> 24 == TIER_SUBSEQUENCE {
+                let detail = (floor >> 8) & MAX_DETAIL;
+                detail + u32::from(pack(TIER_SUBSEQUENCE, detail, len) < floor)
+            } else {
+                0
+            };
+            if let Some((s, hits)) = self.subsequence(name, buf, want_ranges, min_detail) {
+                let score = pack(TIER_SUBSEQUENCE, s, len);
+                if score < floor {
+                    return None;
+                }
                 let r = want_ranges.then(|| Coords::Normalized(char_ranges(name, &hits)));
-                return Some((pack(TIER_SUBSEQUENCE, s, name.len()), r));
+                return Some((score, r));
             }
         }
         if typos.is_some() {
@@ -303,6 +381,68 @@ impl FuzzyMatcher {
             }
         }
         true
+    }
+
+    /// Shift-and over the word initials of a normalized name: false only if
+    /// [`FuzzyMatcher::acronym`] cannot match [`normalized_initials`] (`compact` has 2..=64
+    /// characters).
+    fn normalized_acronym_possible(&self, name: &str) -> bool {
+        let top = 1u64 << (self.compact.len() - 1);
+        let mut state = 0u64;
+        for (at, word) in words(name) {
+            let Some(c) = word.chars().next() else {
+                continue;
+            };
+            let mut mask = self.compact_peq.get(c);
+            if let Some((a, _)) = article_alt(word, at) {
+                mask |= self.compact_peq.get(a);
+            }
+            state = ((state << 1) | 1) & mask;
+            if state & top != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Shift-and over the initials [`original_initials`] would give: false only if
+    /// [`FuzzyMatcher::acronym`] cannot match them. Exact for ASCII names (the common
+    /// camelCase case, walked byte by byte with the same word rules); other names say true.
+    fn original_acronym_possible(&self, original: &str) -> bool {
+        if !original.is_ascii() {
+            return true;
+        }
+        let b = original.as_bytes();
+        let top = 1u64 << (self.compact.len() - 1);
+        let mut state = 0u64;
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i].is_ascii_alphanumeric() {
+                i += 1;
+                continue;
+            }
+            state =
+                ((state << 1) | 1) & self.compact_peq.get(char::from(b[i].to_ascii_lowercase()));
+            if state & top != 0 {
+                return true;
+            }
+            let mut j = i + 1;
+            while j < b.len() {
+                let (p, c) = (b[j - 1], b[j]);
+                let next_lower = b.get(j + 1).is_some_and(u8::is_ascii_lowercase);
+                let boundary = !c.is_ascii_alphanumeric()
+                    || (p.is_ascii_lowercase() && c.is_ascii_uppercase())
+                    || (p.is_ascii_uppercase() && c.is_ascii_uppercase() && next_lower)
+                    || (p.is_ascii_alphabetic() && c.is_ascii_digit())
+                    || (p.is_ascii_digit() && c.is_ascii_alphabetic());
+                if boundary {
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        false
     }
 
     /// The term as consecutive initials: `(detail, byte offsets of the used initials)`.
@@ -342,7 +482,16 @@ impl FuzzyMatcher {
 
     /// Best fzf-style subsequence alignment: `(score, byte offsets of matched characters)`,
     /// or `None` if its score is below the threshold.
-    fn subsequence(&self, name: &str, buf: &mut FuzzyBuf, want: bool) -> Option<(u32, Vec<usize>)> {
+    ///
+    /// Gives up early (`None`) once the best score still reachable is below the threshold or
+    /// below `min_detail`: each further term character adds at most [`MAX_STEP`].
+    fn subsequence(
+        &self,
+        name: &str,
+        buf: &mut FuzzyBuf,
+        want: bool,
+        min_detail: u32,
+    ) -> Option<(u32, Vec<usize>)> {
         let FuzzyBuf {
             hay, starts, dp, ..
         } = buf;
@@ -355,10 +504,13 @@ impl FuzzyMatcher {
             prev = c;
         }
         let (m, h) = (self.compact.len(), hay.len());
+        let threshold = MATCH * m as i32 * 3 / 4;
+        let needed = threshold.max(min_detail as i32);
         dp.clear();
         dp.resize(m * h, NEG);
         for (i, &nc) in self.compact.iter().enumerate() {
             let mut gap = NEG;
+            let mut row_best = NEG;
             for j in 0..h {
                 if i > 0 && j >= 2 {
                     gap = (gap - GAP_EXTEND).max(dp[(i - 1) * h + j - 2] - GAP_OPEN);
@@ -382,6 +534,12 @@ impl FuzzyMatcher {
                         best + MATCH + bonus
                     }
                 };
+                row_best = row_best.max(dp[i * h + j]);
+            }
+            // Every alignment passes through this row; the rest adds at most MAX_STEP per
+            // character.
+            if row_best <= NEG / 2 || row_best + MAX_STEP * ((m - 1 - i) as i32) < needed {
+                return None;
             }
         }
         let last = &dp[(m - 1) * h..];
@@ -389,7 +547,6 @@ impl FuzzyMatcher {
             .iter()
             .enumerate()
             .max_by_key(|&(j, &v)| (v, std::cmp::Reverse(j)))?;
-        let threshold = MATCH * m as i32 * 3 / 4;
         if best < threshold {
             return None;
         }
@@ -503,9 +660,15 @@ fn has_camel_boundary(original: &str) -> bool {
 /// Initials of the words of an original name, splitting also at camelCase and letter/digit
 /// changes. Separators are ASCII punctuation and whitespace; any other character belongs to
 /// a word. Initials are normalized (ASCII lower-cased, others through the name normalization).
-fn original_initials(original: &str, out: &mut Vec<Initial>, norm: &mut String) {
+fn original_initials(
+    original: &str,
+    out: &mut Vec<Initial>,
+    norm: &mut String,
+    chars: &mut Vec<(usize, char)>,
+) {
     out.clear();
-    let chars: Vec<(usize, char)> = original.char_indices().collect();
+    chars.clear();
+    chars.extend(original.char_indices());
     let is_sep = |c: char| c.is_whitespace() || (c.is_ascii() && !c.is_ascii_alphanumeric());
     let mut i = 0;
     while i < chars.len() {
@@ -772,6 +935,133 @@ mod tests {
             prop_assert_eq!(s.is_some(), !h.is_empty());
             for r in h {
                 prop_assert!(r.start < r.end && name.is_char_boundary(r.start) && name.is_char_boundary(r.end));
+            }
+        }
+    }
+
+    /// Every alignment of `needle` in `hay` (as chars), scored by the rules the DP implements:
+    /// the best score, or `None` if there is no alignment. Brute force, for small inputs.
+    fn subsequence_brute(needle: &[char], hay: &str) -> Option<i32> {
+        let hay: Vec<char> = hay.chars().collect();
+        let start = |j: usize| hay[j] != ' ' && (j == 0 || hay[j - 1] == ' ');
+        fn walk(
+            needle: &[char],
+            hay: &[char],
+            start: &dyn Fn(usize) -> bool,
+            i: usize,
+            prev: usize,
+            acc: i32,
+        ) -> Option<i32> {
+            if i == needle.len() {
+                return Some(acc);
+            }
+            let mut best: Option<i32> = None;
+            for j in prev + 1..hay.len() {
+                if hay[j] != needle[i] {
+                    continue;
+                }
+                let bonus = if start(j) { BOUNDARY } else { 0 };
+                let step = if j == prev + 1 {
+                    CONSECUTIVE
+                } else {
+                    -(GAP_OPEN + GAP_EXTEND * (j - prev - 2) as i32)
+                };
+                if let Some(v) = walk(needle, hay, start, i + 1, j, acc + MATCH + bonus + step) {
+                    best = Some(best.map_or(v, |b| b.max(v)));
+                }
+            }
+            best
+        }
+        let mut best: Option<i32> = None;
+        for j in 0..hay.len() {
+            if hay[j] != needle[0] {
+                continue;
+            }
+            let first = MATCH
+                + if start(j) {
+                    BOUNDARY + FIRST_BOUNDARY
+                } else {
+                    0
+                };
+            if let Some(v) = walk(needle, &hay, &start, 1, j, first) {
+                best = Some(best.map_or(v, |b| b.max(v)));
+            }
+        }
+        best
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The floor only drops what scores below it: `score_at_least(floor)` is exactly the
+        /// plain score filtered by `>= floor`, for floors at, around and far from the score.
+        #[test]
+        fn a_floor_never_rejects_a_score_that_reaches_it(
+            term in "[a-dA-Dت م ال_.]{1,10}",
+            name in "[a-eA-E0-9ت م ال ُ _.-]{0,30}",
+            tier in 0u32..8,
+            detail in 0u32..200,
+            tail in 0u32..256,
+        ) {
+            let n = norm(&term);
+            prop_assume!(!n.is_empty());
+            let m = FuzzyMatcher::new(&n);
+            let normalized = norm(&name);
+            let mut buf = FuzzyBuf::default();
+            let plain = m.score_at_least(&normalized, &name, &mut buf, 0);
+            let mut floors = vec![(tier << 24) | (detail << 8) | tail, 1, u32::MAX];
+            if let Some(s) = plain {
+                floors.extend([s, s + 1, s.saturating_sub(1), s & !0xFF, (s | 0xFFFF) + 1]);
+            }
+            for floor in floors {
+                let fast = m.score_at_least(&normalized, &name, &mut buf, floor);
+                prop_assert_eq!(fast, plain.filter(|&s| s >= floor), "floor {:#x}", floor);
+            }
+        }
+
+        /// The subsequence DP (with its early exits) gives the best alignment score.
+        #[test]
+        fn subsequence_dp_matches_brute_force(
+            term in "[abc]{3,5}",
+            name in "[abcd ]{0,14}",
+            min_detail in 0u32..120,
+        ) {
+            let m = FuzzyMatcher::new(&term);
+            let threshold = MATCH * m.compact.len() as i32 * 3 / 4;
+            let brute = subsequence_brute(&m.compact, &name).filter(|&b| b >= threshold);
+            let mut buf = FuzzyBuf::default();
+            let dp = m.subsequence(&name, &mut buf, false, 0).map(|(s, _)| s as i32);
+            prop_assert_eq!(dp, brute);
+            // With a minimum, only results below it may go missing.
+            let bounded = m.subsequence(&name, &mut buf, false, min_detail).map(|(s, _)| s as i32);
+            match bounded {
+                Some(s) => prop_assert_eq!(Some(s), brute),
+                None => prop_assert!(brute.is_none_or(|b| b < min_detail as i32)),
+            }
+        }
+
+        /// The shift-and prefilters never reject a name whose initials hold the acronym:
+        /// camelCase-heavy ASCII names, and Arabic ones with the article.
+        #[test]
+        fn acronym_prefilters_never_reject_a_match(
+            (term, name) in prop_oneof![
+                ("[a-c1]{2,3}", "[a-cA-C0-9 _.]{0,20}"),
+                ("[a-dت م ال1]{2,4}", "[a-dA-D0-9 _.ت م ال]{0,24}"),
+            ],
+        ) {
+            let n = norm(&term);
+            let m = FuzzyMatcher::new(&n);
+            prop_assume!(m.compact.len() >= 2);
+            let normalized = norm(&name);
+            let mut initials = Vec::new();
+            normalized_initials(&normalized, &mut initials);
+            if m.acronym(&initials, false).is_some() {
+                prop_assert!(m.normalized_acronym_possible(&normalized));
+            }
+            let (mut norm_buf, mut chars) = (String::new(), Vec::new());
+            original_initials(&name, &mut initials, &mut norm_buf, &mut chars);
+            if m.acronym(&initials, false).is_some() {
+                prop_assert!(m.original_acronym_possible(&name));
             }
         }
     }

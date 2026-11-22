@@ -4,7 +4,8 @@
 //!   process memory, then replays realistic typing sequences keystroke by keystroke through
 //!   the same steps as the desktop app's name fast path (`athrix_query::parse` →
 //!   `Query::compile` → search for `limit + 1` ids → path + metadata of each hit) and prints
-//!   p50 / p95 / p99 per keystroke and overall.
+//!   p50 / p95 / p99 per keystroke and overall. After a keystroke with no results it also
+//!   times the "did you mean" probes the UI then asks for (`search_suggest`), separately.
 //! - `bench content <ROOT>…`: walks the roots, extracts up to `--max-files` documents with
 //!   `athrix-extract` on all cores, builds a content index in `--index-dir`, then times word,
 //!   phrase, Arabic and name + content (`AND`) queries through `athrix_ranking::execute`, like
@@ -107,8 +108,10 @@ pub fn cmd_bench(args: &[String]) -> Result<std::process::ExitCode, CliError> {
     }
 }
 
-/// One keystroke the way the app's name fast path runs it. Returns the number of items.
-fn name_keystroke(index: &FileIndex, text: &str, limit: usize) -> Option<usize> {
+/// One keystroke the way the app's `search` command runs it on the name fast path: the
+/// result rows only ("did you mean" is a separate `search_suggest` call, see
+/// [`suggestion_probes`]). Returns the number of items and the compiled query.
+fn name_keystroke(index: &FileIndex, text: &str, limit: usize) -> Option<(usize, Query)> {
     let ast = athrix_query::parse(text).ok()?;
     let plan = athrix_query::plan(&ast, &PlanOptions::default()).ok()?;
     if plan.uses_content() {
@@ -125,16 +128,13 @@ fn name_keystroke(index: &FileIndex, text: &str, limit: usize) -> Option<usize> 
         std::hint::black_box((path, meta, query.fuzzy_highlights(index.name(id))));
         items += 1;
     }
-    if items == 0 {
-        suggestion_probes(index, text, &query, limit, &cancel);
-    }
-    Some(items)
+    Some((items, query))
 }
 
-/// The app's "did you mean" probes after an empty result (`suggest.rs`): the words retyped on
-/// the other keyboard layout, then the query with the `fuzzy:` switch, each a count-only
-/// search, stopping at the first that finds something. Approximation: a token is swapped
-/// whole unless it holds `:` (a filter); the app swaps the parsed terms only.
+/// The app's "did you mean" probes after an empty result (`search_suggest`, `suggest.rs`):
+/// the words retyped on the other keyboard layout, then the query with the `fuzzy:` switch,
+/// each a count-only search, stopping at the first that finds something. Approximation: a
+/// token is swapped whole unless it holds `:` (a filter); the app swaps the parsed terms only.
 fn suggestion_probes(index: &FileIndex, text: &str, query: &Query, limit: usize, c: &AtomicBool) {
     let mut changed = false;
     let swapped: Vec<String> = text
@@ -168,6 +168,7 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
     let mut rounds = 5usize;
     let mut limit = APP_LIMIT;
     let mut snapshot: Option<PathBuf> = None;
+    let mut typing: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -176,6 +177,7 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
                     .parse()
                     .map_err(|_| usage("--rounds needs a number"))?;
             }
+            "--query" => typing.push(value(&mut it, "--query")?.to_string()),
             "--limit" => {
                 limit = value(&mut it, "--limit")?
                     .parse()
@@ -213,9 +215,13 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
     // Warm the rayon pool once (the app's pool is long-lived).
     let _ = name_keystroke(&index, "warmup", limit);
 
+    if typing.is_empty() {
+        typing = TYPING.iter().map(|&s| s.to_owned()).collect();
+    }
     let mut all = Vec::new();
     let mut first_keys = Vec::new();
-    for word in TYPING {
+    let mut suggests = Vec::new();
+    for word in &typing {
         println!("\n== {word:?}");
         for key in keystrokes(word) {
             let mut times = Vec::with_capacity(rounds);
@@ -226,12 +232,27 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
                 times.push(ms(t.elapsed()));
             }
             times.sort_by(f64::total_cmp);
-            let shown = items.map_or_else(|| "invalid/none".to_owned(), |i| i.to_string());
-            println!(
+            let shown = items
+                .as_ref()
+                .map_or_else(|| "invalid/none".to_owned(), |(i, _)| i.to_string());
+            print!(
                 "  {key:<22} items {shown:>12}  p50 {:>7.2} ms  max {:>7.2} ms",
                 pct(&times, 50.0),
                 times.last().copied().unwrap_or(f64::NAN)
             );
+            // An empty result: the UI then asks `search_suggest`, off the keystroke's path.
+            if let Some((0, query)) = &items {
+                let mut st = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    let t = Instant::now();
+                    suggestion_probes(&index, key, query, limit, &AtomicBool::new(false));
+                    st.push(ms(t.elapsed()));
+                }
+                st.sort_by(f64::total_cmp);
+                print!("  | suggest p50 {:>7.2} ms", pct(&st, 50.0));
+                suggests.extend(st);
+            }
+            println!();
             if key.chars().count() == 1 {
                 first_keys.extend_from_slice(&times);
             }
@@ -240,6 +261,12 @@ fn bench_names(args: &[String]) -> Result<std::process::ExitCode, CliError> {
     }
     println!("\nall keystrokes:   {}", summary(&mut all));
     println!("first keystroke:  {}", summary(&mut first_keys));
+    if !suggests.is_empty() {
+        println!(
+            "suggest (after an empty result): {}",
+            summary(&mut suggests)
+        );
+    }
     println!("rss at end: {:.1} MiB", mib(rss_bytes().unwrap_or(0)));
     Ok(std::process::ExitCode::SUCCESS)
 }

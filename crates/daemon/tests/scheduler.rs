@@ -496,3 +496,52 @@ fn throughput_on_2000_text_files() {
         generated,
     );
 }
+
+#[test]
+fn held_folders_keep_their_documents_and_get_no_work() {
+    let docs = tmp();
+    let root = docs.path();
+    let usb = root.join("usb");
+    write(&usb.join("a.txt"), "plugged zephyrine");
+    write(&root.join("disk/b.txt"), "disk zephyrine");
+    let (_dir, index) = open_index();
+    let s = start(&index, config());
+    s.enqueue_snapshot(&snapshot(root));
+    assert!(s.wait_idle(LONG));
+    assert_eq!(hits(&index, "zephyrine").len(), 2);
+
+    // The stick is pulled out: put it on hold first, then its files are reported gone.
+    s.hold(std::slice::from_ref(&usb));
+    fs::remove_dir_all(&usb).unwrap();
+    s.paths_changed(&[usb.join("a.txt"), usb.clone()]);
+    assert!(s.wait_idle(LONG));
+    assert_eq!(
+        hits(&index, "zephyrine"),
+        [
+            key(&root.join("disk").join("b.txt")),
+            key(&usb.join("a.txt"))
+        ],
+        "a held folder keeps its documents"
+    );
+
+    // Plugged back in with a new file: nothing happens while held...
+    write(&usb.join("c.txt"), "returned zephyrine");
+    s.enqueue_snapshot(&snapshot(root));
+    assert!(s.wait_idle(LONG));
+    assert_eq!(hits(&index, "returned").len(), 0);
+    // ...and it is indexed once released.
+    s.hold(&[]);
+    s.enqueue_snapshot(&snapshot(root));
+    assert!(s.wait_idle(LONG));
+    assert_eq!(hits(&index, "returned"), [key(&usb.join("c.txt"))]);
+
+    // Forgetting a folder only drops queued work; deleting its documents is the caller's job.
+    write(&usb.join("d.txt"), "forgotten zephyrine");
+    s.pause();
+    s.enqueue_snapshot(&snapshot(root));
+    assert!(s.forget(std::slice::from_ref(&usb)) >= 1);
+    s.resume();
+    assert!(s.wait_idle(LONG));
+    assert_eq!(hits(&index, "forgotten").len(), 0);
+    s.shutdown();
+}

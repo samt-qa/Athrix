@@ -30,7 +30,7 @@
 //! plain results is a later task.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use athrix_core::{Error, Result};
 use athrix_query::{FilterName, ParseError, Span};
@@ -44,6 +44,9 @@ use crate::index::{EntryId, FileIndex};
 const CHUNK: usize = 16 * 1024;
 /// How often (in entries) a task checks the cancellation flag.
 const CANCEL_CHECK_EVERY: usize = 4 * 1024;
+/// How often (in entries) a ranked scan picks up the score floor other chunks raised; divides
+/// [`CANCEL_CHECK_EVERY`].
+const FLOOR_CHECK_EVERY: usize = 256;
 
 /// Why a query could not be compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,8 +464,7 @@ impl FileIndex {
         match &query.plan {
             Plan::Tree(node) if query.ranked => {
                 let e = Entry { ix: self, id, name };
-                let mut s = Scratch::default();
-                node.eval(&e, &mut s).then(|| node.score(&e, &mut s))
+                node.eval_score(&e, &mut Scratch::default(), 0)
             }
             _ => self.is_match(query, id).then_some(0),
         }
@@ -494,6 +496,8 @@ impl FileIndex {
         }
         let chunks = n.div_ceil(CHUNK);
         let wave = rayon::current_num_threads().max(1) * 4;
+        // The lowest score that can still make the final top `limit` (see `scan_scored`).
+        let floor = AtomicU32::new(0);
         let mut first = 0;
         while first < chunks {
             if cancel.load(Ordering::Relaxed) {
@@ -504,13 +508,14 @@ impl FileIndex {
                 .into_par_iter()
                 .map(|c| {
                     let end = ((c + 1) * CHUNK).min(n);
-                    self.scan_scored(c * CHUNK, end, node, limit, cancel, mask)
+                    self.scan_scored(c * CHUNK, end, node, limit, cancel, mask, &floor)
                 })
                 .collect();
             for part in parts {
                 out.extend(part.ok_or(Error::Cancelled)?);
             }
             keep_best(&mut out, limit);
+            raise_floor(&floor, &out, limit);
             first = last;
         }
         out.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
@@ -519,6 +524,13 @@ impl FileIndex {
 
     /// Scans ids `start..end` for a ranked query, keeping the best `limit`; `None` if
     /// cancelled.
+    ///
+    /// `floor` is shared by every chunk of the search: once some chunk (or the merged waves
+    /// before) holds `limit` hits, the lowest of their scores is a lower bound for the final
+    /// top `limit`, so entries scoring below it can be skipped, and fuzzy terms do not even
+    /// try the tiers that cannot reach it ([`Node::eval_score`]). Exact: an entry scoring at
+    /// least the floor is never skipped, and ties are kept for the final (score, id) order.
+    #[allow(clippy::too_many_arguments)]
     fn scan_scored(
         &self,
         start: usize,
@@ -527,6 +539,7 @@ impl FileIndex {
         limit: usize,
         cancel: &AtomicBool,
         mask: Option<&[u64]>,
+        floor: &AtomicU32,
     ) -> Option<Vec<(u32, EntryId)>> {
         let arena = &self.normalized;
         let text = arena.text.as_str();
@@ -537,23 +550,32 @@ impl FileIndex {
             arena.ends[start - 1] as usize
         };
         let mut scratch = Scratch::default();
+        let mut local = 0;
         for (i, &to) in arena.ends[start..end].iter().enumerate() {
-            if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
-                return None;
+            if i % FLOOR_CHECK_EVERY == 0 {
+                if i % CANCEL_CHECK_EVERY == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                local = local.max(floor.load(Ordering::Relaxed));
             }
             let to = to as usize;
             let name = &text[from..to];
             from = to;
             let id = (start + i) as EntryId;
+            if mask.is_some_and(|m| bit_is_set(m, id)) {
+                continue;
+            }
             let e = Entry { ix: self, id, name };
-            if node.eval(&e, &mut scratch) && !mask.is_some_and(|m| bit_is_set(m, id)) {
-                hits.push((node.score(&e, &mut scratch), id));
+            if let Some(score) = node.eval_score(&e, &mut scratch, local) {
+                hits.push((score, id));
                 if hits.len() >= limit.saturating_mul(2).max(1024) {
                     keep_best(&mut hits, limit);
+                    local = local.max(raise_floor(floor, &hits, limit));
                 }
             }
         }
         keep_best(&mut hits, limit);
+        raise_floor(floor, &hits, limit);
         Some(hits)
     }
 
@@ -668,6 +690,17 @@ impl FileIndex {
         }
         Some(hits)
     }
+}
+
+/// If `best` holds at least `limit` hits (after [`keep_best`]: exactly the best `limit` of
+/// them), raises `floor` to their lowest score: no entry scoring less can make the top `limit`
+/// of a search whose hits include these. Returns the new floor.
+fn raise_floor(floor: &AtomicU32, best: &[(u32, EntryId)], limit: usize) -> u32 {
+    if limit == 0 || best.len() < limit {
+        return floor.load(Ordering::Relaxed);
+    }
+    let lowest = best.iter().map(|&(s, _)| s).min().unwrap_or(0);
+    floor.fetch_max(lowest, Ordering::Relaxed).max(lowest)
 }
 
 /// Keeps the `limit` best `(score, id)` pairs (highest score, then lowest id), unordered.
@@ -857,5 +890,104 @@ mod tests {
         assert!(matches!(e, Error::InvalidQuery { position: 0, .. }));
         let e: Error = Query::parse("a content:x").unwrap_err().into();
         assert!(matches!(e, Error::InvalidQuery { position: 2, .. }));
+    }
+
+    /// The reference for ranked searches: every entry evaluated and scored the two-pass way
+    /// (`Node::eval`, then `Node::score`), best first, ties by id.
+    fn ranked_brute_force(ix: &FileIndex, query: &Query, limit: usize) -> Vec<(u32, EntryId)> {
+        let Plan::Tree(node) = &query.plan else {
+            panic!("not a ranked query");
+        };
+        let mut s = Scratch::default();
+        let mut all: Vec<(u32, EntryId)> = (0..ix.len() as EntryId)
+            .filter_map(|id| {
+                let e = Entry {
+                    ix,
+                    id,
+                    name: ix.normalized_name(id),
+                };
+                node.eval(&e, &mut s).then(|| (node.score(&e, &mut s), id))
+            })
+            .collect();
+        all.sort_unstable_by_key(|&(s, id)| (std::cmp::Reverse(s), id));
+        all.truncate(limit);
+        all
+    }
+
+    #[test]
+    fn ranked_search_with_a_score_floor_equals_brute_force() {
+        // Several chunks of pseudo-random names with many fuzzy hits in each, so the floor
+        // rises inside chunks and between waves.
+        const PARTS: &[&str] = &[
+            "re",
+            "port",
+            "rp",
+            "t",
+            "Rprt",
+            "MyRe",
+            "PortX",
+            "2026",
+            "تقرير",
+            "المبيعات",
+            "مُحَاضَرَة",
+            "سنوي",
+            "x",
+            "_",
+            " ",
+            "-",
+            "managment",
+            "reprot",
+        ];
+        const EXTS: &[&str] = &[".pdf", ".docx", "", ".txt"];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let names: Vec<String> = (0..3 * CHUNK + 1234)
+            .map(|_| {
+                let words = 1 + next() % 4;
+                let mut name: String = (0..words)
+                    .map(|_| PARTS[(next() % PARTS.len() as u64) as usize])
+                    .collect();
+                name.push_str(EXTS[(next() % EXTS.len() as u64) as usize]);
+                name
+            })
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ix = index(&refs);
+        let cancel = AtomicBool::new(false);
+        for text in [
+            "fuzzy:rprt",
+            "fuzzy:r",
+            "fuzzy:rep",
+            "fuzzy:mr",
+            "fuzzy:reprot",
+            "fuzzy:managment",
+            "fuzzy:تقرر",
+            "fuzzy:تمس",
+            "fuzzy: report 2026",
+            "fuzzy:rprt | fuzzy:تقرر",
+            "fuzzy:rprt | port",
+            "fuzzy:rprt !port",
+            "fuzzy:rpt ext:pdf",
+            "fuzzy:rp <fuzzy:t | 2026>",
+        ] {
+            let query = q(text);
+            assert!(query.is_ranked(), "{text}");
+            for limit in [1, 7, 201, 5000, usize::MAX] {
+                let fast = ix
+                    .search_scored_masked(&query, limit, &cancel, None)
+                    .unwrap();
+                let slow = ranked_brute_force(&ix, &query, limit);
+                assert_eq!(fast, slow, "{text} limit {limit}");
+            }
+            // The one-entry score agrees with the two-pass one too.
+            for &(score, id) in ranked_brute_force(&ix, &query, 50).iter() {
+                assert_eq!(ix.score(&query, id), Some(score), "{text} id {id}");
+            }
+        }
     }
 }

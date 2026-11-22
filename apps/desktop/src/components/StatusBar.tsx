@@ -64,6 +64,21 @@ export default function StatusBar(props: Props) {
           </span>
         )}
       </Show>
+      {/* Task 2.5: a drive just plugged in being walked, and indexed drives that are unplugged. */}
+      <Show when={props.index?.state === "ready" && props.index.scanning?.length ? props.index.scanning : null}>
+        {(scanning) => (
+          <span class="index-scanning" role="status">
+            {t("index.scanning", { roots: "" })}<bdi dir="ltr">{scanning().map(rootName).join(", ")}</bdi>
+          </span>
+        )}
+      </Show>
+      <Show when={props.index?.offline?.length ? props.index.offline : null}>
+        {(offline) => (
+          <span class="index-offline" title={t("index.offlineTitle")}>
+            {t("index.offline", { roots: "" })}<bdi dir="ltr">{offline().map(rootName).join(", ")}</bdi>
+          </span>
+        )}
+      </Show>
       <Show when={props.mock}>
         <span class="mock-badge" title={t("index.mockTitle")}>{t("index.mock")}</span>
       </Show>

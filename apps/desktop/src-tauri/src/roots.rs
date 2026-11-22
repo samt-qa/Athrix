@@ -5,6 +5,13 @@
 //! File layout: `{"version":1,"roots":null}` for the whole computer (re-resolved at every start,
 //! so a new fixed drive is picked up), or `{"version":1,"roots":["C:\\","D:\\"]}`. A missing,
 //! unreadable, corrupt or other-version file means the whole computer (logged).
+//!
+//! **External drives (task 2.5).** [`DriveSettings`] (`<app_data>/drive-settings.json`,
+//! `{"version":1,"includeRemovable":true,"includeNetwork":false}`) says whether "the whole
+//! computer" also takes in removable drives (USB sticks, memory cards; default on) and mapped
+//! network drives (default off). [`plan`] turns the choice, the volumes present and those
+//! settings into a [`RootPlan`]: the roots to index and which of them are offline right now (a
+//! chosen folder on an unplugged drive stays chosen, it is just offline until it comes back).
 
 use std::fs;
 use std::io;
@@ -13,12 +20,224 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::volumes::{Volume, is_drive_root, whole_computer_roots};
+use crate::volumes::{Volume, VolumeKind, is_drive_root, whole_computer_roots};
 
 /// File name of the roots setting inside the app data folder.
 pub const ROOTS_SETTING_FILE: &str = "indexed-roots.json";
 
+/// File name of the external-drive settings inside the app data folder.
+pub const DRIVE_SETTINGS_FILE: &str = "drive-settings.json";
+
 const ROOTS_FILE_VERSION: u32 = 1;
+const DRIVE_SETTINGS_VERSION: u32 = 1;
+
+/// Which drives besides the fixed ones "the whole computer" indexes (`get_drive_settings` /
+/// `set_drive_settings`). Explicitly chosen roots are indexed whatever these say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveSettings {
+    /// Removable drives (USB sticks, memory cards) are indexed while plugged in. Default on.
+    pub include_removable: bool,
+    /// Mapped network drives are indexed while connected. Default off (slow, and often huge).
+    pub include_network: bool,
+}
+
+impl Default for DriveSettings {
+    fn default() -> Self {
+        DriveSettings {
+            include_removable: true,
+            include_network: false,
+        }
+    }
+}
+
+impl DriveSettings {
+    /// True if "the whole computer" takes in a drive of `kind`.
+    pub fn includes(&self, kind: VolumeKind) -> bool {
+        match kind {
+            VolumeKind::Fixed => true,
+            VolumeKind::Removable => self.include_removable,
+            VolumeKind::Network => self.include_network,
+            VolumeKind::Unknown => false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveSettingsFile {
+    version: u32,
+    #[serde(flatten)]
+    settings: DriveSettings,
+}
+
+/// The persisted [`DriveSettings`]. A missing, corrupt or other-version file means the
+/// defaults (logged).
+#[derive(Debug, Default)]
+pub struct DriveSettingsStore {
+    inner: Mutex<(Option<PathBuf>, DriveSettings)>,
+}
+
+impl DriveSettingsStore {
+    /// Points the setting at `file` and loads it.
+    pub fn load_from(&self, file: PathBuf) {
+        let settings = read_drive_settings(&file);
+        *self.lock() = (Some(file), settings);
+    }
+
+    /// The current settings.
+    pub fn get(&self) -> DriveSettings {
+        self.lock().1
+    }
+
+    /// Replaces the settings and writes them, if a file is set. The new value is kept even if
+    /// writing fails (the error is returned for logging).
+    pub fn set(&self, settings: DriveSettings) -> io::Result<()> {
+        let mut s = self.lock();
+        s.1 = settings;
+        match &s.0 {
+            Some(file) => {
+                let body = DriveSettingsFile {
+                    version: DRIVE_SETTINGS_VERSION,
+                    settings,
+                };
+                write_atomic(
+                    file,
+                    &serde_json::to_vec_pretty(&body).map_err(io::Error::other)?,
+                )
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (Option<PathBuf>, DriveSettings)> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn read_drive_settings(file: &Path) -> DriveSettings {
+    let bytes = match fs::read(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return DriveSettings::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the drive settings; using the defaults");
+            return DriveSettings::default();
+        }
+    };
+    match serde_json::from_slice::<DriveSettingsFile>(&bytes) {
+        Ok(f) if f.version == DRIVE_SETTINGS_VERSION => f.settings,
+        Ok(f) => {
+            tracing::warn!(
+                version = f.version,
+                "drive settings have another version; ignoring them"
+            );
+            DriveSettings::default()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "drive settings are corrupt; using the defaults");
+            DriveSettings::default()
+        }
+    }
+}
+
+/// What to index right now: every root of the choice, and which of them are offline.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RootPlan {
+    /// The roots, in path order for "the whole computer", in the chosen order otherwise.
+    /// Includes the offline ones.
+    pub roots: Vec<PathBuf>,
+    /// The roots whose drive is not present now (a subset of `roots`).
+    pub offline: Vec<PathBuf>,
+}
+
+impl RootPlan {
+    /// The roots that can be walked now (`roots` minus `offline`).
+    pub fn online(&self) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|r| !self.offline.contains(r))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The [`RootPlan`] of `choice`, given the volumes present now and the drive settings.
+///
+/// - The whole computer: every fixed drive, plus every removable / network drive that
+///   `settings` takes in. `remembered` are drive roots seen earlier in this session (removable
+///   or network drives that were indexed): those that are gone now stay in the plan, offline,
+///   so their entries are only hidden and plugging the drive back in is a re-walk of that
+///   drive alone. No drive at all falls back to the home folder (like [`resolve`]).
+/// - Chosen roots: all of them, those whose drive is missing marked offline
+///   ([`root_available`]).
+pub fn plan(
+    choice: &RootsChoice,
+    volumes: &[Volume],
+    settings: DriveSettings,
+    remembered: &[PathBuf],
+) -> Result<RootPlan, String> {
+    match choice {
+        RootsChoice::Custom(roots) => Ok(RootPlan {
+            roots: roots.clone(),
+            offline: roots
+                .iter()
+                .filter(|r| !root_available(r, volumes))
+                .cloned()
+                .collect(),
+        }),
+        RootsChoice::WholeComputer => {
+            let fixed = resolve(choice, volumes)?;
+            if !cfg!(windows) {
+                return Ok(RootPlan {
+                    roots: fixed,
+                    offline: Vec::new(),
+                });
+            }
+            let mut roots = fixed;
+            for v in volumes {
+                if v.kind != VolumeKind::Fixed
+                    && settings.includes(v.kind)
+                    && is_drive_root(&v.path)
+                {
+                    roots.push(PathBuf::from(&v.path));
+                }
+            }
+            let mut offline = Vec::new();
+            for r in remembered {
+                let key = path_key(r);
+                if !roots.iter().any(|x| path_key(x) == key) {
+                    offline.push(r.clone());
+                    roots.push(r.clone());
+                }
+            }
+            roots.sort_by_key(|r| path_key(r));
+            Ok(RootPlan { roots, offline })
+        }
+    }
+}
+
+/// True if the drive (or mount) `root` lies on is present in `volumes`: on Windows the drive
+/// letter must be listed (UNC paths count as present); elsewhere a root under `/media/x`,
+/// `/mnt/x` or `/Volumes/x` needs that mount listed, anything else lives on `/`.
+pub fn root_available(root: &Path, volumes: &[Volume]) -> bool {
+    let s = root.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return volumes
+            .iter()
+            .any(|v| v.path.len() >= 2 && v.path[..2].eq_ignore_ascii_case(&s[..2]));
+    }
+    for prefix in ["/media/", "/mnt/", "/Volumes/"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            let mount = match rest.find('/') {
+                Some(i) => &s[..prefix.len() + i],
+                None => &s[..],
+            };
+            return volumes.iter().any(|v| v.path == mount);
+        }
+    }
+    true
+}
 
 /// The user's choice of what to index.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -36,8 +255,11 @@ pub enum RootsChoice {
 pub struct IndexRoots {
     /// The choice is "the whole computer".
     pub whole_computer: bool,
-    /// The folders that choice indexes now.
+    /// The folders that choice indexes now (offline ones excluded).
     pub roots: Vec<String>,
+    /// Chosen folders (or remembered external drives) whose drive is not plugged in now: they
+    /// stay in the choice and come back on their own.
+    pub offline: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -236,11 +458,16 @@ fn write_choice(file: &Path, choice: &RootsChoice) -> io::Result<()> {
         },
     };
     let json = serde_json::to_vec_pretty(&body).map_err(io::Error::other)?;
+    write_atomic(file, &json)
+}
+
+/// Writes `bytes` to a temporary file next to `file`, then renames it over `file`.
+fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
     }
     let tmp = file.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
+    fs::write(&tmp, bytes)?;
     fs::rename(&tmp, file)
 }
 
@@ -320,27 +547,157 @@ mod tests {
         assert!(normalize_roots(&["  ".into()]).is_err());
     }
 
+    fn vol(path: &str, kind: VolumeKind) -> Volume {
+        Volume {
+            path: path.into(),
+            name: path.trim_end_matches('\\').into(),
+            label: None,
+            kind,
+            serial: None,
+        }
+    }
+
+    #[test]
+    fn drive_settings_default_round_trip_and_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(DRIVE_SETTINGS_FILE);
+        let store = DriveSettingsStore::default();
+        store.load_from(file.clone());
+        assert_eq!(
+            store.get(),
+            DriveSettings {
+                include_removable: true,
+                include_network: false
+            },
+            "defaults: removable on, network off"
+        );
+        let changed = DriveSettings {
+            include_removable: false,
+            include_network: true,
+        };
+        store.set(changed).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"version": 1, "includeRemovable": false, "includeNetwork": true})
+        );
+        let again = DriveSettingsStore::default();
+        again.load_from(file.clone());
+        assert_eq!(again.get(), changed);
+        for bad in [
+            &b"{oops"[..],
+            br#"{"version":2,"includeRemovable":false,"includeNetwork":true}"#,
+        ] {
+            fs::write(&file, bad).unwrap();
+            let s = DriveSettingsStore::default();
+            s.load_from(file.clone());
+            assert_eq!(s.get(), DriveSettings::default());
+        }
+    }
+
+    #[test]
+    fn the_whole_computer_takes_external_drives_per_the_settings() {
+        let vols = [
+            vol("C:\\", VolumeKind::Fixed),
+            vol("E:\\", VolumeKind::Removable),
+            vol("Z:\\", VolumeKind::Network),
+            vol("X:\\", VolumeKind::Unknown),
+        ];
+        let roots = |settings, remembered: &[PathBuf]| {
+            plan(&RootsChoice::WholeComputer, &vols, settings, remembered).unwrap()
+        };
+        let p = roots(DriveSettings::default(), &[]);
+        if cfg!(windows) {
+            assert_eq!(p.roots, [PathBuf::from("C:\\"), PathBuf::from("E:\\")]);
+            assert!(p.offline.is_empty());
+            let none = DriveSettings {
+                include_removable: false,
+                include_network: false,
+            };
+            assert_eq!(roots(none, &[]).roots, [PathBuf::from("C:\\")]);
+            let all = DriveSettings {
+                include_removable: true,
+                include_network: true,
+            };
+            assert_eq!(roots(all, &[]).roots.len(), 3, "unknown kinds never");
+            // A stick seen earlier and unplugged since stays known, offline.
+            let p = roots(DriveSettings::default(), &[PathBuf::from("F:\\")]);
+            assert_eq!(
+                p.roots,
+                [
+                    PathBuf::from("C:\\"),
+                    PathBuf::from("E:\\"),
+                    PathBuf::from("F:\\")
+                ]
+            );
+            assert_eq!(p.offline, [PathBuf::from("F:\\")]);
+            assert_eq!(p.online(), [PathBuf::from("C:\\"), PathBuf::from("E:\\")]);
+            // ...and is not offline while it is plugged in.
+            assert!(
+                roots(DriveSettings::default(), &[PathBuf::from("E:\\")])
+                    .offline
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(p.roots, [PathBuf::from("/")]);
+        }
+    }
+
+    #[test]
+    fn chosen_roots_on_missing_drives_are_offline_not_dropped() {
+        let vols = [
+            vol("C:\\", VolumeKind::Fixed),
+            vol("/media/usb", VolumeKind::Removable),
+        ];
+        let chosen =
+            |paths: &[&str]| RootsChoice::Custom(paths.iter().map(PathBuf::from).collect());
+        let p = plan(
+            &chosen(&[
+                "C:\\Users",
+                "E:\\Photos",
+                "/media/usb/docs",
+                "/media/other/x",
+                "/home/me",
+            ]),
+            &vols,
+            DriveSettings::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(p.roots.len(), 5, "every chosen root stays");
+        assert_eq!(
+            p.offline,
+            [PathBuf::from("E:\\Photos"), PathBuf::from("/media/other/x")]
+        );
+        assert!(
+            root_available(Path::new("c:\\data"), &vols),
+            "letters ignore case"
+        );
+        assert!(
+            root_available(Path::new("\\\\server\\share"), &vols),
+            "UNC: assumed present"
+        );
+        assert!(root_available(Path::new("/media/usb"), &vols));
+        // The settings do not touch chosen roots.
+        let off = DriveSettings {
+            include_removable: false,
+            include_network: false,
+        };
+        assert_eq!(
+            plan(&chosen(&["/media/usb/docs"]), &vols, off, &[])
+                .unwrap()
+                .roots
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn resolves_the_whole_computer_from_volumes() {
         let vols = vec![
-            Volume {
-                path: "C:\\".into(),
-                name: "C:".into(),
-                label: None,
-                kind: VolumeKind::Fixed,
-            },
-            Volume {
-                path: "D:\\".into(),
-                name: "D:".into(),
-                label: Some("Data".into()),
-                kind: VolumeKind::Fixed,
-            },
-            Volume {
-                path: "E:\\".into(),
-                name: "E:".into(),
-                label: None,
-                kind: VolumeKind::Removable,
-            },
+            vol("C:\\", VolumeKind::Fixed),
+            vol("D:\\", VolumeKind::Fixed),
+            vol("E:\\", VolumeKind::Removable),
         ];
         let whole = resolve(&RootsChoice::WholeComputer, &vols).unwrap();
         if cfg!(windows) {

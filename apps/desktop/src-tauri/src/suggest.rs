@@ -9,6 +9,10 @@
 //!
 //! Each candidate is one more search with the same scope, limit and cancel flag, without
 //! building result rows.
+//!
+//! Not part of `search`: the UI asks `search_suggest` after an empty result (and a short
+//! pause), so these probes (the fuzzy one scans and ranks the whole index) never delay the
+//! empty answer of the keystroke.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

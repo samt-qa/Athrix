@@ -23,6 +23,25 @@
 //! the generation (`generation << 32 | entry`) and are resolved against the view of that
 //! generation, kept in a small ring of the [`RECENT_VIEWS`] latest views that share the
 //! current base; ids of older views (or of a replaced base) are rejected as stale.
+//!
+//! **Drives coming and going (task 2.5).** The roots of the index may include *offline* roots:
+//! roots whose drive is unplugged ([`Indexer::reconcile`], [`Indexer::set_offline_roots`]).
+//! - Going offline is instant and walks nothing: the root's subtree is tombstoned in the live
+//!   index (results disappear at once), the watcher is restarted without it, and the
+//!   [`IndexObserver`] is told (the content index pauses that root but keeps its documents). A
+//!   watched root that vanishes before the drive monitor notices (the watcher reports changes
+//!   or an error under a root that no longer exists) is taken offline the same way instead of
+//!   triggering a full re-walk.
+//! - A root that comes back, a new root, or another volume on the same path is handled by an
+//!   *update* job on the indexing thread: only those roots are walked (with `scanning` in the
+//!   status), then the current entries minus the replaced roots and the new walk are
+//!   concatenated ([`FileIndex::concat`]) and installed as a new base. Watched changes under a
+//!   root being walked are only buffered (and applied after the install), never applied to
+//!   the old live index, which would walk that drive inside its lock.
+//! - Requests are queued like walks (latest wins): a pending full walk absorbs an update, and
+//!   two updates merge (union of the roots to refresh).
+//! - The snapshot may be of other roots than wanted at start-up (a drive unplugged since): if
+//!   they overlap it is loaded anyway and the extra roots hidden, then the walk follows.
 
 use std::collections::VecDeque;
 use std::ops::Deref;
@@ -33,12 +52,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockRea
 use std::time::{Duration, Instant};
 
 use athrix_fs_index::{
-    EntryId, FileIndex, IndexSnapshot, LiveIndex, WalkOptions, WatchBatch, WatchConfig, Watcher,
-    walk,
+    ApplyStats, Change, EntryId, FileIndex, IndexSnapshot, LiveIndex, WalkOptions, WatchBatch,
+    WatchConfig, Watcher, walk,
 };
 
 use crate::model::{IndexState, IndexStatus};
-use crate::roots::path_key;
+use crate::roots::{key_has_prefix, path_key};
 
 mod snapshot_store;
 
@@ -101,8 +120,63 @@ pub trait IndexObserver: Send + Sync {
     fn base_ready(&self, view: &Arc<IndexView>);
 
     /// The watcher reported changed paths; they were applied to the live index first. Called
-    /// on the watcher's thread: keep it short.
+    /// on the watcher's thread: keep it short. Paths under offline roots are never passed.
     fn files_changed(&self, batch: &WatchBatch);
+
+    /// The offline roots are now `offline` (drives unplugged; their entries are hidden but
+    /// their derived data should be kept, not deleted). Called on whichever thread noticed;
+    /// keep it short.
+    fn roots_offline(&self, offline: &[PathBuf]) {
+        let _ = offline;
+    }
+}
+
+/// Work for the indexing thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Job {
+    /// Walk every (online) root from scratch.
+    Full(Vec<PathBuf>),
+    /// Bring the index to `roots`, walking only the roots it does not hold yet (new, back
+    /// online) and those in `refresh` (another volume on their path).
+    Update {
+        roots: Vec<PathBuf>,
+        refresh: Vec<PathBuf>,
+    },
+}
+
+impl Job {
+    fn roots(&self) -> &[PathBuf] {
+        match self {
+            Job::Full(roots) | Job::Update { roots, .. } => roots,
+        }
+    }
+
+    /// `self` is queued and `next` is requested: the one job that does both (latest roots
+    /// win; a full walk covers any update).
+    fn merge(self, next: Job) -> Job {
+        match (self, next) {
+            (_, Job::Full(roots)) | (Job::Full(_), Job::Update { roots, .. }) => Job::Full(roots),
+            (Job::Update { refresh: mut a, .. }, Job::Update { roots, refresh: b }) => {
+                for r in b {
+                    if !a.contains(&r) {
+                        a.push(r);
+                    }
+                }
+                Job::Update { roots, refresh: a }
+            }
+        }
+    }
+}
+
+/// What an [`Job::Update`] has to do, given the live index now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateWork {
+    /// Roots to walk (their old entries, if any, are replaced).
+    add: Vec<PathBuf>,
+    /// Roots of the live index that are no longer wanted.
+    dropped: Vec<PathBuf>,
+    /// There is no live index yet: walk everything.
+    full: bool,
 }
 
 #[derive(Default)]
@@ -268,8 +342,8 @@ fn base_runs(index: &FileIndex) -> Vec<IndexRoot> {
 #[derive(Debug, Default)]
 struct Progress {
     status: IndexStatus,
-    /// Roots requested while the indexing thread was busy.
-    pending: Option<Vec<PathBuf>>,
+    /// Work requested while the indexing thread was busy.
+    pending: Option<Job>,
     /// The indexing thread is alive (loading a snapshot, walking or saving). Requests made
     /// meanwhile are queued in `pending`.
     running: bool,
@@ -303,6 +377,61 @@ struct Core {
     watch_token: u64,
     /// Set while a walk runs.
     during_walk: Option<WalkBuffer>,
+    /// Roots whose drive is unplugged: their entries are tombstoned, they are not watched.
+    offline: Vec<PathBuf>,
+    /// Roots being (or about to be) walked that the live index does not hold: watched changes
+    /// under them are buffered, not applied to the live index.
+    unheld: Vec<PathBuf>,
+}
+
+impl Core {
+    /// The paths of `paths` that the live index can take now: under one of its roots that is
+    /// online and held.
+    fn applicable(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let keys: Vec<String> = self
+            .live_roots
+            .iter()
+            .filter(|r| !self.offline.contains(r) && !self.unheld.contains(r))
+            .map(|r| path_key(r))
+            .collect();
+        paths
+            .iter()
+            .filter(|p| {
+                let k = path_key(p);
+                keys.iter().any(|root| key_has_prefix(&k, root))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// What an update to `roots` (refreshing `refresh`) would do; `None` if nothing.
+    fn update_work(&self, roots: &[PathBuf], refresh: &[PathBuf]) -> Option<UpdateWork> {
+        let online = roots.iter().filter(|r| !self.offline.contains(r));
+        if self.live.is_none() {
+            return Some(UpdateWork {
+                add: online.cloned().collect(),
+                dropped: Vec::new(),
+                full: true,
+            });
+        }
+        let add: Vec<PathBuf> = online
+            .filter(|r| {
+                !self.live_roots.contains(r) || refresh.contains(r) || self.unheld.contains(r)
+            })
+            .cloned()
+            .collect();
+        let dropped: Vec<PathBuf> = self
+            .live_roots
+            .iter()
+            .filter(|r| !roots.contains(r))
+            .cloned()
+            .collect();
+        (!add.is_empty() || !dropped.is_empty() || self.live_roots != roots).then_some(UpdateWork {
+            add,
+            dropped,
+            full: false,
+        })
+    }
 }
 
 /// The listener of the last `start` call, used for live updates and rescans.
@@ -398,7 +527,208 @@ impl Indexer {
     /// Starts indexing `roots` in the background and returns immediately. See the module docs
     /// for what happens when a walk is already running.
     pub fn start(self: &Arc<Self>, roots: Vec<PathBuf>, listener: StatusListener) -> StartOutcome {
-        self.launch(roots, listener, false)
+        self.launch(Job::Full(roots), listener, false)
+    }
+
+    /// Brings the index to `roots` without walking what it already holds (task 2.5):
+    /// - `offline` (a subset of `roots`) are the roots whose drive is unplugged: newly offline
+    ///   ones are hidden at once (see [`Indexer::set_offline_roots`]);
+    /// - roots that are new, back online, or listed in `refresh` (another volume on their
+    ///   path) are walked in the background, alone, and merged in;
+    /// - roots of the index that are not in `roots` are dropped.
+    ///
+    /// Returns `None` when nothing needs walking or rebuilding, else what the queued update did
+    /// (it waits behind a running walk, see the module docs).
+    pub fn reconcile(
+        self: &Arc<Self>,
+        roots: Vec<PathBuf>,
+        offline: Vec<PathBuf>,
+        refresh: Vec<PathBuf>,
+        listener: StatusListener,
+    ) -> Option<StartOutcome> {
+        self.set_listener(&listener);
+        let mut refresh: Vec<PathBuf> = refresh
+            .into_iter()
+            .filter(|r| roots.contains(r) && !offline.contains(r))
+            .collect();
+        for back in self.change_offline(&offline, &refresh) {
+            if roots.contains(&back) && !refresh.contains(&back) {
+                refresh.push(back);
+            }
+        }
+        let idle = !self.lock().running;
+        if idle && self.core().update_work(&roots, &refresh).is_none() {
+            return None;
+        }
+        Some(self.launch(Job::Update { roots, refresh }, listener, false))
+    }
+
+    /// Sets which roots are offline (drives unplugged), without walking anything: the entries
+    /// of newly offline roots are tombstoned at once, the watcher drops them, the observer is
+    /// told, and the status (`offline`) is emitted. Roots no longer offline are remembered as
+    /// not held: the next [`Indexer::reconcile`] walks them. Also used before the first start.
+    pub fn set_offline_roots(self: &Arc<Self>, offline: &[PathBuf]) {
+        self.change_offline(offline, &[]);
+    }
+
+    /// The roots currently offline.
+    pub fn offline_roots(&self) -> Vec<PathBuf> {
+        self.core().offline.clone()
+    }
+
+    fn set_listener(&self, listener: &StatusListener) {
+        *self
+            .listener
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(listener));
+    }
+
+    /// See [`Indexer::set_offline_roots`]; `refresh` roots the live index holds online are
+    /// hidden too (another volume took their path). Returns the roots that came back online.
+    fn change_offline(self: &Arc<Self>, offline: &[PathBuf], refresh: &[PathBuf]) -> Vec<PathBuf> {
+        let (hide, came_back, restart, changed) = {
+            let mut core = self.core();
+            let newly: Vec<PathBuf> = offline
+                .iter()
+                .filter(|r| !core.offline.contains(r))
+                .cloned()
+                .collect();
+            let came_back: Vec<PathBuf> = core
+                .offline
+                .iter()
+                .filter(|r| !offline.contains(r))
+                .cloned()
+                .collect();
+            let swapped: Vec<PathBuf> = refresh
+                .iter()
+                .filter(|r| core.live_roots.contains(r) && !core.offline.contains(r))
+                .cloned()
+                .collect();
+            for r in came_back.iter().chain(&swapped) {
+                if !core.unheld.contains(r) {
+                    core.unheld.push(r.clone());
+                }
+            }
+            core.unheld.retain(|r| !offline.contains(r));
+            core.offline = offline.to_vec();
+            let restart = if core.watch_roots.iter().any(|r| offline.contains(r)) {
+                core.watch_roots.retain(|r| !offline.contains(r));
+                core.watch_token += 1;
+                Some((
+                    core.watcher.take(),
+                    core.watch_roots.clone(),
+                    core.watch_token,
+                ))
+            } else {
+                None
+            };
+            let changed = !newly.is_empty() || !came_back.is_empty();
+            let mut hide = newly;
+            hide.extend(swapped);
+            (hide, came_back, restart, changed)
+        };
+        if !hide.is_empty() {
+            tracing::info!(roots = ?hide, "drive gone or replaced; hiding its entries");
+        }
+        if !came_back.is_empty() {
+            tracing::info!(roots = ?came_back, "drive back; it will be indexed again");
+        }
+        if let Some((old, roots, token)) = restart {
+            // Joins the old watcher's thread (unless called from it, see `Watcher`'s drop).
+            drop(old);
+            if !roots.is_empty() {
+                self.start_watcher(&roots, token);
+            }
+        }
+        let hidden = !hide.is_empty() && self.hide_roots(&hide);
+        if changed {
+            if let Some(observer) = self.observer.0.get() {
+                if catch_unwind(AssertUnwindSafe(|| observer.roots_offline(offline))).is_err() {
+                    tracing::error!("the index observer panicked on offline roots");
+                }
+            }
+        }
+        if changed || hidden {
+            let status = {
+                let mut p = self.lock();
+                let gone = root_strings(offline);
+                p.status.roots.retain(|r| !gone.contains(r));
+                p.status.offline = gone;
+                if let Some(view) = self.index() {
+                    p.status.entries = view.len() as u64;
+                }
+                p.status.clone()
+            };
+            self.emit(&status);
+        }
+        came_back
+    }
+
+    /// Tombstones the subtrees of `roots` (those the live index has) and publishes the result.
+    /// Returns true if anything was hidden.
+    fn hide_roots(self: &Arc<Self>, roots: &[PathBuf]) -> bool {
+        let target = {
+            let core = self.core();
+            core.live.as_ref().map(|live| {
+                let changes: Vec<Change> = roots
+                    .iter()
+                    .filter(|r| core.live_roots.contains(r))
+                    .map(|r| Change::Remove { path: r.clone() })
+                    .collect();
+                (Arc::clone(live), core.session, changes)
+            })
+        };
+        let Some((live, session, changes)) = target else {
+            return false;
+        };
+        if changes.is_empty() {
+            return false;
+        }
+        let started = Instant::now();
+        let Ok(stats) = catch_unwind(AssertUnwindSafe(|| live.apply_changes(&changes))) else {
+            tracing::error!("hiding a root panicked");
+            return false;
+        };
+        self.publish_applied(&live, session, stats, started, false)
+    }
+
+    /// Roots of `paths`' watcher (token `token`) that vanished: a path of the batch lies under
+    /// them (or `all`) and they no longer exist.
+    fn vanished_roots(&self, token: u64, paths: &[PathBuf], all: bool) -> Option<Vec<PathBuf>> {
+        let roots = {
+            let core = self.core();
+            if core.watch_token != token {
+                return None;
+            }
+            core.watch_roots.clone()
+        };
+        // Outside the lock: a stat of a disconnected network drive can block.
+        Some(
+            roots
+                .into_iter()
+                .filter(|r| {
+                    let key = path_key(r);
+                    (all || paths.iter().any(|p| key_has_prefix(&path_key(p), &key))) && !r.exists()
+                })
+                .collect(),
+        )
+    }
+
+    /// Watched roots that disappeared before the drive monitor noticed: offline from now on.
+    fn roots_vanished(self: &Arc<Self>, gone: &[PathBuf]) {
+        let offline = {
+            let core = self.core();
+            let mut offline = core.offline.clone();
+            for g in gone {
+                if !offline.contains(g) {
+                    offline.push(g.clone());
+                }
+            }
+            offline
+        };
+        tracing::info!(roots = ?gone, "watched folder vanished (drive removed?)");
+        self.change_offline(&offline, &[]);
     }
 
     /// Like [`Indexer::start`], but the indexing thread first loads the stored snapshot of
@@ -409,28 +739,27 @@ impl Indexer {
         roots: Vec<PathBuf>,
         listener: StatusListener,
     ) -> StartOutcome {
-        self.launch(roots, listener, true)
+        self.launch(Job::Full(roots), listener, true)
     }
 
     fn launch(
         self: &Arc<Self>,
-        roots: Vec<PathBuf>,
+        job: Job,
         listener: StatusListener,
         use_snapshot: bool,
     ) -> StartOutcome {
-        *self
-            .listener
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&listener));
+        self.set_listener(&listener);
         let started = {
             let mut p = self.lock();
             if p.running {
-                p.pending = Some(roots);
+                p.pending = Some(match p.pending.take() {
+                    Some(queued) => queued.merge(job),
+                    None => job,
+                });
                 return StartOutcome::Queued;
             }
             p.running = true;
-            p.status = self.indexing_status(&roots);
+            p.status = self.indexing_status(&job);
             p.status.clone()
         };
         listener(&started);
@@ -439,7 +768,7 @@ impl Indexer {
         let worker_listener = Arc::clone(&listener);
         let spawned = std::thread::Builder::new()
             .name("athrix-indexer".into())
-            .spawn(move || this.run(roots, &worker_listener, use_snapshot));
+            .spawn(move || this.run(job, &worker_listener, use_snapshot));
         if let Err(e) = spawned {
             let failed = {
                 let mut p = self.lock();
@@ -454,36 +783,28 @@ impl Indexer {
         StartOutcome::Started
     }
 
-    /// The indexing thread: optionally loads the snapshot, walks `roots` (saving each result),
-    /// then walks any roots queued meanwhile.
-    fn run(
-        self: &Arc<Self>,
-        mut roots: Vec<PathBuf>,
-        listener: &StatusListener,
-        use_snapshot: bool,
-    ) {
+    /// The indexing thread: optionally loads the snapshot, runs `job` (saving each walked
+    /// result), then the work queued meanwhile.
+    fn run(self: &Arc<Self>, mut job: Job, listener: &StatusListener, use_snapshot: bool) {
         if use_snapshot {
-            self.load_snapshot(&mut roots, listener);
+            self.load_snapshot(&mut job, listener);
         }
         loop {
-            self.begin_walk(&roots);
             let started = Instant::now();
-            let opts = walk_options(&roots);
-            let result = catch_unwind(AssertUnwindSafe(|| walk(&opts)));
+            let result = self.run_job(&job);
             let elapsed_ms = millis_since(started);
-            let result = match result {
-                Ok(Ok(index)) => self.install(index, &roots).map_err(Some),
-                Ok(Err(e)) => Err(Some(e.to_string())),
-                Err(_) => Err(None),
-            };
             if result.is_err() {
-                self.core().during_walk = None;
+                let mut core = self.core();
+                core.during_walk = None;
             }
 
             let (finished, walked) = {
+                let offline = root_strings(&self.core().offline);
                 let mut p = self.lock();
+                p.status.scanning = Vec::new();
+                p.status.offline = offline;
                 let walked = match result {
-                    Ok(view) => {
+                    Ok(Some(view)) => {
                         let installed = Arc::clone(&view);
                         let entries = view.len() as u64;
                         tracing::info!(
@@ -497,6 +818,12 @@ impl Indexer {
                         p.status.elapsed_ms = Some(elapsed_ms);
                         p.status.error = None;
                         Some(installed)
+                    }
+                    Ok(None) => {
+                        // An update that found nothing to do (the queue moved on meanwhile).
+                        p.status.state = IndexState::Ready;
+                        p.status.error = None;
+                        None
                     }
                     Err(Some(e)) => {
                         tracing::warn!(error = %e, "indexing failed");
@@ -516,56 +843,153 @@ impl Indexer {
             listener(&finished);
             // Saved after the swap and the `ready` event, so neither search nor the UI waits.
             if let Some(view) = walked {
-                self.save_snapshot(&roots);
+                self.save_snapshot(job.roots());
                 // The current view (changes made during the walk may already be applied).
                 self.notify_base(&self.index().unwrap_or(view));
             }
 
             let next = {
                 let mut p = self.lock();
-                match p.pending.take() {
-                    Some(next) => {
-                        p.status = self.indexing_status(&next);
-                        Some((next, p.status.clone()))
-                    }
-                    None => {
-                        p.running = false;
-                        None
+                loop {
+                    match p.pending.take() {
+                        Some(Job::Update { roots, refresh })
+                            if self.core().update_work(&roots, &refresh).is_none() => {}
+                        Some(next) => {
+                            p.status = self.indexing_status(&next);
+                            break Some((next, p.status.clone()));
+                        }
+                        None => {
+                            p.running = false;
+                            break None;
+                        }
                     }
                 }
             };
             match next {
-                Some((next_roots, restarted)) => {
+                Some((next_job, restarted)) => {
                     listener(&restarted);
-                    roots = next_roots;
+                    job = next_job;
                 }
                 None => return,
             }
         }
     }
 
-    /// Loads the stored snapshot of `roots`, if any, makes it current and reports `ready`, then
-    /// reports `indexing` for the walk that follows (of `roots`, or of roots queued meanwhile,
-    /// latest wins). A missing or unusable snapshot changes nothing.
-    fn load_snapshot(self: &Arc<Self>, roots: &mut Vec<PathBuf>, listener: &StatusListener) {
+    /// Runs one job; `Ok(None)` = an update with nothing to do.
+    fn run_job(self: &Arc<Self>, job: &Job) -> Result<Option<Arc<IndexView>>, Option<String>> {
+        match job {
+            Job::Full(roots) => self.walk_all(roots).map(Some),
+            Job::Update { roots, refresh } => self.walk_new(roots, refresh),
+        }
+    }
+
+    /// Walks every online root of `roots` and installs the result (offline roots stay in the
+    /// index's roots, empty).
+    fn walk_all(self: &Arc<Self>, roots: &[PathBuf]) -> Result<Arc<IndexView>, Option<String>> {
+        let online = self.online(roots);
+        self.begin_walk(&online, &online);
+        let opts = walk_options(&online);
+        match catch_unwind(AssertUnwindSafe(|| walk(&opts))) {
+            Ok(Ok(index)) => self.install_walked(index, roots, &online).map_err(Some),
+            Ok(Err(e)) => Err(Some(e.to_string())),
+            Err(_) => Err(None),
+        }
+    }
+
+    /// The update of [`Indexer::reconcile`]: walks only the roots to add, then installs the
+    /// current entries minus the replaced / dropped roots plus that walk.
+    fn walk_new(
+        self: &Arc<Self>,
+        roots: &[PathBuf],
+        refresh: &[PathBuf],
+    ) -> Result<Option<Arc<IndexView>>, Option<String>> {
+        let Some(work) = self.core().update_work(roots, refresh) else {
+            return Ok(None);
+        };
+        if work.full {
+            return self.walk_all(roots).map(Some);
+        }
+        tracing::info!(add = ?work.add, dropped = ?work.dropped, "updating the indexed roots");
+        let online = self.online(roots);
+        self.begin_walk(&online, &work.add);
+        let walked = if work.add.is_empty() {
+            FileIndex::default()
+        } else {
+            let opts = walk_options(&work.add);
+            match catch_unwind(AssertUnwindSafe(|| walk(&opts))) {
+                Ok(Ok(index)) => index,
+                Ok(Err(e)) => return Err(Some(e.to_string())),
+                Err(_) => return Err(None),
+            }
+        };
+        // The latest entries (changes applied during the walk included).
+        let Some(snapshot) = self.core().live.as_ref().map(|l| l.snapshot()) else {
+            return self.walk_all(roots).map(Some);
+        };
+        let replaced: Vec<String> = work
+            .dropped
+            .iter()
+            .chain(&work.add)
+            .map(|r| path_key(r))
+            .collect();
+        let merged = catch_unwind(AssertUnwindSafe(|| {
+            let current = snapshot.to_file_index();
+            drop(snapshot);
+            FileIndex::concat(&[&current, &walked], |part, root| {
+                part == 1 || !replaced.contains(&path_key(Path::new(root)))
+            })
+        }))
+        .map_err(|_| None)?;
+        self.install_walked(merged, roots, &work.add)
+            .map(Some)
+            .map_err(Some)
+    }
+
+    /// The roots of `roots` that are not offline.
+    fn online(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        let core = self.core();
+        roots
+            .iter()
+            .filter(|r| !core.offline.contains(r))
+            .cloned()
+            .collect()
+    }
+
+    /// Loads the stored snapshot of the job's roots (or of overlapping roots: the extra ones are
+    /// hidden), if there is a valid one, makes it current and reports `ready`, then reports
+    /// `indexing` for the job that follows (`job`, or the work queued meanwhile merged into
+    /// it). A missing or unusable snapshot changes nothing.
+    fn load_snapshot(self: &Arc<Self>, job: &mut Job, listener: &StatusListener) {
         let Some(store) = self.snapshots.get() else {
             return;
         };
         let started = Instant::now();
-        let loaded = catch_unwind(AssertUnwindSafe(|| store.load(roots))).unwrap_or_else(|_| {
-            tracing::error!("loading the index snapshot panicked; ignoring it");
-            None
-        });
-        let Some(index) = loaded else {
+        let wanted = job.roots().to_vec();
+        let loaded = catch_unwind(AssertUnwindSafe(|| store.load_overlapping(&wanted)))
+            .unwrap_or_else(|_| {
+                tracing::error!("loading the index snapshot panicked; ignoring it");
+                None
+            });
+        let Some((index, saved)) = loaded else {
             return;
         };
-        let view = match self.install(index, roots) {
+        let view = match self.install_walked(index, &saved, &[]) {
             Ok(view) => view,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot use the index snapshot; ignoring it");
                 return;
             }
         };
+        let extra: Vec<PathBuf> = saved
+            .iter()
+            .filter(|r| !wanted.contains(r))
+            .cloned()
+            .collect();
+        if !extra.is_empty() {
+            tracing::info!(roots = ?extra, "the snapshot has roots not indexed now; hiding them");
+            self.hide_roots(&extra);
+        }
+        let view = self.index().unwrap_or(view);
         let entries = view.len() as u64;
         tracing::info!(
             entries,
@@ -581,9 +1005,9 @@ impl Indexer {
             p.status.error = None;
             let ready = p.status.clone();
             if let Some(next) = p.pending.take() {
-                *roots = next;
+                *job = job.clone().merge(next);
             }
-            p.status = self.indexing_status(roots);
+            p.status = self.indexing_status(job);
             (ready, p.status.clone())
         };
         listener(&ready);
@@ -616,22 +1040,30 @@ impl Indexer {
         }
     }
 
-    /// Before a walk of `roots`: starts remembering changed paths and makes sure a watcher
-    /// watches `roots` (restarting it if it watched other roots).
-    fn begin_walk(self: &Arc<Self>, roots: &[PathBuf]) {
+    /// Before a walk of `walked`: starts remembering changed paths, marks the walked roots the
+    /// live index does not hold as not held, and makes sure a watcher watches `watch` (the
+    /// online roots; restarting it if it watched other roots).
+    fn begin_walk(self: &Arc<Self>, watch: &[PathBuf], walked: &[PathBuf]) {
         let (old, token) = {
             let mut core = self.core();
             core.during_walk = Some(WalkBuffer::default());
-            if core.watcher.is_some() && core.watch_roots == roots {
+            for r in walked {
+                if !core.live_roots.contains(r) && !core.unheld.contains(r) {
+                    core.unheld.push(r.clone());
+                }
+            }
+            if core.watcher.is_some() && core.watch_roots == watch {
                 return;
             }
             core.watch_token += 1;
-            core.watch_roots = roots.to_vec();
+            core.watch_roots = watch.to_vec();
             (core.watcher.take(), core.watch_token)
         };
         // Stopping joins the old watcher's thread, whose callback may be waiting for `core`.
         drop(old);
-        self.start_watcher(roots, token);
+        if !watch.is_empty() {
+            self.start_watcher(watch, token);
+        }
     }
 
     fn start_watcher(self: &Arc<Self>, roots: &[PathBuf], token: u64) {
@@ -663,6 +1095,22 @@ impl Indexer {
     fn on_batch(self: &Arc<Self>, token: u64, batch: WatchBatch) {
         match batch {
             WatchBatch::Changed(paths) => {
+                // A drive pulled out before the monitor noticed: hide it, never "delete" it.
+                let Some(gone) = self.vanished_roots(token, &paths, false) else {
+                    return;
+                };
+                let paths: Vec<PathBuf> = if gone.is_empty() {
+                    paths
+                } else {
+                    let keys: Vec<String> = gone.iter().map(|g| path_key(g)).collect();
+                    paths
+                        .into_iter()
+                        .filter(|p| {
+                            let k = path_key(p);
+                            !keys.iter().any(|g| key_has_prefix(&k, g))
+                        })
+                        .collect()
+                };
                 let target = {
                     let mut core = self.core();
                     if core.watch_token != token {
@@ -677,26 +1125,46 @@ impl Indexer {
                         }
                     }
                     match &core.live {
-                        Some(live) if core.live_roots == core.watch_roots => {
-                            Some((Arc::clone(live), core.session))
+                        Some(live) => {
+                            let applicable = core.applicable(&paths);
+                            (!applicable.is_empty())
+                                .then(|| (Arc::clone(live), core.session, applicable))
                         }
-                        _ => None,
+                        None => None,
                     }
                 };
-                if let Some((live, session)) = target {
-                    self.apply(&live, session, &paths, true);
+                if !gone.is_empty() {
+                    self.roots_vanished(&gone);
                 }
-                if let Some(observer) = self.observer.0.get() {
-                    observer.files_changed(&WatchBatch::Changed(paths));
+                if let Some((live, session, applicable)) = target {
+                    self.apply(&live, session, &applicable, true);
+                }
+                if !paths.is_empty() {
+                    if let Some(observer) = self.observer.0.get() {
+                        observer.files_changed(&WatchBatch::Changed(paths));
+                    }
                 }
             }
             WatchBatch::RescanNeeded(reason) => {
+                let Some(gone) = self.vanished_roots(token, &[], true) else {
+                    return;
+                };
+                if !gone.is_empty() {
+                    // The watcher failed because its drive went away: not a reason to re-walk.
+                    tracing::info!(%reason, "file watching stopped on a removed drive");
+                    self.roots_vanished(&gone);
+                    return;
+                }
                 let roots = {
                     let core = self.core();
                     if core.watch_token != token {
                         return;
                     }
-                    core.watch_roots.clone()
+                    if core.live_roots.is_empty() {
+                        core.watch_roots.clone()
+                    } else {
+                        core.live_roots.clone()
+                    }
                 };
                 tracing::warn!(%reason, "file watching lost track of changes; indexing again");
                 self.rescan(roots);
@@ -726,13 +1194,26 @@ impl Indexer {
             tracing::error!("applying file changes panicked");
             return;
         };
+        self.publish_applied(live, session, stats, started, report);
+    }
+
+    /// Publishes the snapshot of `live` after changes (`stats`) if `live` is still current.
+    /// Returns true if a new view was published.
+    fn publish_applied(
+        self: &Arc<Self>,
+        live: &LiveIndex,
+        session: u64,
+        stats: ApplyStats,
+        started: Instant,
+        report: bool,
+    ) -> bool {
         if !stats.changed() {
-            return;
+            return false;
         }
         let view = {
             let core = self.core();
             if core.session != session {
-                return;
+                return false;
             }
             self.publish(&core, live.snapshot())
         };
@@ -749,6 +1230,7 @@ impl Indexer {
         if report {
             self.report_entries(view.len() as u64);
         }
+        true
     }
 
     /// Records the entry count after applied changes and emits the status, at most once per
@@ -812,30 +1294,57 @@ impl Indexer {
         }
     }
 
-    /// Makes `index` (walked or loaded, of `roots`) the base of a new live index, publishes it
-    /// under a new generation, then applies the paths changed during the walk, if any. Returns
-    /// the current view.
+    /// Makes `index` (a walk of all of `roots`) the current index; see
+    /// [`Indexer::install_walked`]. (Tests only: the indexing thread knows what it walked.)
+    #[cfg(test)]
     pub(crate) fn install(
         self: &Arc<Self>,
         index: FileIndex,
         roots: &[PathBuf],
     ) -> Result<Arc<IndexView>, String> {
+        self.install_walked(index, roots, roots)
+    }
+
+    /// Makes `index` (walked or loaded, of `roots`; `walked` are the roots this walk read) the
+    /// base of a new live index, hides its offline roots, publishes it under a new generation,
+    /// then applies the paths changed during the walk, if any. Returns the current view.
+    fn install_walked(
+        self: &Arc<Self>,
+        index: FileIndex,
+        roots: &[PathBuf],
+        walked: &[PathBuf],
+    ) -> Result<Arc<IndexView>, String> {
         let live =
             Arc::new(LiveIndex::new(index, &walk_options(roots)).map_err(|e| e.to_string())?);
         let (view, buffered, session) = {
             let mut core = self.core();
+            // A walk that raced an unplug (or a snapshot) may hold entries of an offline root.
+            let hidden: Vec<Change> = core
+                .offline
+                .iter()
+                .filter(|r| roots.contains(r))
+                .map(|r| Change::Remove { path: r.clone() })
+                .collect();
+            if !hidden.is_empty() {
+                live.apply_changes(&hidden);
+            }
             core.session += 1;
             core.live = Some(Arc::clone(&live));
             core.live_roots = roots.to_vec();
-            let buffered = core.during_walk.take();
+            core.unheld
+                .retain(|r| !walked.contains(r) && roots.contains(r));
+            let buffered = core.during_walk.take().map(|b| {
+                let paths = core.applicable(&b.paths);
+                (b.overflowed, paths)
+            });
             let view = self.publish_new_base(&core, live.snapshot(), roots);
             (view, buffered, core.session)
         };
-        if let Some(buffer) = buffered {
-            if buffer.overflowed {
+        if let Some((overflowed, paths)) = buffered {
+            if overflowed {
                 self.rescan(roots.to_vec());
-            } else if !buffer.paths.is_empty() {
-                self.apply(&live, session, &buffer.paths, false);
+            } else if !paths.is_empty() {
+                self.apply(&live, session, &paths, false);
             }
         }
         Ok(self.index().unwrap_or(view))
@@ -890,18 +1399,33 @@ impl Indexer {
             & GENERATION_MASK
     }
 
-    /// Status for a walk of `roots` that is about to start; keeps the current entry count since
-    /// searches still use the previous index.
-    fn indexing_status(&self, roots: &[PathBuf]) -> IndexStatus {
+    /// Status for `job`, about to start; keeps the current entry count since searches still use
+    /// the previous index. `roots` are the job's online roots, `scanning` those it walks.
+    fn indexing_status(&self, job: &Job) -> IndexStatus {
+        let (online, offline, scanning) = {
+            let core = self.core();
+            let online: Vec<PathBuf> = job
+                .roots()
+                .iter()
+                .filter(|r| !core.offline.contains(r))
+                .cloned()
+                .collect();
+            let scanning = match job {
+                Job::Full(_) => online.clone(),
+                Job::Update { roots, refresh } => core
+                    .update_work(roots, refresh)
+                    .map_or_else(Vec::new, |w| if w.full { online.clone() } else { w.add }),
+            };
+            (online, core.offline.clone(), scanning)
+        };
         IndexStatus {
             state: IndexState::Indexing,
             entries: self.index().map_or(0, |ix| ix.len() as u64),
-            roots: roots
-                .iter()
-                .map(|r| r.to_string_lossy().into_owned())
-                .collect(),
+            roots: root_strings(&online),
             elapsed_ms: None,
             error: None,
+            offline: root_strings(&offline),
+            scanning: root_strings(&scanning),
         }
     }
 
@@ -916,6 +1440,13 @@ impl Indexer {
 
 fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn root_strings(roots: &[PathBuf]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Walk options for `roots` with the default exclusions from the IPC contract.
@@ -991,10 +1522,10 @@ mod tests {
         {
             let mut p = indexer.lock();
             p.running = true;
-            p.status = indexer.indexing_status(roots);
+            p.status = indexer.indexing_status(&Job::Full(roots.to_vec()));
         }
         let (l, rx) = listener();
-        indexer.run(roots.to_vec(), &l, use_snapshot);
+        indexer.run(Job::Full(roots.to_vec()), &l, use_snapshot);
         assert!(!indexer.lock().running);
         rx.try_iter().collect()
     }
@@ -1051,7 +1582,7 @@ mod tests {
         {
             let mut p = indexer.lock();
             p.running = true;
-            p.status = indexer.indexing_status(&[a.path().to_path_buf()]);
+            p.status = indexer.indexing_status(&Job::Full(vec![a.path().to_path_buf()]));
         }
         let queued =
             |d: &tempfile::TempDir| indexer.start(vec![d.path().to_path_buf()], Arc::clone(&l));
@@ -1059,7 +1590,7 @@ mod tests {
         assert_eq!(queued(&c), StartOutcome::Queued);
         assert!(rx.try_recv().is_err(), "queuing emits nothing");
         // Run the "running" walk on this thread: it must then pick up `c` (not `b`).
-        indexer.run(vec![a.path().to_path_buf()], &l, false);
+        indexer.run(Job::Full(vec![a.path().to_path_buf()]), &l, false);
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(
             states(&events),
@@ -1361,5 +1892,155 @@ mod tests {
             "the deleted file is gone"
         );
         assert!(eventually(|| indexer.status().entries == 5));
+    }
+
+    /// A folder holding one file named `name`.
+    fn drive_with(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(name), b"x").unwrap();
+        dir
+    }
+
+    /// Waits for a walk to start, then for the `ready` status that ends it.
+    fn settled(rx: &mpsc::Receiver<IndexStatus>) -> IndexStatus {
+        while next(rx).state != IndexState::Indexing {}
+        loop {
+            let s = next(rx);
+            if s.state == IndexState::Ready {
+                assert!(s.scanning.is_empty(), "{s:?}");
+                return s;
+            }
+        }
+    }
+
+    #[test]
+    fn queued_jobs_merge_and_a_full_walk_wins() {
+        let p = |s: &str| PathBuf::from(s);
+        let update = |roots: &[&str], refresh: &[&str]| Job::Update {
+            roots: roots.iter().map(|r| p(r)).collect(),
+            refresh: refresh.iter().map(|r| p(r)).collect(),
+        };
+        match update(&["/a"], &["/a"]).merge(update(&["/a", "/b"], &["/b"])) {
+            Job::Update { roots, refresh } => {
+                assert_eq!(roots, [p("/a"), p("/b")], "latest roots");
+                assert_eq!(refresh, [p("/a"), p("/b")], "both refreshes kept");
+            }
+            Job::Full(_) => panic!("two updates stay an update"),
+        }
+        assert!(matches!(
+            Job::Full(vec![p("/a")]).merge(update(&["/b"], &[])),
+            Job::Full(r) if r == [p("/b")]
+        ));
+        assert!(matches!(
+            update(&["/a"], &[]).merge(Job::Full(vec![p("/c")])),
+            Job::Full(r) if r == [p("/c")]
+        ));
+    }
+
+    #[test]
+    fn an_unplugged_root_is_hidden_at_once_and_back_after_walking_it_alone() {
+        let fixed = drive_with("fixed-file.txt");
+        let usb = drive_with("usb-file.txt");
+        let roots = vec![fixed.path().to_path_buf(), usb.path().to_path_buf()];
+        let indexer = Arc::new(Indexer::new());
+        let events = run_here(&indexer, &roots, false);
+        assert_eq!(states(&events), [IndexState::Ready]);
+        let view = indexer.index().unwrap();
+        assert!(finds(&view, "usb-file") && finds(&view, "fixed-file"));
+
+        // Unplugged: hidden without a walk, the root stays listed, offline.
+        indexer.set_offline_roots(&roots[1..]);
+        let view = indexer.index().unwrap();
+        assert!(!finds(&view, "usb-file"), "hidden at once");
+        assert!(finds(&view, "fixed-file"));
+        let status = indexer.status();
+        assert_eq!(status.state, IndexState::Ready);
+        assert_eq!(status.roots, [fixed.path().to_string_lossy().into_owned()]);
+        assert_eq!(status.offline, [usb.path().to_string_lossy().into_owned()]);
+        assert_eq!(indexer.watched_roots(), [fixed.path().to_path_buf()]);
+        // Nothing to walk while it stays unplugged.
+        let (l, rx) = listener();
+        assert_eq!(
+            indexer.reconcile(
+                roots.clone(),
+                roots[1..].to_vec(),
+                Vec::new(),
+                Arc::clone(&l)
+            ),
+            None
+        );
+
+        // Plugged back (with a new file): walked alone, then searchable again.
+        fs::write(usb.path().join("usb-new.txt"), b"x").unwrap();
+        assert!(
+            indexer
+                .reconcile(roots.clone(), Vec::new(), Vec::new(), l)
+                .is_some()
+        );
+        let done = settled(&rx);
+        assert!(done.offline.is_empty(), "{done:?}");
+        let view = indexer.index().unwrap();
+        assert!(finds(&view, "usb-file") && finds(&view, "usb-new"));
+        assert!(
+            finds(&view, "fixed-file"),
+            "the fixed drive kept its entries"
+        );
+        assert_eq!(view.len(), indexer.status().entries as usize);
+        assert!(eventually(|| indexer.watched_roots().len() == 2));
+    }
+
+    #[test]
+    fn reconcile_walks_added_roots_and_drops_removed_ones() {
+        let a = drive_with("alpha-file.txt");
+        let b = drive_with("beta-file.txt");
+        let (pa, pb) = (a.path().to_path_buf(), b.path().to_path_buf());
+        let indexer = Arc::new(Indexer::new());
+        run_here(&indexer, std::slice::from_ref(&pa), false);
+        let (l, rx) = listener();
+        assert_eq!(
+            indexer.reconcile(vec![pa.clone()], Vec::new(), Vec::new(), Arc::clone(&l)),
+            None,
+            "nothing changed"
+        );
+
+        assert!(
+            indexer
+                .reconcile(
+                    vec![pa.clone(), pb.clone()],
+                    Vec::new(),
+                    Vec::new(),
+                    Arc::clone(&l)
+                )
+                .is_some()
+        );
+        let done = settled(&rx);
+        assert_eq!(done.roots.len(), 2);
+        let view = indexer.index().unwrap();
+        assert!(finds(&view, "alpha-file") && finds(&view, "beta-file"));
+
+        assert!(
+            indexer
+                .reconcile(vec![pb.clone()], Vec::new(), Vec::new(), Arc::clone(&l))
+                .is_some()
+        );
+        let done = settled(&rx);
+        assert_eq!(done.roots, [pb.to_string_lossy().into_owned()]);
+        let view = indexer.index().unwrap();
+        assert!(!finds(&view, "alpha-file"), "dropped root");
+        assert!(finds(&view, "beta-file"));
+
+        // Another volume on the same path (`refresh`): walked again, its new content shows.
+        fs::remove_file(pb.join("beta-file.txt")).unwrap();
+        fs::write(pb.join("gamma-file.txt"), b"x").unwrap();
+        assert!(
+            indexer
+                .reconcile(vec![pb.clone()], Vec::new(), vec![pb.clone()], l)
+                .is_some()
+        );
+        settled(&rx);
+        assert!(eventually(|| {
+            let view = indexer.index().unwrap();
+            finds(&view, "gamma-file") && !finds(&view, "beta-file")
+        }));
     }
 }

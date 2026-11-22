@@ -141,6 +141,42 @@ impl FileIndex {
             + self.sizes.capacity() * size_of::<u64>()
             + self.mtimes.capacity() * size_of::<i64>()
     }
+
+    /// Builds one index from `parts`, in order: every entry of each part, except the roots
+    /// (entries without a parent, named by their full path) that `keep_root(part, name)` rejects
+    /// (`part` = position in `parts`), with their whole subtrees. Ids are renumbered; names
+    /// keep their normalized forms (no re-normalizing), so this costs one copy of the entries.
+    ///
+    /// Used to add or drop whole roots (a drive plugged in or removed) without walking the
+    /// other roots again. Each part must hold parents before children, as every index does.
+    pub fn concat(
+        parts: &[&FileIndex],
+        mut keep_root: impl FnMut(usize, &str) -> bool,
+    ) -> FileIndex {
+        let entries: usize = parts.iter().map(|p| p.len()).sum();
+        let name_bytes: usize = parts.iter().map(|p| p.names.text.len()).sum();
+        let mut b = IndexBuilder::with_capacity(entries, name_bytes / entries.max(1) + 1);
+        for (n, part) in parts.iter().enumerate() {
+            let mut remap = vec![NO_PARENT; part.len()];
+            for id in 0..part.len() as EntryId {
+                let parent = match part.parent(id) {
+                    None if !keep_root(n, part.name(id)) => continue,
+                    None => None,
+                    Some(p) => match remap[p as usize] {
+                        NO_PARENT => continue,
+                        p => Some(p),
+                    },
+                };
+                remap[id as usize] = b.push_normalized(
+                    parent,
+                    part.name(id),
+                    part.normalized_name(id),
+                    part.meta(id),
+                );
+            }
+        }
+        b.finish()
+    }
 }
 
 /// Builds a [`FileIndex`] one entry at a time. Used by the walker; also handy for tests,
@@ -275,5 +311,50 @@ mod tests {
         let expected: PathBuf = ["/data", "Docs", "مُحَاضَرَةُ.PDF"].iter().collect();
         assert_eq!(ix.path(file), expected);
         assert!(ix.heap_bytes() > 0);
+    }
+
+    #[test]
+    fn concat_keeps_chosen_roots_with_their_subtrees() {
+        let mut b = IndexBuilder::new();
+        let c = b.push(None, "C:\\", dir());
+        let e = b.push(None, "E:\\", dir());
+        let docs = b.push(Some(c), "Docs", dir());
+        b.push(Some(e), "قديم.txt", EntryMeta::default());
+        b.push(Some(docs), "a.txt", EntryMeta::default());
+        let first = b.finish();
+        let mut b = IndexBuilder::new();
+        let e2 = b.push(None, "E:\\", dir());
+        b.push(
+            Some(e2),
+            "جديد.TXT",
+            EntryMeta {
+                size: 7,
+                ..Default::default()
+            },
+        );
+        let second = b.finish();
+
+        let merged = FileIndex::concat(&[&first, &second], |_, root| root != "E:\\");
+        let paths: Vec<PathBuf> = (0..merged.len() as EntryId)
+            .map(|id| merged.path(id))
+            .collect();
+        let p = |parts: &[&str]| parts.iter().collect::<PathBuf>();
+        assert_eq!(
+            paths,
+            [
+                p(&["C:\\"]),
+                p(&["C:\\", "Docs"]),
+                p(&["C:\\", "Docs", "a.txt"]),
+            ],
+            "the root filter applies to every part"
+        );
+        let merged =
+            FileIndex::concat(&[&first, &second], |part, root| part == 1 || root != "E:\\");
+        assert_eq!(merged.len(), 5, "old E:\\ dropped, new E:\\ added");
+        assert_eq!(merged.name(4), "جديد.TXT");
+        assert_eq!(merged.normalized_name(4), "جديد txt");
+        assert_eq!(merged.meta(4).size, 7);
+        assert_eq!(merged.parent(4), Some(3));
+        assert_eq!(merged.parent(3), None);
     }
 }

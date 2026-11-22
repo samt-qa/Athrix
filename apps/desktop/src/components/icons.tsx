@@ -106,3 +106,13 @@ export function ContentMatchIcon() {
     </svg>
   );
 }
+
+/** A removable (USB) drive: a stick with its plug. */
+export function UsbIcon(props: { size?: number }) {
+  return (
+    <svg class="usb-icon" width={props.size ?? 14} height={props.size ?? 14} viewBox="0 0 24 24" {...stroke}>
+      <rect x="7" y="9" width="10" height="13" rx="2" />
+      <path d="M9 9V3h6v6M11 5.5v.01M13 5.5v.01" />
+    </svg>
+  );
+}

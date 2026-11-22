@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::content::{ContentOptions, ContentService};
+use crate::drives::DriveMonitor;
 use crate::indexing::Indexer;
 use crate::preview::PreviewAssets;
-use crate::roots::RootsSetting;
+use crate::roots::{DriveSettingsStore, RootsSetting};
 
 /// Everything the commands share: the indexer, the content service, the indexed-roots setting,
 /// the cancel flags of the latest search and preview, and the images the preview may serve.
@@ -18,6 +19,10 @@ pub struct AppState {
     pub content: Arc<ContentService>,
     /// Which folders to index (persisted in the app data folder).
     pub roots: RootsSetting,
+    /// Whether external (removable, network) drives join "the whole computer" (persisted).
+    pub drive_settings: DriveSettingsStore,
+    /// The drives seen and the external drives indexed this session (see [`crate::drives`]).
+    pub drive_monitor: DriveMonitor,
     /// Cancel flag of the most recent `search` request.
     search_cancel: Mutex<Arc<AtomicBool>>,
     /// Cancel flag of the most recent `preview_entry` request.
@@ -35,6 +40,8 @@ impl Default for AppState {
             indexer: Arc::default(),
             content: ContentService::new(ContentOptions::default()),
             roots: RootsSetting::default(),
+            drive_settings: DriveSettingsStore::default(),
+            drive_monitor: DriveMonitor::default(),
             search_cancel: Mutex::default(),
             preview_cancel: Mutex::default(),
             preview_gate: Arc::default(),

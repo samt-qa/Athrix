@@ -7,6 +7,8 @@
 // Test switches (URL query string): `?mockEntries=N` (default 4000), `?mockIndexError`,
 // `?mockStale` (the first open / reveal / copy acts as if a re-index ran after the search:
 // it rejects with the stale-id error and the ids change, like the Rust side).
+// `?mockUsb` (task 2.5): the USB stick E: is pulled out and plugged back in every 10 s
+// (`volumes://changed`, its entries hidden while offline, a short re-scan when it is back).
 //
 // Content search (tasks 4.5, 4.7): text files and documents get a short body (a few demo files
 // carry hand-written Arabic notes; the rest draw sentences from a bank). After the name index is
@@ -17,9 +19,9 @@
 // More switches: `?mockBattery` (pauses "on battery" for 8 s at about a third of the way),
 // `?mockContentError` (the content indexer fails), `?mockContentRate=N` (docs per second).
 import type {
-  CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, Favorite, HistoryEntry, IndexRoots,
+  CommandArgs, CommandName, CommandResult, ContentSnippet, ContentStatus, DriveSettings, Favorite, HistoryEntry, IndexRoots,
   IndexStatus, MatchSource, PreviewBody, PreviewResponse, QueryError, Range16, ResultItem, RowSnippet,
-  SavedSearch, SearchResponse, SearchSuggestion, Volume,
+  SavedSearch, SearchResponse, SearchSuggestion, SuggestResponse, Volume,
 } from "./api";
 import { categoryOf, type FileCategory } from "./fileKinds";
 import { tokenize, type Token } from "./queryLang";
@@ -38,7 +40,14 @@ const VOLUMES: Volume[] = [
   { path: "D:\\", name: "D:", label: "Data", kind: "fixed" },
   { path: "E:\\", name: "E:", label: "USB", kind: "removable" },
 ];
-const WHOLE_COMPUTER = VOLUMES.filter((v) => v.kind === "fixed").map((v) => v.path);
+/** The USB stick of `VOLUMES` (plugged in unless `?mockUsb` pulled it out). */
+const USB = "E:\\";
+let usbPlugged = true;
+let driveSettings: DriveSettings = { includeRemovable: true, includeNetwork: false };
+const volumesNow = () => VOLUMES.filter((v) => usbPlugged || v.path !== USB);
+/** Fixed drives, plus the USB stick when the settings take it in (offline while unplugged). */
+const wholeComputer = () =>
+  VOLUMES.filter((v) => v.kind === "fixed" || (v.kind === "removable" && driveSettings.includeRemovable)).map((v) => v.path);
 
 function clampInt(n: number, min: number, max: number) {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : min;
@@ -283,6 +292,16 @@ function buildIndex(count: number): MockEntry[] {
       name: `${stem}.${ext}`, parent: ((f) => `${baseOf(f)}\\${f}`)(pick(FOLDERS)), isDir: false,
       size: Math.max(1, Math.floor(SIZE_SCALE[cat] * Math.pow(rnd() * 2, 3))),
       modified: nowSec - age, ext,
+    });
+  }
+
+  // A few files on the USB stick (found only while E: is indexed and plugged in).
+  const usbFolder = "نسخة احتياطية";
+  push({ name: usbFolder, parent: "E:", isDir: true, size: null, modified: nowSec - 5 * 86400, ext: "" });
+  for (const [name, ext] of [["صور الرحلة", "zip"], ["تقرير المشروع النهائي", "pdf"], ["backup-notes", "txt"], ["عرض تقديمي", "pptx"]]) {
+    push({
+      name: `${name}.${ext}`, parent: `E:\\${usbFolder}`, isDir: false,
+      size: 50_000 + name.length * 9_000, modified: nowSec - 6 * 86400, ext,
     });
   }
   return entries;
@@ -566,7 +585,7 @@ function bumpGeneration(entries: MockEntry[]) {
 }
 
 let index: MockEntry[] | null = null;
-let status: IndexStatus = { state: "idle", entries: 0, roots: [], elapsedMs: null, error: null };
+let status: IndexStatus = { state: "idle", entries: 0, roots: [], elapsedMs: null, error: null, offline: [], scanning: [] };
 const listeners = new Set<(s: IndexStatus) => void>();
 let latestRequest = 0;
 
@@ -582,7 +601,7 @@ export function onIndexStatus(handler: (s: IndexStatus) => void): () => void {
 
 /** The indexed-roots setting (`null` = whole computer), kept for the page's lifetime. */
 let chosenRoots: string[] | null = null;
-const resolvedRoots = () => chosenRoots ?? WHOLE_COMPUTER;
+const resolvedRoots = () => chosenRoots ?? wholeComputer();
 
 /** Comparable path: "/" separators, no trailing "/", lower case. */
 const pathKey = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
@@ -592,10 +611,41 @@ const under = (path: string, root: string) => {
   return k === r || k.startsWith(`${r}/`);
 };
 
+/** The roots of `roots` on an unplugged drive. */
+const offlineOf = (roots: string[]) => roots.filter((r) => !usbPlugged && under(r, USB));
+
+// ---------- drives coming and going (task 2.5) ----------
+
+const volumeListeners = new Set<(v: Volume[]) => void>();
+
+export function onVolumesChanged(handler: (v: Volume[]) => void): () => void {
+  volumeListeners.add(handler);
+  return () => volumeListeners.delete(handler);
+}
+
+/** All the roots of the last indexing, online or not (`status.roots` lists the online ones). */
+let indexedRoots: string[] = [];
+const online = (roots: string[]) => roots.filter((r) => !offlineOf(roots).includes(r));
+
+function setUsbPlugged(plugged: boolean) {
+  usbPlugged = plugged;
+  for (const l of volumeListeners) l(volumesNow().map((v) => ({ ...v })));
+  const onUsb = indexedRoots.filter((r) => under(r, USB));
+  if (!onUsb.length) return;
+  // Unplugged: hidden at once. Plugged back: walked again (alone), then shown.
+  setStatus({
+    ...status, roots: online(indexedRoots), offline: offlineOf(indexedRoots), scanning: plugged ? onUsb : [],
+  });
+  if (plugged) setTimeout(() => setStatus({ ...status, scanning: [] }), 900);
+}
+
+if (params.has("mockUsb")) setInterval(() => setUsbPlugged(!usbPlugged), 10_000);
+
 function startIndexing(roots?: string[]) {
   if (status.state === "indexing") return;
   const r = roots?.length ? roots : resolvedRoots();
-  setStatus({ state: "indexing", entries: 0, roots: r, elapsedMs: null, error: null });
+  indexedRoots = r;
+  setStatus({ state: "indexing", entries: 0, roots: online(r), elapsedMs: null, error: null, offline: offlineOf(r), scanning: [] });
   const t0 = performance.now();
   setTimeout(() => {
     if (params.has("mockIndexError")) {
@@ -605,7 +655,8 @@ function startIndexing(roots?: string[]) {
     index = buildIndex(ENTRY_COUNT).filter((e) => r.some((root) => under(e.item.parent, root)));
     bumpGeneration(index);
     setStatus({
-      state: "ready", entries: index.length, roots: r, elapsedMs: Math.round(performance.now() - t0), error: null,
+      state: "ready", entries: index.length, roots: online(r), elapsedMs: Math.round(performance.now() - t0), error: null,
+      offline: offlineOf(r), scanning: [],
     });
     startContentIndexing(index);
   }, INDEX_DELAY_MS);
@@ -808,15 +859,20 @@ function suggest(query: string, p: Parsed, limit: number, scope: string | null, 
  * index (AND with the name words and filters); with `withContent` (the UI's "search contents
  * too"), a query of plain words and filters without `content:` finds files whose name matches
  * OR whose content has all the words (name hits rank first). Content hits carry a snippet.
+ * `withSuggestion`: the UI's own search (not a probe); `wantSuggestion`: also compute the
+ * "did you mean" of `search_suggest` when nothing is found.
  */
 function search(
   query: string, limit: number, requestId: number, scope: string | null, withContent = false, withSuggestion = true,
-): SearchResponse {
+  wantSuggestion = false,
+): SearchResponse & { suggestion?: SearchSuggestion | null } {
   const t0 = performance.now();
   let p: Parsed | null = null;
-  const done = (items: ResultItem[], truncated: boolean, error: QueryError | null = null): SearchResponse => ({
+  const done = (items: ResultItem[], truncated: boolean, error: QueryError | null = null) => ({
     requestId, items, truncated, error, cancelled: false,
-    suggestion: withSuggestion && p && !error && !items.length && limit > 0 ? suggest(query, p, limit, scope, withContent) : null,
+    ...(wantSuggestion
+      ? { suggestion: p && !error && !items.length && limit > 0 ? suggest(query, p, limit, scope, withContent) : null }
+      : {}),
     elapsedMs: Math.round((performance.now() - t0) * 10) / 10,
   });
   if (!query.trim()) return done([], false);
@@ -877,9 +933,11 @@ function search(
   const contentHas = (e: MockEntry, words: string[]) => words.every((w) => e.bodyNorm!.includes(w));
 
   const hits: { e: MockEntry; score: number; highlights: Range16[]; matched: MatchSource; snippet: ContentSnippet | null }[] = [];
+  const offline = status.offline ?? [];
   for (const e of index) {
     const it = e.item;
     if (scope && !under(`${it.parent}\\${it.name}`, scope)) continue;
+    if (offline.length && offline.some((o) => under(it.parent, o))) continue;
     if (p.kinds && !kindMatches(p.kinds, it)) continue;
     if (p.exts && !p.exts.includes(it.ext)) continue;
     if (p.size && !sizeMatches(p.size, it.size)) continue;
@@ -1208,23 +1266,40 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       break;
     case "list_volumes":
       await sleep(80);
-      result = VOLUMES.map((v) => ({ ...v }));
+      result = volumesNow().map((v) => ({ ...v }));
       break;
     case "get_index_roots":
-      result = { wholeComputer: chosenRoots === null, roots: resolvedRoots() } satisfies IndexRoots;
+      result = { wholeComputer: chosenRoots === null, roots: resolvedRoots(), offline: offlineOf(resolvedRoots()) } satisfies IndexRoots;
       break;
     case "set_index_roots": {
       const roots = args.roots as string[] | null;
       if (roots !== null && roots.length === 0) throw "choose at least one drive or folder to index";
       chosenRoots = roots;
       const next = resolvedRoots();
-      const same = next.length === status.roots.length && next.every((x, i) => pathKey(x) === pathKey(status.roots[i]));
+      const same = next.length === indexedRoots.length && next.every((x, i) => pathKey(x) === pathKey(indexedRoots[i]));
       if (!same) {
         // Like the Rust queue (latest wins), simplified: restart once the running walk ends.
         if (status.state === "indexing") setTimeout(() => startIndexing(resolvedRoots()), INDEX_DELAY_MS + 50);
         else startIndexing(next);
       }
-      result = { wholeComputer: roots === null, roots: next } satisfies IndexRoots;
+      result = { wholeComputer: roots === null, roots: next, offline: offlineOf(next) } satisfies IndexRoots;
+      break;
+    }
+    case "get_drive_settings":
+      result = { ...driveSettings };
+      break;
+    case "set_drive_settings": {
+      const next = args.settings as DriveSettings;
+      driveSettings = { includeRemovable: next.includeRemovable !== false, includeNetwork: next.includeNetwork === true };
+      if (chosenRoots === null) {
+        const roots = wholeComputer();
+        const same = roots.length === indexedRoots.length && roots.every((x, i) => pathKey(x) === pathKey(indexedRoots[i]));
+        if (!same) {
+          if (status.state === "indexing") setTimeout(() => startIndexing(resolvedRoots()), INDEX_DELAY_MS + 50);
+          else startIndexing(roots);
+        }
+      }
+      result = { ...driveSettings };
       break;
     }
     case "search": {
@@ -1243,6 +1318,20 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
           throw `invalid search scope: "${scope}" is not an absolute path or a drive like D:`;
         }
         result = search(query, args.limit as number, requestId, scope || null, args.searchContent === true);
+      }
+      break;
+    }
+    case "search_suggest": {
+      // Like the Rust side: asked after an empty result, cancelled by a newer search.
+      const requestId = args.requestId as number;
+      latestRequest = Math.max(latestRequest, requestId);
+      await sleep(5 + Math.floor(Math.random() * 20));
+      if (requestId < latestRequest) {
+        result = { requestId, suggestion: null, cancelled: true } satisfies SuggestResponse;
+      } else {
+        const scope = ((args.scope as string | null | undefined) ?? "").trim() || null;
+        const r = search(args.query as string, args.limit as number, requestId, scope, args.searchContent === true, false, true);
+        result = { requestId, suggestion: r.suggestion ?? null, cancelled: false } satisfies SuggestResponse;
       }
       break;
     }

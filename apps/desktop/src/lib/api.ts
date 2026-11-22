@@ -15,6 +15,13 @@ export interface IndexStatus {
   elapsedMs: number | null;
   /** English message when state = "error". */
   error: string | null;
+  /**
+   * Indexed roots whose drive is unplugged (not in `roots`, which lists the searchable ones):
+   * their entries are hidden until it comes back. Optional for older backends.
+   */
+  offline?: string[];
+  /** Roots being walked right now (a drive just plugged in, a new folder). Optional. */
+  scanning?: string[];
 }
 
 /** A UTF-16 [start, end) range, ready for `String.prototype.slice`. */
@@ -99,8 +106,15 @@ export interface SearchResponse {
   elapsedMs: number;
   error: QueryError | null;
   cancelled: boolean;
-  /** "Did you mean": only when a valid query found nothing and a rewrite of it finds something. */
-  suggestion?: SearchSuggestion | null;
+}
+
+/** `search_suggest`, asked after a search found nothing (so the probes never delay the empty answer). */
+export interface SuggestResponse {
+  requestId: number;
+  /** "Did you mean": a rewrite of the query that finds something, or null. */
+  suggestion: SearchSuggestion | null;
+  /** A newer search or suggest cancelled this one. */
+  cancelled: boolean;
 }
 
 /** A query to offer instead of one that found nothing. */
@@ -132,6 +146,16 @@ export interface IndexRoots {
   wholeComputer: boolean;
   /** The folders indexed under that choice now. */
   roots: string[];
+  /** Those of `roots` whose drive is unplugged now (kept, searched again when it is back). */
+  offline: string[];
+}
+
+/** Whether external drives join "the whole computer" (`get_drive_settings` / `set_drive_settings`). */
+export interface DriveSettings {
+  /** USB sticks, SD cards... Default true. */
+  includeRemovable: boolean;
+  /** Mapped network drives. Default false. */
+  includeNetwork: boolean;
 }
 
 /** Header of a preview: name, full path and metadata of the entry. */
@@ -227,9 +251,16 @@ export interface Commands {
   get_index_roots: [undefined, IndexRoots];
   /** `roots: null` = whole computer. */
   set_index_roots: [{ roots: string[] | null }, IndexRoots];
+  get_drive_settings: [undefined, DriveSettings];
+  set_drive_settings: [{ settings: DriveSettings }, DriveSettings];
   /** `scope`: a root from `IndexStatus.roots` (e.g. "D:\\") to search only there; null = everywhere. */
   /** `searchContent`: plain words also search file contents (a `content:` filter always does). */
   search: [{ query: string; limit: number; requestId: number; scope: string | null; searchContent?: boolean }, SearchResponse];
+  /**
+   * "Did you mean" for a query whose `search` (same arguments) found nothing; ask after a short pause.
+   * A newer `search` cancels it (and it cancels a running search).
+   */
+  search_suggest: [{ query: string; limit: number; requestId: number; scope: string | null; searchContent?: boolean }, SuggestResponse];
   open_entry: [{ id: number }, void];
   reveal_entry: [{ id: number }, void];
   entry_path: [{ id: number }, string];
@@ -282,6 +313,8 @@ export type CommandResult<C extends CommandName> = Commands[C][1];
 
 export const INDEX_STATUS_EVENT = "index://status";
 export const CONTENT_STATUS_EVENT = "content://status";
+/** A drive was plugged in or removed: payload `Volume[]` (the new list). */
+export const VOLUMES_CHANGED_EVENT = "volumes://changed";
 /** "Search in Athrix" from the Explorer right-click menu on a folder: payload `{ path }`. */
 export const SEARCH_IN_EVENT = "app://search-in";
 
@@ -313,6 +346,12 @@ export async function call<C extends CommandName>(cmd: C, args?: CommandArgs<C>)
 export async function onIndexStatus(handler: (status: IndexStatus) => void): Promise<() => void> {
   if (usingMock) return (await mock()).onIndexStatus(handler);
   return listen<IndexStatus>(INDEX_STATUS_EVENT, (e) => handler(e.payload));
+}
+
+/** Subscribes to `volumes://changed`; resolves to an unsubscribe function. */
+export async function onVolumesChanged(handler: (volumes: Volume[]) => void): Promise<() => void> {
+  if (usingMock) return (await mock()).onVolumesChanged(handler);
+  return listen<Volume[]>(VOLUMES_CHANGED_EVENT, (e) => handler(e.payload));
 }
 
 /** Subscribes to `content://status` (at most twice a second); resolves to an unsubscribe function. */
@@ -348,8 +387,12 @@ export const api = {
   listVolumes: () => call("list_volumes"),
   getIndexRoots: () => call("get_index_roots"),
   setIndexRoots: (roots: string[] | null) => call("set_index_roots", { roots }),
+  getDriveSettings: () => call("get_drive_settings"),
+  setDriveSettings: (settings: DriveSettings) => call("set_drive_settings", { settings }),
   search: (query: string, limit: number, requestId: number, scope: string | null = null, searchContent = false) =>
     call("search", { query, limit, requestId, scope, searchContent }),
+  searchSuggest: (query: string, limit: number, requestId: number, scope: string | null = null, searchContent = false) =>
+    call("search_suggest", { query, limit, requestId, scope, searchContent }),
   openEntry: (id: number) => call("open_entry", { id }),
   revealEntry: (id: number) => call("reveal_entry", { id }),
   entryPath: (id: number) => call("entry_path", { id }),

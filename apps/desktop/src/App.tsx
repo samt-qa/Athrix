@@ -2,6 +2,7 @@ import { batch, createEffect, createMemo, createResource, createSignal, Match, o
 import { locale, localeDir, t } from "./i18n";
 import {
   api, errorMessage, isStaleIdError, onIndexStatus, onSearchIn, onUpdateAvailable, usingMock, type UpdateInfo, type IndexStatus, type QueryError, type SearchResponse,
+  type SearchSuggestion,
 } from "./lib/api";
 import { applySuggestion, composeQuery, suggestionInput, type ChipKind } from "./lib/query";
 import SearchField from "./components/SearchField";
@@ -31,6 +32,13 @@ const LIMIT = (() => {
   const v = import.meta.env.DEV ? Number(new URLSearchParams(window.location.search).get("limit")) : NaN;
   return Number.isFinite(v) && v > 0 ? Math.floor(Math.min(v, 100_000)) : 200;
 })();
+
+/**
+ * "Did you mean" is asked (`search_suggest`) this long after an empty result, if no newer
+ * keystroke came: its probes (a ranked `fuzzy:` scan) cost more than the search itself, so
+ * they run apart from it and only once typing pauses.
+ */
+const SUGGEST_DELAY_MS = 150;
 
 const LIST_ID = "results";
 const ERROR_ID = "query-error";
@@ -93,8 +101,13 @@ export default function App(props: { mode: WindowMode }) {
   const sent = createMemo(() => composeQuery(text(), chip()));
   // Where to search: "" = whole computer, else one indexed root. A remembered drive that is no
   // longer indexed falls back to the whole computer.
-  const roots = () => index()?.roots ?? [];
-  const scope = createMemo(() => effectiveScope(storedScope(), index()?.roots));
+  // Roots on an unplugged drive are not offered, and a scope on one falls back to everywhere
+  // (it comes back with the drive).
+  const roots = () => {
+    const offline = (index()?.offline ?? []).map(rootKey);
+    return (index()?.roots ?? []).filter((r) => !offline.includes(rootKey(r)));
+  };
+  const scope = createMemo(() => effectiveScope(storedScope(), index() ? roots() : undefined));
 
   // Whole numbers: Rust reads requestId as u64. Seeded from the clock so ids keep increasing
   // across a webview reload (or HMR) while the backend stays alive.
@@ -102,11 +115,28 @@ export default function App(props: { mode: WindowMode }) {
   // A search is on its way: the list holds `content_snippets` requests meanwhile, since the
   // backend answers them with the query of the last search it finished.
   const [searchPending, setSearchPending] = createSignal(false);
+  // "Did you mean" for the shown (empty) response, asked separately after a pause.
+  const [suggestion, setSuggestion] = createSignal<SearchSuggestion | null>(null);
+  let suggestTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(suggestTimer));
+  async function askSuggestion(query: string, where: string, withContent: boolean, requestId: number) {
+    if (requestId !== lastRequest) return;
+    try {
+      const s = await api.searchSuggest(query, LIMIT, requestId, where || null, withContent);
+      // Same request id as the search it completes: dropped once anything newer was sent.
+      if (requestId !== lastRequest || s.requestId !== requestId || s.cancelled) return;
+      setSuggestion(s.suggestion);
+    } catch (err) {
+      console.warn("no suggestion", err);
+    }
+  }
   async function runSearch(query: string, where: string, withContent = searchContent()) {
     const requestId = ++lastRequest;
+    clearTimeout(suggestTimer);
     if (!query.trim()) {
       batch(() => {
         setResponse(null);
+        setSuggestion(null);
         setFailure(null);
         setSelected(0);
         setSearchPending(false);
@@ -124,10 +154,14 @@ export default function App(props: { mode: WindowMode }) {
       }
       batch(() => {
         setResponse(r);
+        setSuggestion(null);
         setFailure(null);
         setSelected(0);
         setSearchPending(false);
       });
+      if (!r.items.length && !r.error) {
+        suggestTimer = setTimeout(() => void askSuggestion(query, where, withContent, requestId), SUGGEST_DELAY_MS);
+      }
     } catch (err) {
       if (requestId === lastRequest) {
         batch(() => {
@@ -147,7 +181,7 @@ export default function App(props: { mode: WindowMode }) {
   const items = () => response()?.items ?? [];
   // "Did you mean": the backend rewrote the query as sent; the field gets it without the chip suffix.
   const didYouMean = () => {
-    const s = response()?.suggestion;
+    const s = suggestion();
     return s ? { text: suggestionInput(s.query, chip()), kind: s.kind } : null;
   };
   const queryError = () => response()?.error ?? null;

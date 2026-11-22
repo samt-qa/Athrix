@@ -91,6 +91,8 @@ body {
 /* Scope selector (whole computer / one drive) at the inline end of the search bar. */
 .scope-select { flex: none; }
 .scope-select .segmented-btn { padding-inline: 10px; white-space: nowrap; }
+.scope-option { display: inline-flex; align-items: center; gap: 4px; }
+.usb-icon { flex: none; }
 .search-field { position: relative; flex: 1; min-inline-size: 0; block-size: 100%; }
 /* The input and the highlight layer must lay text out identically: same box, font and spacing. */
 .search input, .search-mirror {
@@ -422,6 +424,9 @@ mark.match {
 .drives-whole { font-weight: 500; }
 .drives-name { font: 500 13px/1.4 var(--font-mono); min-inline-size: 2.5em; }
 .drives-detail { color: var(--text-secondary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drives-usb { display: inline-flex; color: var(--text-secondary); }
+.drives-row.offline .drives-name { color: var(--text-secondary); text-decoration: line-through dotted; }
+.drives-row.offline .drives-detail { font-style: italic; }
 .drives-note { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
 .drives-note[role="alert"] { color: var(--danger); }
 .drives-actions { display: flex; justify-content: flex-end; gap: 8px; margin-block-start: 12px; }
@@ -470,6 +475,8 @@ kbd {
 .notice { color: var(--accent); }
 .elapsed { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .index-roots { color: var(--text-muted); }
+.index-scanning { color: var(--text-secondary); }
+.index-offline { color: var(--text-muted); font-style: italic; }
 
 /* ---- Quick-search popup (design §9.1) ----
    A frameless, transparent window sized to .quick-frame (see lib/window.ts): the rounded panel

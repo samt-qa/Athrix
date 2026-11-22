@@ -186,6 +186,9 @@ fn cut_end(text: &str, hi: usize, max: usize) -> usize {
 }
 
 #[cfg(test)]
+mod prop_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

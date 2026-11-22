@@ -38,7 +38,11 @@ use std::ops::Range;
 
 /// Version of the tokenizer and stemmer rules. Bump it whenever a change would give a
 /// different term for the same text, so persisted indexes know they must be rebuilt.
-pub const ANALYZER_VERSION: u32 = 1;
+///
+/// - 2: invisible format characters that nass deletes (soft hyphen, zero-width space, BOM,
+///   bidi embeddings and isolates) and Arabic Extended-B marks no longer split a word;
+///   invisible characters and tatweel at a word's edge are not part of it.
+pub const ANALYZER_VERSION: u32 = 2;
 
 /// Normalized words longer than this (in bytes) are not indexed.
 pub const MAX_TOKEN_BYTES: usize = 80;
@@ -169,17 +173,27 @@ impl Tokens<'_> {
         }
     }
 
-    /// Next run of word characters in the original text.
+    /// Next run of word characters in the original text, without the invisible format
+    /// characters and tatweel at its edges (see [`is_edge_filler`]); runs of only those are
+    /// skipped.
     fn next_segment(&mut self) -> Option<Range<usize>> {
-        let rest = &self.text[self.cursor..];
-        let (skip, _) = rest.char_indices().find(|&(_, c)| is_word_char(c))?;
-        let start = self.cursor + skip;
-        let len = self.text[start..]
-            .char_indices()
-            .find(|&(_, c)| !is_word_char(c))
-            .map_or(self.text.len() - start, |(i, _)| i);
-        self.cursor = start + len;
-        Some(start..start + len)
+        loop {
+            let rest = &self.text[self.cursor..];
+            let (skip, _) = rest.char_indices().find(|&(_, c)| is_word_char(c))?;
+            let start = self.cursor + skip;
+            let len = self.text[start..]
+                .char_indices()
+                .find(|&(_, c)| !is_word_char(c))
+                .map_or(self.text.len() - start, |(i, _)| i);
+            self.cursor = start + len;
+            let seg = &self.text[start..start + len];
+            let trimmed = seg.trim_start_matches(is_edge_filler);
+            let lead = seg.len() - trimmed.len();
+            let trimmed = trimmed.trim_end_matches(is_edge_filler);
+            if !trimmed.is_empty() {
+                return Some(start + lead..start + lead + trimmed.len());
+            }
+        }
     }
 
     /// Queues the term(s) for one normalized word (in segment order; reversed afterwards).
@@ -241,12 +255,32 @@ fn lower(word: &str) -> String {
     }
 }
 
+/// Invisible format characters and the tatweel: word characters inside a word (see
+/// [`is_word_char`]), but trimmed off the edges of a segment. At an edge they carry nothing,
+/// and nass decides whether to keep a ZWNJ / ZWJ by looking at its neighbours, which a segment
+/// cuts off: «،\u{200C}» would otherwise give a token made of a lone ZWNJ, and «a\u{200C}ـ» the
+/// term «a\u{200C}».
+fn is_edge_filler(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0640}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Whether `c` belongs to a word segment of the ORIGINAL text.
 ///
 /// Word characters: ASCII letters and digits, any Unicode alphanumeric, combining marks
 /// (Arabic harakat, Quranic marks, Latin/Hebrew combining marks), the Arabic blocks except
-/// Arabic punctuation (، ؛ ؟ ٪ ٫ ٬ ٭ ۔), and the zero-width joiners and direction marks
-/// (nass removes them, but they appear inside words). Everything else separates words,
+/// Arabic punctuation (، ؛ ؟ ٪ ٫ ٬ ٭ ۔), and the invisible format characters nass removes but
+/// that appear inside words: zero-width (non-)joiners and spaces, direction marks, bidi
+/// embeddings and isolates, the soft hyphen and the BOM. As separators they
+/// would split a word that name search (nass) sees whole. Everything else separates words,
 /// including `_`, `.`, `-` and `'`: «تقرير_2026.pdf» gives «تقرير», «2026», «pdf».
 ///
 /// This is a character-class splitter, not full UAX #29 word segmentation: UAX #29 keeps
@@ -263,10 +297,14 @@ pub fn is_word_char(c: char) -> bool {
         '\u{FD3E}' | '\u{FD3F}' => false, // ornate parentheses
         '\u{0600}'..='\u{06FF}'
         | '\u{0750}'..='\u{077F}'
-        | '\u{08A0}'..='\u{08FF}'
+        | '\u{0870}'..='\u{08FF}'
         | '\u{FB50}'..='\u{FDFF}'
         | '\u{FE70}'..='\u{FEFE}' => true,
-        '\u{200C}'..='\u{200F}' => true,
+        '\u{00AD}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}' => true,
         '\u{0300}'..='\u{036F}'
         | '\u{0483}'..='\u{0489}'
         | '\u{0591}'..='\u{05C7}'
@@ -371,6 +409,41 @@ mod tests {
         };
         let t: Vec<_> = a.tokens("والمكتبات").map(|t| t.text).collect();
         assert_eq!(t, ["والمكتبات"]);
+    }
+
+    /// Regression (found by `prop_text::tokenize_normalized_text_gives_the_same_terms`): a
+    /// zero-width no-break space (BOM) inside a word split it in two, while nass, and so name
+    /// search, deletes it. Same for the soft hyphen of justified PDF/Word text and bidi controls.
+    #[test]
+    fn invisible_format_characters_do_not_split_words() {
+        assert_eq!(terms("٠\u{FEFF}٠"), ["00"]);
+        // Arabic Extended-B (U+0870..U+089F) marks, like the other Arabic blocks.
+        assert_eq!(terms("٠\u{898}ا"), ["0ا"]);
+        for c in ['\u{AD}', '\u{200B}', '\u{202B}', '\u{2067}', '\u{FEFF}'] {
+            let text = format!("تق{c}رير");
+            let toks: Vec<_> = tokenize(&text).collect();
+            assert_eq!(toks.len(), 1, "{c:?}");
+            assert_eq!(toks[0].text, "تقرير");
+            assert_eq!(&text[toks[0].span()], text);
+        }
+    }
+
+    /// Regression (found by `prop_text::tokenize_normalized_text_gives_the_same_terms`): a
+    /// ZWNJ cut off from its Arabic neighbour by a separator was kept by nass and became a
+    /// token of its own (an invisible term); joiners at a word's edge are now trimmed.
+    #[test]
+    fn joiners_at_word_edges_are_trimmed() {
+        assert!(terms("،\u{200C}").is_empty());
+        assert!(terms("\u{200D}\u{FEFF} \u{200C}").is_empty());
+        // A tatweel after the joiner hid the edge.
+        assert_eq!(terms("a\u{200C}ـ\u{3347A}"), ["a"]);
+        let text = "،\u{200C}abc\u{200D}، كتاب\u{200C}";
+        let toks: Vec<_> = tokenize(text).collect();
+        let got: Vec<_> = toks
+            .iter()
+            .map(|t| (t.text.as_str(), &text[t.span()]))
+            .collect();
+        assert_eq!(got, [("abc", "abc"), ("كتاب", "كتاب")]);
     }
 
     #[test]

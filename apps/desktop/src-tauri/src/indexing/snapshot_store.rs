@@ -53,9 +53,27 @@ impl SnapshotStore {
         self.dir.join(ROOTS_FILE)
     }
 
-    /// Loads the snapshot if it exists, covers exactly `roots` and is valid. Missing, foreign,
-    /// corrupt, old-version or unreadable snapshots give `None` (logged).
-    pub fn load(&self, roots: &[PathBuf]) -> Option<FileIndex> {
+    /// Loads the snapshot if it exists and is valid, with the roots it covers, provided they
+    /// share at least one root with `roots` (an external drive plugged in or removed since it
+    /// was saved changes the roots; the caller hides or walks the difference). Missing,
+    /// unrelated, corrupt, old-version or unreadable snapshots give `None` (logged).
+    pub fn load_overlapping(&self, roots: &[PathBuf]) -> Option<(FileIndex, Vec<PathBuf>)> {
+        let saved = self.saved_roots()?;
+        if !saved.iter().any(|r| roots.contains(r)) {
+            tracing::info!("index snapshot covers other roots; ignoring it");
+            return None;
+        }
+        match FileIndex::load(&self.snapshot_path()) {
+            Ok(index) => Some((index, saved)),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot load the index snapshot; ignoring it");
+                None
+            }
+        }
+    }
+
+    /// The roots of the stored snapshot, from its sidecar (`None` if missing or unusable).
+    fn saved_roots(&self) -> Option<Vec<PathBuf>> {
         let sidecar = match fs::read(self.roots_path()) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -68,22 +86,29 @@ impl SnapshotStore {
             }
         };
         match serde_json::from_slice::<Sidecar>(&sidecar) {
-            Ok(s) if s.version == SIDECAR_VERSION && s.roots == root_strings(roots) => {}
-            Ok(s) if s.version != SIDECAR_VERSION => {
+            Ok(s) if s.version == SIDECAR_VERSION => {
+                Some(s.roots.into_iter().map(PathBuf::from).collect())
+            }
+            Ok(s) => {
                 tracing::info!(
                     version = s.version,
                     "index snapshot roots file has another version; ignoring the snapshot"
                 );
-                return None;
-            }
-            Ok(_) => {
-                tracing::info!("index snapshot covers other roots; ignoring it");
-                return None;
+                None
             }
             Err(e) => {
                 tracing::warn!(error = %e, "index snapshot roots file is corrupt; ignoring it");
-                return None;
+                None
             }
+        }
+    }
+
+    /// Loads the snapshot if it exists, covers exactly `roots` and is valid. Missing, foreign,
+    /// corrupt, old-version or unreadable snapshots give `None` (logged).
+    pub fn load(&self, roots: &[PathBuf]) -> Option<FileIndex> {
+        if root_strings(&self.saved_roots()?) != root_strings(roots) {
+            tracing::info!("index snapshot covers other roots; ignoring it");
+            return None;
         }
         match FileIndex::load(&self.snapshot_path()) {
             Ok(index) => Some(index),
@@ -164,6 +189,22 @@ mod tests {
         assert_eq!(store.load(&roots).unwrap().len(), 2);
         assert!(store.load(&[PathBuf::from("/other")]).is_none());
         assert!(store.load(&[]).is_none());
+    }
+
+    #[test]
+    fn overlapping_roots_load_with_the_saved_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let saved = vec![PathBuf::from("/data"), PathBuf::from("/media/usb")];
+        store.save(&sample(), &saved).unwrap();
+        // The stick is gone now: same snapshot, its roots returned for the caller to hide.
+        let (index, roots) = store.load_overlapping(&[PathBuf::from("/data")]).unwrap();
+        assert_eq!((index.len(), roots), (2, saved.clone()));
+        assert!(store.load_overlapping(&[PathBuf::from("/other")]).is_none());
+        assert!(
+            store.load(&[PathBuf::from("/data")]).is_none(),
+            "exact load stays exact"
+        );
     }
 
     #[test]
