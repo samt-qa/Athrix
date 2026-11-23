@@ -133,6 +133,20 @@ npm run tauri build    # مثبّت NSIS في target/release/bundle/nsis
 
 **التوثيق:** [البحث والمزايا](docs/01-RESEARCH-AND-FEATURES.md) · [نظام التصميم](docs/02-DESIGN-SYSTEM.md) · [عقد الواجهة](docs/IPC-CONTRACT.md) · [تدقيق الأداء](docs/PERF-AUDIT.md) · [الإصدار](docs/RELEASE.md)
 
+## سياسة توقيع الكود / Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+> **الحالة:** طلب الشهادة المجانية لم يُقبل بعد، فالإصدارات الحالية غير موقّعة وقد يظهر تحذير SmartScreen عند التثبيت.
+> **Status:** the free certificate is not approved yet, so current releases are unsigned and Windows SmartScreen may warn on install.
+
+- **الملفات الموقّعة:** يُوقَّع فقط ما يُبنى من هذا المستودع عبر GitHub Actions، وهو التطبيق والعامل والمثبّت. ولكل توقيع موافقة يدوية.
+- **المطوّرون والمراجعون (Committers and reviewers):** [أعضاء المنظمة samt-qa](https://github.com/orgs/samt-qa/people). أي مساهمة من خارجهم تُراجَع قبل الدمج.
+- **الموافقون على التوقيع (Approvers):** [مالكو المنظمة](https://github.com/orgs/samt-qa/people?query=role%3Aowner).
+- **الخصوصية (Privacy policy):** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+  - البرنامج لا يتصل بالإنترنت إلا عند فحص التحديثات، وهذا الفحص يدوي ما لم يفعّله المستخدم. يرسل الفحص طلبًا إلى GitHub Releases وحده، دون أي بيانات عن الملفات.
+  - خادم MCP معطّل افتراضيًا. عند تفعيله يعمل محليًا فقط مع المساعد الذي يربطه المستخدم، وفي المجلدات التي يختارها.
+
 ## المساهمة
 
 المساهمات مرحّب بها. اقرأ [`CONTRIBUTING.md`](CONTRIBUTING.md) قبل البدء، والتزم بـ [ميثاق السلوك](CODE_OF_CONDUCT.md). للإبلاغ عن ثغرة أمنية راجع [`SECURITY.md`](SECURITY.md) ولا تفتح Issue عامًا.
@@ -188,6 +202,11 @@ cd apps/desktop
 npm install
 npm run tauri dev
 ```
+
+**Code signing policy:** Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). Not approved yet, so current releases are unsigned. Only artifacts built from this repository by GitHub Actions are signed, and each signing request is approved manually.
+- Committers and reviewers: [samt-qa members](https://github.com/orgs/samt-qa/people). Changes from anyone else are reviewed before merging.
+- Approvers: [samt-qa owners](https://github.com/orgs/samt-qa/people?query=role%3Aowner).
+- Privacy policy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. The only network request is the update check, which is manual unless the user turns it on, and goes to GitHub Releases without any file data. The MCP server is off by default and, when enabled, runs locally for the assistant and folders the user chooses.
 
 **Contributing:** see [`CONTRIBUTING.md`](CONTRIBUTING.md), the [Code of Conduct](CODE_OF_CONDUCT.md) and the [security policy](SECURITY.md).
 
