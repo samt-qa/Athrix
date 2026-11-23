@@ -131,6 +131,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn presentation_forms_leave_no_tatweel() {
+        // nass 0.4.1: «ﹷ» (tatweel with fatha) used to leave a tatweel at the search level.
+        assert_eq!(normalize_name("\u{628}\u{FE77}"), "\u{628}");
+        let once = normalize_name("\u{FE71}\u{628}\u{FCF2}");
+        assert_eq!(normalize_name(&once), once);
+        assert!(!once.contains('\u{640}'));
+    }
+
+    #[test]
     fn removes_diacritics_from_names() {
         assert_eq!(
             normalize_name("مُحَاضَرَةُ الفِقْهِ"),

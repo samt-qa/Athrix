@@ -3052,9 +3052,9 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nass"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3a1e53abf229ef30f9120b13559443c01805303cd40df753af4837c131a70dd"
+checksum = "8c9b61383a397038013b778fea07a24cbe5626cccfd1ee2ad8af5d4a5c953c8c"
 
 [[package]]
 name = "native-tls"

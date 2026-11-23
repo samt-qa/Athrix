@@ -56,7 +56,8 @@ const FORMAT_VERSION: u32 = 2;
 ///
 /// - 2: names fold ة → ه, ؤ → و, ئ → ي (decision 7). Snapshots of epoch 1 keep those letters
 ///   in their normalized names, so they are rejected and the index is rebuilt.
-const NORMALIZER_EPOCH: u32 = 2;
+/// - 3: nass 0.4.1 no longer leaves a tatweel from presentation forms such as «ﹷ».
+const NORMALIZER_EPOCH: u32 = 3;
 
 /// Names covering the normalization rules (diacritics, alef/yaa/taa marbuta/kaf variants,
 /// tatweel, ligatures, digits, invisible marks, case folding, separators). Their normalized
@@ -76,6 +77,7 @@ const NORMALIZER_PROBES: &[&str] = &[
     "Report_2026-final (3).tar.gz",
     "ÉCOLE Straße İstanbul",
     "الفِقْه وَالتَّفْسِير",
+    "\u{628}\u{FE77} \u{FE71}",
 ];
 
 const HEADER_LEN: u64 = 8 + 4 + 4 + 7 * 8;
