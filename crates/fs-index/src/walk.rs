@@ -1,16 +1,16 @@
-//! Parallel directory walk (via `jwalk`) that fills an [`IndexBuilder`].
+//! Parallel directory walk with bounded memory that fills an [`IndexBuilder`].
 //!
 //! This is the cross-platform path; on Windows, [`crate::ntfs`] fills the same builder from an
 //! NTFS volume enumeration with the same exclusion rules.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::UNIX_EPOCH;
 
 use athrix_core::{Error, Result};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use jwalk::WalkDirGeneric;
 
 use crate::index::{EntryId, EntryMeta, FileIndex, IndexBuilder};
 
@@ -52,7 +52,7 @@ impl WalkOptions {
         self
     }
 
-    /// Follows symbolic links and junctions (off by default; loops are detected by `jwalk`).
+    /// Follows symbolic links and junctions (off by default; a folder reached twice is listed once).
     pub fn follow_links(mut self, follow: bool) -> Self {
         self.follow_links = follow;
         self
@@ -146,9 +146,6 @@ fn prefix_key(path: &Path) -> String {
         s.to_owned()
     }
 }
-
-/// Per-entry state computed on the walker threads.
-type State = ((), EntryMeta);
 
 /// Walks every root in `opts` in parallel and builds the name index.
 ///
@@ -372,27 +369,6 @@ fn unix_seconds(t: std::time::SystemTime) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
-fn read_meta(path: &Path, follow_links: bool, counters: &Counters) -> Option<EntryMeta> {
-    let md = if follow_links {
-        std::fs::metadata(path)
-    } else {
-        std::fs::symlink_metadata(path)
-    };
-    match md {
-        Ok(md) => Some(meta_from(&md)),
-        Err(e) => {
-            Counters::add(&counters.unreadable_metadata);
-            if is_expected_error(&e) {
-                Counters::add(&counters.expected_errors);
-                tracing::debug!(path = %path.display(), error = %e, "cannot read metadata");
-            } else {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
-            }
-            None
-        }
-    }
-}
-
 /// Windows error codes that whole-drive walks meet by the thousand in system folders and that
 /// are not worth a warning (besides "access denied", which has its own
 /// [`std::io::ErrorKind`]).
@@ -415,13 +391,13 @@ pub(crate) fn is_expected_error(e: &std::io::Error) -> bool {
                 .is_some_and(|code| EXPECTED_WINDOWS_ERRORS.contains(&code)))
 }
 
-/// Logs a jwalk error: `debug` for the expected ones, `warn` otherwise.
-fn log_entry_error(e: &jwalk::Error, counters: &Counters) {
-    if e.io_error().is_some_and(is_expected_error) {
+/// Logs an unreadable directory entry: `debug` for the expected errors, `warn` otherwise.
+fn log_entry_error(dir: &Path, e: &std::io::Error, counters: &Counters) {
+    if is_expected_error(e) {
         Counters::add(&counters.expected_errors);
-        tracing::debug!(error = %e, "skipping unreadable entry");
+        tracing::debug!(dir = %dir.display(), error = %e, "skipping unreadable entry");
     } else {
-        tracing::warn!(error = %e, "skipping unreadable entry");
+        tracing::warn!(dir = %dir.display(), error = %e, "skipping unreadable entry");
     }
 }
 
@@ -449,7 +425,70 @@ pub(crate) fn walk_root(
     skipped.access_denied += stats.access_denied;
 }
 
+/// Most threads listing folders at once. Listing is I/O bound and each thread adds buffers,
+/// so more than this does not pay off.
+const MAX_WALK_THREADS: usize = 8;
+
+/// Listed folders waiting for the builder. Bounds the walk's memory: workers block once this
+/// many listings are pending (a jwalk walk buffered without limit, gigabytes on big drives).
+const PENDING_LISTINGS: usize = 64;
+
+/// A folder to list: its path and its id in the builder.
+struct DirTask {
+    path: PathBuf,
+    id: EntryId,
+    /// When links are followed: the real paths of this folder's ancestors (a link back up
+    /// to one of them would loop).
+    chain: Option<Arc<Chain>>,
+}
+
+/// One real folder path in a chain of ancestors.
+struct Chain {
+    real: PathBuf,
+    up: Option<Arc<Chain>>,
+}
+
+impl Chain {
+    fn contains(mut node: Option<&Arc<Chain>>, real: &Path) -> bool {
+        while let Some(n) = node {
+            if n.real == real {
+                return true;
+            }
+            node = n.up.as_ref();
+        }
+        false
+    }
+}
+
+/// A listed folder: its kept children, sorted by name.
+struct Listing {
+    task: DirTask,
+    children: Vec<Child>,
+    /// The chain for its subfolders (links followed only).
+    chain: Option<Arc<Chain>>,
+}
+
+struct Child {
+    name: std::ffi::OsString,
+    meta: EntryMeta,
+    /// Listed in turn (a folder, not a link unless links are followed).
+    descend: bool,
+}
+
+/// Folders waiting for a worker. `done` is set by the builder once every folder is listed.
+#[derive(Default)]
+struct TaskQueue {
+    tasks: Vec<DirTask>,
+    done: bool,
+}
+
 /// Walks one root into `builder`, counting what could not be read in `counters`.
+///
+/// Up to [`MAX_WALK_THREADS`] workers list folders (children with their metadata, filtered by
+/// the exclusions) and hand each listing to this thread, which adds the children to the
+/// builder and queues the subfolders. Parents always come before their children, and the root
+/// with its whole subtree forms one block of ids. Pending folders are taken last-in first-out,
+/// so the walk goes roughly depth-first and the queue stays small.
 pub(crate) fn walk_counted(
     root: &Path,
     follow_links: bool,
@@ -457,91 +496,224 @@ pub(crate) fn walk_counted(
     builder: &mut IndexBuilder,
     counters: &Arc<Counters>,
 ) {
-    let ex = Arc::clone(exclusions);
-    let threads = Arc::clone(counters);
-    let walker = WalkDirGeneric::<State>::new(root)
-        .follow_links(follow_links)
-        .skip_hidden(false)
-        .sort(true)
-        .process_read_dir(move |depth, dir, _state, children| {
-            if depth.is_none() {
-                // The root itself: handled (and never excluded) in the loop below.
-                return;
-            }
-            children.retain_mut(|child| match child {
-                Ok(entry) => {
-                    let path = dir.join(&entry.file_name);
-                    if ex.excludes(&path, &entry.file_name) {
-                        return false;
+    let meta = match std::fs::metadata(root) {
+        Ok(md) => meta_from(&md),
+        Err(e) => {
+            tracing::warn!(root = %root.display(), error = %e, "skipping unreadable root");
+            return;
+        }
+    };
+    let id = builder.push(None, &root.to_string_lossy(), meta);
+    if !meta.is_dir {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_WALK_THREADS);
+    let queue = Mutex::new(TaskQueue {
+        tasks: vec![DirTask {
+            path: root.to_path_buf(),
+            id,
+            chain: None,
+        }],
+        done: false,
+    });
+    let wake = Condvar::new();
+    let (tx, rx) = mpsc::sync_channel::<Listing>(PENDING_LISTINGS);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let (queue, wake) = (&queue, &wake);
+            s.spawn(move || {
+                while let Some(task) = next_task(queue, wake) {
+                    let (children, chain) = catch_unwind(AssertUnwindSafe(|| {
+                        list_task(&task, follow_links, exclusions, counters)
+                    }))
+                    .unwrap_or_else(|_| {
+                        tracing::error!(dir = %task.path.display(), "listing a folder panicked");
+                        (Vec::new(), None)
+                    });
+                    // Every task sends exactly one listing: the builder counts them to know
+                    // when the walk is over. It only fails if the builder is gone.
+                    let listing = Listing {
+                        task,
+                        children,
+                        chain,
+                    };
+                    if tx.send(listing).is_err() {
+                        break;
                     }
-                    let ft = entry.file_type;
-                    let mut meta = read_meta(&path, follow_links, &threads).unwrap_or_default();
-                    // Trust the directory listing for the kind: it never follows links.
-                    meta.is_dir = ft.is_dir();
-                    meta.is_symlink |= ft.is_symlink();
-                    if meta.is_symlink && !follow_links {
-                        // Covers junctions too: std reports them as symlinks on Windows.
-                        entry.read_children_path = None;
-                        meta.is_dir = false;
-                    }
-                    entry.client_state = meta;
-                    true
-                }
-                Err(e) => {
-                    log_entry_error(e, &threads);
-                    false
                 }
             });
-        });
-
-    // jwalk yields depth-first: every entry comes after its parent, and a directory's
-    // descendants come before its next sibling. So `stack[d]` is the open directory at depth d.
-    let mut stack: Vec<(Arc<Path>, EntryId)> = Vec::new();
-    for item in walker {
-        let entry = match item {
-            Ok(e) => e,
-            Err(e) => {
-                log_entry_error(&e, counters);
-                continue;
+        }
+        drop(tx);
+        let mut outstanding = 1usize;
+        while outstanding > 0 {
+            let Ok(listing) = rx.recv() else { break };
+            outstanding -= 1;
+            let mut subdirs = Vec::new();
+            for child in listing.children {
+                let child_id = builder.push(
+                    Some(listing.task.id),
+                    &child.name.to_string_lossy(),
+                    child.meta,
+                );
+                if child.descend {
+                    subdirs.push(DirTask {
+                        path: listing.task.path.join(&child.name),
+                        id: child_id,
+                        chain: listing.chain.clone(),
+                    });
+                }
             }
-        };
-        if let Some(err) = &entry.read_children_error {
+            if !subdirs.is_empty() {
+                outstanding += subdirs.len();
+                // Reversed so that the first subfolder by name is taken first.
+                subdirs.reverse();
+                lock(&queue).tasks.extend(subdirs);
+                wake.notify_all();
+            }
+        }
+        lock(&queue).done = true;
+        wake.notify_all();
+        // Unblock workers waiting to send (only after an early end).
+        drop(rx);
+    });
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The next folder to list, waiting for one; `None` once the walk is over.
+fn next_task(queue: &Mutex<TaskQueue>, wake: &Condvar) -> Option<DirTask> {
+    let mut q = lock(queue);
+    loop {
+        if let Some(t) = q.tasks.pop() {
+            return Some(t);
+        }
+        if q.done {
+            return None;
+        }
+        q = wake.wait(q).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Lists a task's folder ([`list_dir`]). When links are followed, a folder that is one of its
+/// own ancestors (reached through a link back up) is not listed again, and the chain for its
+/// subfolders is returned.
+fn list_task(
+    task: &DirTask,
+    follow_links: bool,
+    exclusions: &Exclusions,
+    counters: &Counters,
+) -> (Vec<Child>, Option<Arc<Chain>>) {
+    if !follow_links {
+        return (list_dir(&task.path, false, exclusions, counters), None);
+    }
+    let Ok(real) = std::fs::canonicalize(&task.path) else {
+        return (list_dir(&task.path, true, exclusions, counters), None);
+    };
+    if Chain::contains(task.chain.as_ref(), &real) {
+        tracing::debug!(dir = %task.path.display(), "link loop, not listed again");
+        return (Vec::new(), None);
+    }
+    let chain = Arc::new(Chain {
+        real,
+        up: task.chain.clone(),
+    });
+    (
+        list_dir(&task.path, true, exclusions, counters),
+        Some(chain),
+    )
+}
+
+/// Lists `dir`: the children the exclusions keep, with their metadata, sorted by name. A
+/// folder that cannot be listed is counted and yields no children.
+fn list_dir(
+    dir: &Path,
+    follow_links: bool,
+    exclusions: &Exclusions,
+    counters: &Counters,
+) -> Vec<Child> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
             Counters::add(&counters.unlisted_folders);
-            if err
-                .io_error()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-            {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
                 Counters::add(&counters.access_denied);
             }
-            if err.io_error().is_some_and(is_expected_error) {
+            if is_expected_error(&e) {
                 Counters::add(&counters.expected_errors);
-                tracing::debug!(path = %entry.path().display(), error = %err, "cannot list folder");
+                tracing::debug!(path = %dir.display(), error = %e, "cannot list folder");
             } else {
-                tracing::warn!(path = %entry.path().display(), error = %err, "cannot list folder");
+                tracing::warn!(path = %dir.display(), error = %e, "cannot list folder");
             }
+            return Vec::new();
         }
-        let depth = entry.depth;
-        let id = if depth == 0 {
-            let Some(meta) = read_meta(root, true, counters) else {
-                tracing::warn!(root = %root.display(), "skipping unreadable root");
-                return;
-            };
-            builder.push(None, &root.to_string_lossy(), meta)
-        } else {
-            stack.truncate(depth);
-            let Some((parent_path, parent)) = stack.last() else {
-                tracing::warn!(path = %entry.path().display(), "entry without parent, skipped");
+    };
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log_entry_error(dir, &e, counters);
                 continue;
-            };
-            debug_assert_eq!(**parent_path, *entry.parent_path);
-            let name = entry.file_name.to_string_lossy();
-            builder.push(Some(*parent), &name, entry.client_state)
+            }
         };
-        if let Some(children) = &entry.read_children_path {
-            stack.truncate(depth);
-            stack.push((Arc::clone(children), id));
+        let name = entry.file_name();
+        let path = entry.path();
+        if exclusions.excludes(&path, &name) {
+            continue;
         }
+        let Ok(ft) = entry.file_type() else {
+            Counters::add(&counters.unreadable_metadata);
+            continue;
+        };
+        // On Windows the listing already carries the metadata (no extra open per file); it
+        // describes a link itself, like `symlink_metadata`.
+        let md = if follow_links && ft.is_symlink() {
+            std::fs::metadata(&path)
+        } else {
+            entry.metadata()
+        };
+        let mut meta = match md {
+            Ok(md) => meta_from(&md),
+            Err(e) => {
+                Counters::add(&counters.unreadable_metadata);
+                if is_expected_error(&e) {
+                    Counters::add(&counters.expected_errors);
+                    tracing::debug!(path = %path.display(), error = %e, "cannot read metadata");
+                } else {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read metadata");
+                }
+                EntryMeta::default()
+            }
+        };
+        // Trust the listing for the kind of a non-link.
+        meta.is_symlink |= ft.is_symlink();
+        let descend = if ft.is_symlink() {
+            // Covers junctions too: std reports them as symlinks on Windows.
+            if follow_links { meta.is_dir } else { false }
+        } else {
+            ft.is_dir()
+        };
+        if !ft.is_symlink() {
+            meta.is_dir = ft.is_dir();
+        } else if !follow_links {
+            meta.is_dir = false;
+        }
+        if meta.is_dir {
+            meta.size = 0;
+        }
+        children.push(Child {
+            name,
+            meta,
+            descend,
+        });
     }
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    children
 }
 
 #[cfg(test)]

@@ -126,7 +126,52 @@ impl Ord for Item {
 struct Entry {
     seq: u64,
     prio: Priority,
-    job: Job,
+    job: Stored,
+}
+
+/// A queued [`Job`]. When the job's path is its key (any path that is valid Unicode, so
+/// nearly all), the path is not stored a second time: it is rebuilt from the key when popped.
+/// A big first scan queues a million files, so this saves a path per file.
+#[derive(Debug)]
+enum Stored {
+    Index {
+        size: u64,
+        mtime: i64,
+        kind: athrix_extract::Kind,
+    },
+    Check,
+    Delete,
+    Full(Job),
+}
+
+impl Stored {
+    fn new(key: &str, job: Job) -> Stored {
+        let same = |p: &Path| p.to_str() == Some(key);
+        match job {
+            Job::Index(c) if same(&c.path) => Stored::Index {
+                size: c.size,
+                mtime: c.mtime,
+                kind: c.kind,
+            },
+            Job::Check(p) if same(&p) => Stored::Check,
+            Job::Delete(p) if same(&p) => Stored::Delete,
+            job => Stored::Full(job),
+        }
+    }
+
+    fn into_job(self, key: &str) -> Job {
+        match self {
+            Stored::Index { size, mtime, kind } => Job::Index(Candidate {
+                path: PathBuf::from(key),
+                size,
+                mtime,
+                kind,
+            }),
+            Stored::Check => Job::Check(PathBuf::from(key)),
+            Stored::Delete => Job::Delete(PathBuf::from(key)),
+            Stored::Full(job) => job,
+        }
+    }
 }
 
 /// Deduplicating priority queue of jobs keyed by path string.
@@ -152,6 +197,7 @@ impl JobQueue {
             Some((k, old)) => (Arc::clone(k), prio.min(old.prio), false),
             None => (Arc::<str>::from(key), prio, true),
         };
+        let job = Stored::new(&key, job);
         self.live.insert(Arc::clone(&key), Entry { seq, prio, job });
         self.heap.push(Item { prio, seq, key });
         if self.heap.len() > 2 * self.live.len() + 1024 {
@@ -174,7 +220,7 @@ impl JobQueue {
                 continue;
             }
             let entry = self.live.remove(&item.key).expect("checked above");
-            found = Some((item.key.to_string(), entry.job));
+            found = Some((item.key.to_string(), entry.job.into_job(&item.key)));
             break;
         }
         self.heap.extend(held);

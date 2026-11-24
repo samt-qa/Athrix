@@ -32,6 +32,7 @@ pub mod interpret;
 pub mod launch_args;
 pub mod library;
 pub mod mcp;
+pub mod memlog;
 pub mod model;
 pub mod pdf_worker;
 pub mod popup;
@@ -106,7 +107,13 @@ fn serve_preview_asset(
 /// exits. The quick-search popup opens with [`shortcut::QUICK_SEARCH_SHORTCUT`] or a tray click.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    athrix_core::logging::init("info");
+    match log_file() {
+        // tantivy logs every commit and merge at info: too much for a file kept for weeks.
+        Some(log) => athrix_core::logging::init_with_file("info,tantivy=warn", &log),
+        None => athrix_core::logging::init("info,tantivy=warn"),
+    }
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Athrix starting");
+    memlog::start();
     tauri::Builder::default()
         // First, per the plugin's docs: a second launch exits right away and this instance
         // shows its main window instead (no second tray icon, no failed shortcut).
@@ -203,4 +210,16 @@ pub fn run() {
                 app.state::<state::AppState>().content.shutdown();
             }
         });
+}
+
+/// The log file: `%LOCALAPPDATA%\com.samt.athrix\logs\athrix.log` on Windows (next to the
+/// WebView data, outside the roaming profile), `None` elsewhere (stderr only).
+fn log_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        std::path::PathBuf::from(base)
+            .join("com.samt.athrix")
+            .join("logs")
+            .join("athrix.log"),
+    )
 }

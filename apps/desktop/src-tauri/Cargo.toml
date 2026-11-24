@@ -48,7 +48,7 @@ serde_json.workspace = true
 # Volume listing for the drive picker (mount point, label, removable): a safe wrapper over
 # GetVolumeInformationW / GetDriveTypeW (the crate denies `unsafe`). Only the `disk` feature.
 # 0.36 is the last line building on Rust 1.85 (0.37+ needs 1.88).
-sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
+sysinfo = { version = "0.36", default-features = false, features = ["disk", "system"] }
 tracing.workspace = true
 
 [dev-dependencies]

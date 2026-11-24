@@ -1,7 +1,7 @@
 //! The content-indexing scheduler: queue, worker pool, single committing writer, control
 //! thread (probe + progress).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use athrix_content_index::{ContentIndex, FileMeta};
+use athrix_content_index::{ContentIndex, FileKey, FileMeta};
 use athrix_extract::Kind;
 use athrix_fs_index::{Change, IndexSnapshot, WatchBatch};
 
@@ -67,7 +67,8 @@ impl Default for Politeness {
 /// Settings of a [`ContentScheduler`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulerConfig {
-    /// Extraction threads (default `max(1, cores / 4)`).
+    /// Extraction threads (default `cores / 4`, between 1 and 4). Each
+    /// holds a file of up to 64 MiB and its extracted text while working.
     pub workers: usize,
     /// Commit after this many index changes (default 1,000).
     pub commit_every: u64,
@@ -93,11 +94,15 @@ pub struct SchedulerConfig {
     pub start_paused: bool,
 }
 
+/// Most extraction threads by default. Indexing runs in the background, and every thread adds
+/// a large file and its text to memory (seven on a 28-core machine peaked near 1 GiB).
+const MAX_DEFAULT_WORKERS: usize = 4;
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         SchedulerConfig {
-            workers: (cores / 4).max(1),
+            workers: (cores / 4).clamp(1, MAX_DEFAULT_WORKERS),
             commit_every: 1_000,
             commit_interval: Duration::from_secs(10),
             filter: CandidateFilter::default(),
@@ -148,9 +153,6 @@ struct State {
     uncommitted: u64,
     pause: PauseReasons,
     stopping: bool,
-    /// Paths of every candidate seen this session: lets a deleted or renamed folder remove
-    /// the documents below it (the content index has no prefix delete).
-    known: BTreeSet<String>,
     failures: HashMap<String, (FileMeta, FailureKind, String)>,
     counters: Counters,
     error_streak: u32,
@@ -209,34 +211,6 @@ impl State {
             commits: c.commits,
         }
     }
-
-    /// Removes `key` and every known path below it from `known`; returns them all.
-    fn take_known_subtree(&mut self, key: &str) -> Vec<String> {
-        let mut out = vec![key.to_owned()];
-        self.known.remove(key);
-        self.failures.remove(key);
-        let prefix = format!("{key}{}", std::path::MAIN_SEPARATOR);
-        let below: Vec<String> = self
-            .known
-            .range(prefix.clone()..)
-            .take_while(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
-        for k in below {
-            self.known.remove(&k);
-            self.failures.remove(&k);
-            out.push(k);
-        }
-        out
-    }
-
-    fn has_known_below(&self, key: &str) -> bool {
-        let prefix = format!("{key}{}", std::path::MAIN_SEPARATOR);
-        self.known
-            .range(prefix.clone()..)
-            .next()
-            .is_some_and(|k| k.starts_with(&prefix))
-    }
 }
 
 enum WriterMsg {
@@ -246,7 +220,8 @@ enum WriterMsg {
         meta: FileMeta,
         text: String,
     },
-    Delete(Vec<String>),
+    /// Delete the file `key` and every document below it.
+    DeleteTree(String),
 }
 
 struct Shared {
@@ -282,9 +257,6 @@ impl Shared {
         for ((key, job), prio) in jobs.into_iter().zip(prios) {
             if st.is_held(&key) {
                 continue;
-            }
-            if matches!(job, Job::Index(_)) {
-                st.known.insert(key.clone());
             }
             if st.queue.push(&key, job, prio) {
                 st.outstanding += 1;
@@ -426,7 +398,6 @@ impl ContentScheduler {
                 ..PauseReasons::default()
             },
             stopping: false,
-            known: BTreeSet::new(),
             failures: HashMap::new(),
             counters: Counters::default(),
             error_streak: 0,
@@ -444,7 +415,9 @@ impl ContentScheduler {
             work_cv: Condvar::new(),
             idle_cv: Condvar::new(),
         });
-        let (writer_tx, writer_rx) = mpsc::sync_channel(workers * 4);
+        // One extracted text (up to 4 Mi characters) per worker may wait for the writer: more
+        // would only hold big texts in memory, the writer is not the bottleneck.
+        let (writer_tx, writer_rx) = mpsc::sync_channel(workers);
         let (control_tx, control_rx) = mpsc::channel();
         let mut me = ContentScheduler {
             shared: Arc::clone(&shared),
@@ -482,14 +455,20 @@ impl ContentScheduler {
         Ok(me)
     }
 
-    /// Queues every candidate file of a name-index snapshot (the initial backlog). Files the
-    /// content index already holds in this version are skipped cheaply by the workers.
-    /// Returns the number of candidates queued.
+    /// Queues every candidate file of a name-index snapshot (the initial backlog), except the
+    /// files the content index already holds in this version: those are counted as up to date
+    /// at once and never take queue memory (on a big disk, a million files would otherwise
+    /// sit in the queue on every start-up). Returns the number of candidates queued.
     ///
     /// Call it after startup, after a [`WatchBatch::RescanNeeded`] re-walk, and whenever
     /// [`ContentIndex::rebuilt`] is `Some` (then every file is re-extracted).
     pub fn enqueue_snapshot(&self, snapshot: &IndexSnapshot) -> usize {
         let max = self.shared.config.filter.max_size;
+        let current = self.shared.index.current_keys().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "cannot read the indexed versions; queuing every file");
+            HashSet::new()
+        });
+        let mut up_to_date = 0u64;
         let mut total = 0;
         let mut batch = Vec::with_capacity(4096);
         for id in 0..snapshot.id_bound() {
@@ -510,7 +489,12 @@ impl ContentScheduler {
                 .shared
                 .candidate(&path, m.size, m.modified.unwrap_or(0))
             {
-                batch.push((c.key(), Job::Index(c)));
+                let key = c.key();
+                if current.contains(&FileKey::of(&key, c.meta()).0) {
+                    up_to_date += 1;
+                    continue;
+                }
+                batch.push((key, Job::Index(c)));
             }
             if batch.len() == 4096 {
                 total += self
@@ -518,7 +502,9 @@ impl ContentScheduler {
                     .push_jobs(std::mem::take(&mut batch), Source::Backlog);
             }
         }
-        total + self.shared.push_jobs(batch, Source::Backlog)
+        total += self.shared.push_jobs(batch, Source::Backlog);
+        self.shared.lock().counters.up_to_date += up_to_date;
+        total
     }
 
     /// Queues files with known metadata (`path`, size, mtime in Unix seconds) as backlog,
@@ -537,7 +523,7 @@ impl ContentScheduler {
 
     /// Queues paths reported changed by the watcher, ahead of the backlog. Each is re-read
     /// from disk by a worker: a file is (re-)extracted, a missing path is deleted from the
-    /// index together with every known file below it, and a new folder (one with no known
+    /// index together with every document below it, and a new folder (one with no indexed
     /// files below it, such as a folder renamed or copied in) is listed and its files queued.
     pub fn paths_changed<P: AsRef<Path>>(&self, paths: &[P]) {
         let jobs = paths
@@ -612,8 +598,8 @@ impl ContentScheduler {
     pub fn forget(&self, prefixes: &[PathBuf]) -> usize {
         let mut st = self.shared.lock();
         let n = st.drop_queued(|k| prefixes.iter().any(|h| starts_with_ci(Path::new(k), h)));
-        st.known
-            .retain(|k| !prefixes.iter().any(|h| starts_with_ci(Path::new(k), h)));
+        st.failures
+            .retain(|k, _| !prefixes.iter().any(|h| starts_with_ci(Path::new(k), h)));
         if st.is_idle() {
             self.shared.idle_cv.notify_all();
         }
@@ -803,13 +789,11 @@ fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
                 sh.finish(&key, true);
             }
             Ok(md) if md.is_file() => match sh.candidate(&path, md.len(), mtime_secs(&md)) {
-                Some(c) => {
-                    sh.lock().known.insert(key.clone());
-                    index_file(sh, tx, key, c);
-                }
+                Some(c) => index_file(sh, tx, key, c),
                 None => {
-                    let was_known = sh.lock().known.contains(&key);
-                    if was_known {
+                    // No longer a candidate (now excluded, too big...): drop its document if
+                    // there is one.
+                    if sh.index.has_under(&key).unwrap_or(true) {
                         delete_subtree(sh, tx, key);
                     } else {
                         sh.finish(&key, true);
@@ -825,10 +809,10 @@ fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
     }
 }
 
-/// A folder appeared (created, renamed or copied in): queue its entries. A folder with known
-/// files below it existed before, and its children report their own changes.
+/// A folder appeared (created, renamed or copied in): queue its entries. A folder with
+/// indexed files below it existed before, and its children report their own changes.
 fn expand_dir(sh: &Shared, key: &str, dir: &Path) {
-    if sh.config.filter.is_excluded_dir(dir) || sh.lock().has_known_below(key) {
+    if sh.config.filter.is_excluded_dir(dir) || has_documents_below(sh, key) {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -844,10 +828,23 @@ fn expand_dir(sh: &Shared, key: &str, dir: &Path) {
     sh.push_jobs(jobs, Source::Change);
 }
 
+/// True if the content index holds documents below the folder `key` (it existed before).
+fn has_documents_below(sh: &Shared, key: &str) -> bool {
+    let below = format!("{key}{}", std::path::MAIN_SEPARATOR);
+    sh.index.has_under(&below).unwrap_or(false)
+}
+
+/// The path `key` is gone: drops its queued jobs and failures and those below it, and deletes
+/// its documents (the file, or everything below the folder).
 fn delete_subtree(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String) {
-    let keys = sh.lock().take_known_subtree(&key);
+    {
+        let below = |k: &str| k.len() > key.len() && starts_with_ci(Path::new(k), Path::new(&key));
+        let mut st = sh.lock();
+        st.drop_queued(below);
+        st.failures.retain(|k, _| k != &key && !below(k));
+    }
     // Sent before the key leaves `in_flight`, so it stays ordered with any later version.
-    let sent = tx.send(WriterMsg::Delete(keys)).is_ok();
+    let sent = tx.send(WriterMsg::DeleteTree(key.clone())).is_ok();
     sh.finish(&key, !sent);
 }
 
@@ -1012,12 +1009,16 @@ fn apply(sh: &Shared, msg: WriterMsg) {
             }
             sh.done(&mut st);
         }
-        WriterMsg::Delete(keys) => {
-            for k in &keys {
-                sh.index.delete(k);
-            }
+        WriterMsg::DeleteTree(key) => {
+            let n = match sh.index.delete_prefix(&key) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(path = %key, error = %e, "content index delete failed");
+                    0
+                }
+            };
             let mut st = sh.lock();
-            st.counters.deleted += keys.len() as u64;
+            st.counters.deleted += n;
             st.uncommitted += 1;
             sh.done(&mut st);
         }

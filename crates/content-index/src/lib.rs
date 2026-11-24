@@ -811,6 +811,43 @@ impl ContentIndex {
         writer.delete_query(q).map_err(|e| self.err(e))?;
         Ok(n as u64)
     }
+
+    /// Whether a committed document is the file `prefix` or lies below it (compared like
+    /// [`delete_prefix`](Self::delete_prefix); a trailing separator means "below only").
+    pub fn has_under(&self, prefix: &str) -> Result<bool> {
+        let Some(q) = scope::prefix_query(self.fields.pkey, &path_key(prefix)) else {
+            return Ok(false);
+        };
+        let top = self
+            .reader
+            .searcher()
+            .search(&q, &TopDocs::with_limit(1))
+            .map_err(|e| self.err(e))?;
+        Ok(!top.is_empty())
+    }
+
+    /// The [`FileKey`] of every committed document, read from the fast column (about 16 bytes
+    /// per document while held). A file whose current key is in the set needs no extraction,
+    /// the same answer as [`is_current`](Self::is_current) without a lookup per file.
+    pub fn current_keys(&self) -> Result<std::collections::HashSet<u64>> {
+        let searcher = self.reader.searcher();
+        let mut out = std::collections::HashSet::with_capacity(
+            usize::try_from(searcher.num_docs()).unwrap_or(0),
+        );
+        for segment in searcher.segment_readers() {
+            let keys = segment.fast_fields().u64("key").map_err(|e| self.err(e))?;
+            let alive = segment.alive_bitset();
+            for doc in 0..segment.max_doc() {
+                if alive.is_some_and(|a| !a.is_alive(doc)) {
+                    continue;
+                }
+                if let Some(k) = keys.first(doc) {
+                    out.insert(k);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// [`ContentIndex::snippets`] uses one more thread per this many paths...

@@ -156,8 +156,8 @@ fn initial_scan_indexes_documents_and_search_finds_them() {
         [key(&root.join("sub").join("letter.docx"))]
     );
 
-    // A second scan finds everything current.
-    assert_eq!(sched.enqueue_snapshot(&snap), 3);
+    // A second scan finds everything current and queues nothing.
+    assert_eq!(sched.enqueue_snapshot(&snap), 0);
     assert!(sched.wait_idle(LONG));
     let p = sched.progress();
     assert_eq!((p.indexed, p.up_to_date), (3, 3));
