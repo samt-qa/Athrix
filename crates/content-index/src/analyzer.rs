@@ -1,5 +1,8 @@
 //! Adapter from the `athrix-text-ar` tokenizer to tantivy's `Tokenizer` trait.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use athrix_text_ar::{Analyzer, Tokens};
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
@@ -19,6 +22,24 @@ impl Tokenizer for ArabicTokenizer {
             buf: athrix_text_ar::Token::default(),
             token: Token::default(),
         }
+    }
+}
+
+/// [`ArabicTokenizer`] for a writable index: adds the length of every text it starts on to
+/// `started`, so the index knows how much of the text handed to the writer the indexing
+/// thread has not reached yet.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MeteredTokenizer {
+    pub(crate) inner: ArabicTokenizer,
+    pub(crate) started: Arc<AtomicU64>,
+}
+
+impl Tokenizer for MeteredTokenizer {
+    type TokenStream<'a> = ArabicTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> ArabicTokenStream<'a> {
+        self.started.fetch_add(text.len() as u64, Ordering::Relaxed);
+        self.inner.token_stream(text)
     }
 }
 

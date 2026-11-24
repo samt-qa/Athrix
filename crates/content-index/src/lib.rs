@@ -31,7 +31,9 @@
 //! # Writing
 //!
 //! One writer per index directory (tantivy's lock), single indexing thread, bounded memory
-//! ([`IndexOptions::memory_budget`]). All methods take `&self` and [`ContentIndex`] is
+//! ([`IndexOptions::memory_budget`] for the segment being built,
+//! [`IndexOptions::pending_text_limit`] for the documents waiting for that thread: tantivy
+//! itself queues up to 10,000 documents of any size). All methods take `&self` and [`ContentIndex`] is
 //! `Send + Sync`, so a background indexer can share it through an `Arc` with the search side.
 //! Changes become visible to [`ContentIndex::search`] after [`ContentIndex::commit`].
 //!
@@ -92,7 +94,9 @@ pub use snippet::Snippet;
 
 use athrix_text_ar::{ANALYZER_VERSION, Analyzer};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
@@ -158,6 +162,10 @@ pub struct IndexOptions {
     pub stored_text_limit: usize,
     /// Approximate snippet length in bytes (default 300: about 150 Arabic letters).
     pub snippet_bytes: usize,
+    /// How many bytes of text may wait for the indexing thread (default 32 MiB).
+    /// [`ContentIndex::add_or_update`] blocks while more than this is waiting, so a run of
+    /// big documents extracted faster than they are indexed cannot pile up in memory.
+    pub pending_text_limit: usize,
 }
 
 impl Default for IndexOptions {
@@ -166,6 +174,7 @@ impl Default for IndexOptions {
             memory_budget: 64 << 20,
             stored_text_limit: 512 << 10,
             snippet_bytes: 300,
+            pending_text_limit: 32 << 20,
         }
     }
 }
@@ -239,7 +248,15 @@ pub struct ContentIndex {
     /// `None` for an index opened with [`ContentIndex::open_read_only`].
     writer: Option<Mutex<IndexWriter>>,
     rebuilt: Option<RebuildReason>,
+    /// Bytes of text handed to the writer since the last commit.
+    text_added: AtomicU64,
+    /// Bytes of text the indexing thread has started on since the last commit.
+    text_started: Arc<AtomicU64>,
 }
+
+/// The longest [`ContentIndex::add_or_update`] waits for the indexing thread before it adds
+/// anyway (a dead indexing thread then reports its error).
+const PENDING_TEXT_WAIT: Duration = Duration::from_secs(30);
 
 impl std::fmt::Debug for ContentIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -376,6 +393,8 @@ impl ContentIndex {
             reader,
             writer: None,
             rebuilt: None,
+            text_added: AtomicU64::new(0),
+            text_started: Arc::default(),
         })
     }
 
@@ -403,6 +422,15 @@ impl ContentIndex {
         rebuilt: Option<RebuildReason>,
     ) -> Result<Self> {
         let reader = Self::register_and_read(dir, &index)?;
+        // The writer's tokenizer counts the text it starts on (see `pending_text_bytes`).
+        let text_started = Arc::<AtomicU64>::default();
+        index.tokenizers().register(
+            TOKENIZER_NAME,
+            analyzer::MeteredTokenizer {
+                inner: ArabicTokenizer::default(),
+                started: Arc::clone(&text_started),
+            },
+        );
         let budget = options.memory_budget.clamp(15_000_000, 2_000_000_000);
         let writer = index
             .writer_with_num_threads(1, budget)
@@ -414,6 +442,8 @@ impl ContentIndex {
             reader,
             writer: Some(Mutex::new(writer)),
             rebuilt,
+            text_added: AtomicU64::new(0),
+            text_started,
         })
     }
 
@@ -441,8 +471,20 @@ impl ContentIndex {
         Ok(writer.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// Bytes of text passed to [`add_or_update`](Self::add_or_update) that the indexing
+    /// thread has not started on yet (0 after a commit). An estimate: it is what
+    /// [`IndexOptions::pending_text_limit`] bounds.
+    pub fn pending_text_bytes(&self) -> u64 {
+        self.text_added
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.text_started.load(Ordering::Relaxed))
+    }
+
     /// Indexes the text of `path`, replacing any earlier version of it. Visible after
     /// [`commit`](Self::commit).
+    ///
+    /// Blocks while more than [`IndexOptions::pending_text_limit`] bytes of earlier documents
+    /// still wait for the indexing thread.
     pub fn add_or_update(&self, path: &str, meta: FileMeta, text: &str) -> Result<FileKey> {
         let key = FileKey::of(path, meta);
         let f = self.fields;
@@ -458,10 +500,24 @@ impl ContentIndex {
         if self.options.stored_text_limit > 0 {
             doc.add_text(f.preview, prefix(text, self.options.stored_text_limit));
         }
+        let limit = self.options.pending_text_limit as u64;
+        let give_up = Instant::now() + PENDING_TEXT_WAIT;
+        while self.pending_text_bytes() > limit && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let w = self.writer()?;
         w.delete_term(Term::from_field_text(f.pkey, &pkey));
         w.add_document(doc).map_err(|e| self.err(e))?;
+        self.text_added
+            .fetch_add(text.len() as u64, Ordering::Relaxed);
         Ok(key)
+    }
+
+    /// Nothing waits for the indexing thread (after a commit or a rollback). Call it with
+    /// the writer locked.
+    fn reset_pending_text(&self) {
+        self.text_added.store(0, Ordering::Relaxed);
+        self.text_started.store(0, Ordering::Relaxed);
     }
 
     /// Removes `path` (compared by [`path_key`]) from the index. Visible after
@@ -474,13 +530,19 @@ impl ContentIndex {
 
     /// Persists pending changes and makes them visible to searches.
     pub fn commit(&self) -> Result<()> {
-        self.writer()?.commit().map_err(|e| self.err(e))?;
+        {
+            let mut w = self.writer()?;
+            w.commit().map_err(|e| self.err(e))?;
+            self.reset_pending_text();
+        }
         self.reader.reload().map_err(|e| self.err(e))
     }
 
     /// Discards changes since the last commit.
     pub fn rollback(&self) -> Result<()> {
-        self.writer()?.rollback().map_err(|e| self.err(e))?;
+        let mut w = self.writer()?;
+        w.rollback().map_err(|e| self.err(e))?;
+        self.reset_pending_text();
         Ok(())
     }
 

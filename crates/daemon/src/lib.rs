@@ -37,7 +37,10 @@
 //! - **Writer.** One thread owns all index writes (`add_or_update`, `delete`) and commits
 //!   every [`SchedulerConfig::commit_every`] changes or [`SchedulerConfig::commit_interval`],
 //!   and also when the queue runs dry, when paused, and on shutdown. A bounded channel between
-//!   workers and writer applies back-pressure.
+//!   workers and writer applies back-pressure, and the index holds a document back while
+//!   more than [`IndexOptions::pending_text_limit`](athrix_content_index::IndexOptions::pending_text_limit)
+//!   of text waits for its one indexing thread: a run of big files is extracted faster than
+//!   it is indexed.
 //! - **Changes.** A watcher path is re-read from disk: an existing file is re-extracted, a
 //!   missing path is deleted together with every file this session queued below it (renames
 //!   are a delete plus an add), and a folder that appeared (renamed or copied in) is listed:

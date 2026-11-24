@@ -3,6 +3,8 @@
 use athrix_content_index::{
     ContentIndex, Error, FileKey, FileMeta, IndexOptions, RebuildReason, Snippet,
 };
+use std::fmt::Write as _;
+
 use tempfile::TempDir;
 
 const META: FileMeta = FileMeta {
@@ -300,6 +302,38 @@ fn match_past_the_stored_prefix_still_matches() {
     let s = snippet(&idx, "نهاية", &hit.path);
     assert!(s.highlights.is_empty());
     assert_eq!(s.offset, 0);
+}
+
+#[test]
+fn text_waiting_for_the_indexing_thread_is_bounded() {
+    const LIMIT: usize = 128 << 10;
+    let dir = TempDir::new().unwrap();
+    let opts = IndexOptions {
+        pending_text_limit: LIMIT,
+        ..IndexOptions::default()
+    };
+    let idx = ContentIndex::open_or_create_with(dir.path(), opts).unwrap();
+    // 120 documents of about 40 KB, handed over far faster than one thread indexes them.
+    let mut most = 0;
+    let mut longest = 0;
+    for i in 0..120 {
+        let mut text = String::new();
+        for w in 0..4_000 {
+            write!(text, "w{i}x{w} ").unwrap();
+        }
+        if i == 119 {
+            text.push_str("zyzzyva");
+        }
+        longest = longest.max(text.len() as u64);
+        idx.add_or_update(&format!("doc{i}"), META, &text).unwrap();
+        most = most.max(idx.pending_text_bytes());
+    }
+    // Before each add at most LIMIT waits, so after it at most LIMIT and that document.
+    assert!(most <= LIMIT as u64 + longest, "{most} bytes waited");
+    idx.commit().unwrap();
+    assert_eq!(idx.pending_text_bytes(), 0);
+    assert_eq!(idx.num_docs(), 120);
+    assert_eq!(paths(&idx, "zyzzyva"), ["doc119"]);
 }
 
 #[test]
