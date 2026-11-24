@@ -21,6 +21,9 @@ pub(crate) enum Job {
     Check(PathBuf),
     /// The path is gone: remove it (and anything known below it) from the index.
     Delete(PathBuf),
+    /// A file of the backlog: read its size and time from disk now and extract it if it is
+    /// still a candidate. A path that is gone or no longer a file is left to the watcher.
+    Scan(PathBuf),
 }
 
 /// Where a job came from. Watcher changes jump ahead of the initial backlog.
@@ -62,31 +65,14 @@ impl Prioritizer {
     /// Priority of `job`, with `now` in Unix seconds.
     pub(crate) fn priority(&self, job: &Job, source: Source, now: i64) -> Priority {
         match job {
-            Job::Index(c) => {
-                const DAY: i64 = 86_400;
-                let age = now.saturating_sub(c.mtime);
-                let recency = match age {
-                    a if a < DAY => 0,
-                    a if a < 7 * DAY => 1,
-                    a if a < 30 * DAY => 2,
-                    a if a < 365 * DAY => 3,
-                    _ => 4,
-                };
-                let size = match c.size {
-                    s if s < 256 << 10 => 0,
-                    s if s < 4 << 20 => 1,
-                    s if s < 32 << 20 => 2,
-                    _ => 3,
-                };
-                Priority {
-                    source,
-                    folder: self.folder_tier(&c.path),
-                    recency,
-                    size,
-                    newer: Reverse(c.mtime),
-                }
-            }
-            Job::Check(p) | Job::Delete(p) => Priority {
+            Job::Index(c) => Priority {
+                source,
+                folder: self.folder_tier(&c.path),
+                recency: recency_tier(c.mtime, now),
+                size: size_tier(c.size),
+                newer: Reverse(c.mtime),
+            },
+            Job::Check(p) | Job::Delete(p) | Job::Scan(p) => Priority {
                 source,
                 folder: self.folder_tier(p),
                 recency: 0,
@@ -94,6 +80,45 @@ impl Prioritizer {
                 newer: Reverse(i64::MAX),
             },
         }
+    }
+}
+
+impl Prioritizer {
+    /// The urgency of a backlog file as one number, smaller first: the order of
+    /// [`priority`](Self::priority) for a [`Source::Backlog`] file (folder, recency, size,
+    /// then newer first), for the compact [`Backlog`](crate::backlog::Backlog).
+    pub(crate) fn backlog_rank(&self, path: &Path, size: u64, mtime: i64, now: i64) -> u64 {
+        /// Bits left for the time after folder (1), recency (3) and size (2).
+        const TIME_BITS: u32 = 58;
+        const TIME_MAX: u64 = (1 << TIME_BITS) - 1;
+        let tiers = (u64::from(self.folder_tier(path)) << 5)
+            | (u64::from(recency_tier(mtime, now)) << 2)
+            | u64::from(size_tier(size));
+        // Newer first: a later time gives a smaller number. Times before 1970 count as 1970.
+        let time = TIME_MAX - u64::try_from(mtime).unwrap_or(0).min(TIME_MAX);
+        (tiers << TIME_BITS) | time
+    }
+}
+
+/// 0 = modified in the last day, 1 = week, 2 = month, 3 = year, 4 = older.
+fn recency_tier(mtime: i64, now: i64) -> u8 {
+    const DAY: i64 = 86_400;
+    match now.saturating_sub(mtime) {
+        a if a < DAY => 0,
+        a if a < 7 * DAY => 1,
+        a if a < 30 * DAY => 2,
+        a if a < 365 * DAY => 3,
+        _ => 4,
+    }
+}
+
+/// 0 = under 256 KiB, 1 = under 4 MiB, 2 = under 32 MiB, 3 = larger.
+fn size_tier(size: u64) -> u8 {
+    match size {
+        s if s < 256 << 10 => 0,
+        s if s < 4 << 20 => 1,
+        s if s < 32 << 20 => 2,
+        _ => 3,
     }
 }
 
@@ -186,6 +211,11 @@ impl JobQueue {
     /// Jobs waiting.
     pub(crate) fn len(&self) -> usize {
         self.live.len()
+    }
+
+    /// True if a job is queued under `key`.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.live.contains_key(key)
     }
 
     /// Queues `job` under `key`. Returns true if the key was not queued yet (false: the
@@ -317,6 +347,31 @@ mod tests {
                 "/other/old-small"
             ]
         );
+    }
+
+    #[test]
+    fn backlog_rank_orders_like_priority() {
+        let p = Prioritizer::new(vec![PathBuf::from("/home/u/Documents")]);
+        let files = [
+            ("/other/old-small", 10, 400),
+            ("/other/new-big", 100 << 20, 0),
+            ("/other/new-small", 10, 0),
+            ("/other/newer-small", 10, -1),
+            ("/home/u/Documents/old", 10, 1000),
+            ("/other/before-1970", 10, 30_000),
+            ("/other/week", 5 << 20, 3),
+        ];
+        let mut by_prio: Vec<_> = files.iter().collect();
+        by_prio.sort_by_key(|(path, size, age)| {
+            p.priority(&cand(path, *size, *age), Source::Backlog, NOW)
+        });
+        let mut by_rank: Vec<_> = files.iter().collect();
+        by_rank.sort_by_key(|(path, size, age)| {
+            p.backlog_rank(Path::new(path), *size, NOW - age * 86_400, NOW)
+        });
+        assert_eq!(by_prio, by_rank);
+        assert_eq!(by_rank[0].0, "/home/u/Documents/old");
+        assert_eq!(by_rank[1].0, "/other/newer-small");
     }
 
     #[test]

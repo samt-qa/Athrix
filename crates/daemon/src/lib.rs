@@ -22,6 +22,10 @@
 //!   path is queued once; queuing it again keeps the newest metadata and the more urgent
 //!   priority. A path being extracted is never handed to a second worker, so versions of one
 //!   file reach the writer in order.
+//! - **Backlog.** The files of a snapshot ([`ContentScheduler::enqueue_snapshot`]) do not go
+//!   into that heap: a million of them would take half a gigabyte. They wait in a compact
+//!   list in the same order of urgency (about 60 bytes each), served whenever the queue has
+//!   nothing to give. A backlog file's size and time are read from disk when its turn comes.
 //! - **Workers.** `max(1, cores / 4)` threads by default
 //!   ([`SchedulerConfig::workers`]), at background priority. For each file a worker skips it
 //!   if the same version failed before or if [`ContentIndex::is_current`](athrix_content_index::ContentIndex::is_current) says the index
@@ -99,6 +103,7 @@
 //! form everywhere (the name index's), since the content index keys documents by path
 //! string.
 
+mod backlog;
 mod candidate;
 mod extractor;
 mod probe;

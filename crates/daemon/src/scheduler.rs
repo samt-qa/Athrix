@@ -13,6 +13,7 @@ use athrix_content_index::{ContentIndex, FileKey, FileMeta};
 use athrix_extract::Kind;
 use athrix_fs_index::{Change, IndexSnapshot, WatchBatch};
 
+use crate::backlog::{Backlog, BacklogBuilder};
 use crate::candidate::{
     Candidate, CandidateFilter, default_priority_folders, path_key, starts_with_ci,
 };
@@ -144,6 +145,9 @@ struct Counters {
 
 struct State {
     queue: JobQueue,
+    /// The files of the last snapshot still to extract. Served when `queue` has nothing to
+    /// give, so changes always go first.
+    backlog: Backlog,
     /// Keys taken by a worker and not yet handed to the writer. A key in here is not popped
     /// again, so two versions of one file never race to the writer.
     in_flight: HashSet<String>,
@@ -166,11 +170,46 @@ impl State {
         !self.held.is_empty() && self.held.iter().any(|h| starts_with_ci(Path::new(key), h))
     }
 
-    /// Drops the queued jobs `drop` accepts; returns how many.
+    /// Drops the queued jobs `drop` accepts, backlog included; returns how many. Reads the
+    /// whole backlog: for rare events only.
     fn drop_queued(&mut self, drop: impl Fn(&str) -> bool) -> usize {
-        let n = self.queue.remove_where(drop);
+        let n = self.queue.remove_where(&drop) + self.backlog.remove_where(&drop);
         self.outstanding = self.outstanding.saturating_sub(n as u64);
         n
+    }
+
+    /// Drops the jobs of the queue `drop` accepts and leaves the backlog alone: a backlog
+    /// file is read from disk when its turn comes, and skipped if it is gone by then.
+    fn drop_queued_jobs(&mut self, drop: impl Fn(&str) -> bool) {
+        let n = self.queue.remove_where(drop);
+        self.outstanding = self.outstanding.saturating_sub(n as u64);
+    }
+
+    /// The next job a worker may start, marked as in flight.
+    fn take_job(&mut self) -> Option<(String, Job)> {
+        let State {
+            queue,
+            backlog,
+            in_flight,
+            outstanding,
+            ..
+        } = self;
+        if let Some((key, job)) = queue.pop_where(|k| in_flight.contains(k)) {
+            in_flight.insert(key.clone());
+            return Some((key, job));
+        }
+        while let Some(key) = backlog.pop() {
+            // A change of the same file is being handled or waits in the queue: it reads the
+            // newest version, so this entry has nothing to add.
+            if in_flight.contains(&key) || queue.contains(&key) {
+                *outstanding = outstanding.saturating_sub(1);
+                continue;
+            }
+            in_flight.insert(key.clone());
+            let path = PathBuf::from(&key);
+            return Some((key, Job::Scan(path)));
+        }
+        None
     }
 
     fn is_idle(&self) -> bool {
@@ -190,7 +229,7 @@ impl State {
     }
 
     fn progress(&self) -> Progress {
-        let queued = self.queue.len() as u64;
+        let queued = (self.queue.len() + self.backlog.len()) as u64;
         let c = &self.counters;
         let state = self.run_state();
         Progress {
@@ -390,6 +429,7 @@ impl ContentScheduler {
         let workers = b.config.workers.max(1);
         let state = State {
             queue: JobQueue::default(),
+            backlog: Backlog::default(),
             in_flight: HashSet::new(),
             outstanding: 0,
             uncommitted: 0,
@@ -455,10 +495,14 @@ impl ContentScheduler {
         Ok(me)
     }
 
-    /// Queues every candidate file of a name-index snapshot (the initial backlog), except the
-    /// files the content index already holds in this version: those are counted as up to date
-    /// at once and never take queue memory (on a big disk, a million files would otherwise
-    /// sit in the queue on every start-up). Returns the number of candidates queued.
+    /// Sets the backlog to the candidate files of a name-index snapshot, except the files the
+    /// content index already holds in this version: those are counted as up to date at once.
+    /// The backlog of an earlier call is replaced (the new snapshot knows the same files, or
+    /// better). Returns the number of candidates now waiting.
+    ///
+    /// A waiting file takes about 60 bytes (see the `backlog` module), and its size and time
+    /// are read from disk again when its turn comes, so a file that changed or went away in
+    /// the meantime is handled as it is then.
     ///
     /// Call it after startup, after a [`WatchBatch::RescanNeeded`] re-walk, and whenever
     /// [`ContentIndex::rebuilt`] is `Some` (then every file is re-extracted).
@@ -468,9 +512,13 @@ impl ContentScheduler {
             tracing::warn!(error = %e, "cannot read the indexed versions; queuing every file");
             HashSet::new()
         });
+        let held = self.shared.lock().held.clone();
+        let is_held = |p: &Path| held.iter().any(|h| starts_with_ci(p, h));
+        let now = unix_now();
         let mut up_to_date = 0u64;
-        let mut total = 0;
-        let mut batch = Vec::with_capacity(4096);
+        let mut backlog = BacklogBuilder::default();
+        // Files the backlog cannot hold (a path that is not Unicode): the job queue takes them.
+        let mut others = Vec::new();
         for id in 0..snapshot.id_bound() {
             let Ok(id) = u32::try_from(id) else { break };
             if !snapshot.contains(id) {
@@ -485,25 +533,43 @@ impl ContentScheduler {
                 continue;
             }
             let path = snapshot.path(id);
-            if let Some(c) = self
+            let Some(c) = self
                 .shared
                 .candidate(&path, m.size, m.modified.unwrap_or(0))
-            {
-                let key = c.key();
-                if current.contains(&FileKey::of(&key, c.meta()).0) {
-                    up_to_date += 1;
-                    continue;
-                }
-                batch.push((key, Job::Index(c)));
+            else {
+                continue;
+            };
+            let key = c.key();
+            if current.contains(&FileKey::of(&key, c.meta()).0) {
+                up_to_date += 1;
+                continue;
             }
-            if batch.len() == 4096 {
-                total += self
-                    .shared
-                    .push_jobs(std::mem::take(&mut batch), Source::Backlog);
+            if is_held(&c.path) {
+                continue;
+            }
+            let rank = self
+                .shared
+                .prioritizer
+                .backlog_rank(&c.path, c.size, c.mtime, now);
+            if c.path.to_str() != Some(key.as_str()) || !backlog.push(&key, rank) {
+                others.push((key, Job::Index(c)));
             }
         }
-        total += self.shared.push_jobs(batch, Source::Backlog);
-        self.shared.lock().counters.up_to_date += up_to_date;
+        drop(current);
+        let backlog = backlog.finish();
+        let total = backlog.len() + others.len();
+        {
+            let mut st = self.shared.lock();
+            let old = std::mem::replace(&mut st.backlog, backlog);
+            st.outstanding =
+                st.outstanding.saturating_sub(old.len() as u64) + st.backlog.len() as u64;
+            st.counters.up_to_date += up_to_date;
+            if st.is_idle() {
+                self.shared.idle_cv.notify_all();
+            }
+        }
+        self.shared.work_cv.notify_all();
+        self.shared.push_jobs(others, Source::Backlog);
         total
     }
 
@@ -749,12 +815,12 @@ fn worker_loop(sh: &Shared, tx: &SyncSender<WriterMsg>) {
                     return;
                 }
                 if !st.pause.any() {
-                    let State {
-                        queue, in_flight, ..
-                    } = &mut *st;
-                    if let Some((key, job)) = queue.pop_where(|k| in_flight.contains(k)) {
-                        in_flight.insert(key.clone());
-                        break (key, job);
+                    if let Some(job) = st.take_job() {
+                        break job;
+                    }
+                    // Backlog entries dropped on the way may have been the last work.
+                    if st.is_idle() {
+                        sh.idle_cv.notify_all();
                     }
                 }
                 st = sh.work_cv.wait(st).unwrap_or_else(PoisonError::into_inner);
@@ -782,6 +848,14 @@ fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
     match job {
         Job::Index(c) => index_file(sh, tx, key, c),
         Job::Delete(_) => delete_subtree(sh, tx, key),
+        Job::Scan(path) => match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_file() => match sh.candidate(&path, md.len(), mtime_secs(&md)) {
+                Some(c) => index_file(sh, tx, key, c),
+                None => sh.finish(&key, true),
+            },
+            // Gone, or a folder now: the watcher reports it, the next scan sees it.
+            _ => sh.finish(&key, true),
+        },
         Job::Check(path) => match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => delete_subtree(sh, tx, key),
             Err(e) => {
@@ -840,7 +914,7 @@ fn delete_subtree(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String) {
     {
         let below = |k: &str| k.len() > key.len() && starts_with_ci(Path::new(k), Path::new(&key));
         let mut st = sh.lock();
-        st.drop_queued(below);
+        st.drop_queued_jobs(below);
         st.failures.retain(|k, _| k != &key && !below(k));
     }
     // Sent before the key leaves `in_flight`, so it stays ordered with any later version.

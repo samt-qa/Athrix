@@ -545,3 +545,40 @@ fn held_folders_keep_their_documents_and_get_no_work() {
     assert_eq!(hits(&index, "forgotten").len(), 0);
     s.shutdown();
 }
+
+#[test]
+fn backlog_files_are_read_from_disk_when_their_turn_comes() {
+    let docs = tmp();
+    let root = docs.path();
+    many_files(root, 30);
+    write(&root.join("changes.txt"), "the first wording");
+    write(&root.join("leaves.txt"), "a file that goes away");
+    let (_ix, index) = open_index();
+    let sched = start(&index, config());
+    sched.pause();
+    let snap = snapshot(root);
+    assert_eq!(sched.enqueue_snapshot(&snap), 32);
+    // The same snapshot again replaces the backlog: nothing waits twice.
+    assert_eq!(sched.enqueue_snapshot(&snap), 32);
+    assert_eq!(sched.progress().queued, 32);
+
+    // Both files change after the scan and before their turn.
+    write(
+        &root.join("changes.txt"),
+        "a longer second wording quixotically",
+    );
+    fs::remove_file(root.join("leaves.txt")).unwrap();
+    sched.resume();
+    assert!(sched.wait_idle(LONG));
+
+    let p = sched.progress();
+    assert_eq!((p.indexed, p.queued, p.failed.total()), (31, 0, 0), "{p:?}");
+    assert_eq!(
+        hits(&index, "quixotically"),
+        [key(&root.join("changes.txt"))]
+    );
+    assert!(hits(&index, "goes").is_empty());
+    // The document carries the size read at extraction, so the next scan finds it current.
+    assert_eq!(sched.enqueue_snapshot(&snapshot(root)), 0);
+    sched.shutdown();
+}
