@@ -40,8 +40,12 @@
 //!   workers and writer applies back-pressure.
 //! - **Changes.** A watcher path is re-read from disk: an existing file is re-extracted, a
 //!   missing path is deleted together with every file this session queued below it (renames
-//!   are a delete plus an add), and a folder with no known files below it (renamed or copied
-//!   in) is listed and its entries queued.
+//!   are a delete plus an add), and a folder that appeared (renamed or copied in) is listed:
+//!   its candidate files are queued and its folders checked in turn. A folder counts as
+//!   seen before, and is left alone, if it was in the last snapshot, was listed since, or has
+//!   documents below it (8 bytes per folder of the snapshot). Without that memory a change
+//!   in a folder whose files are not extracted yet, or that has no text files at all, would
+//!   list the whole tree below it again, and a change in a drive's root the whole drive.
 //! - **Politeness.** [`ContentScheduler::pause`] / [`ContentScheduler::resume`], plus
 //!   auto-pause from a [`SystemProbe`] sampled every [`Politeness::probe_interval`]: on
 //!   battery, or when *other* programs use more than [`Politeness::busy_above`] of the CPU for
@@ -106,6 +110,7 @@
 mod backlog;
 mod candidate;
 mod extractor;
+mod known_dirs;
 mod probe;
 mod progress;
 mod queue;

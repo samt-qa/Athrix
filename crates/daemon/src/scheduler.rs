@@ -18,6 +18,7 @@ use crate::candidate::{
     Candidate, CandidateFilter, default_priority_folders, path_key, starts_with_ci,
 };
 use crate::extractor::{ExtractFailure, Extractor, InProcessExtractor};
+use crate::known_dirs::{KnownDirs, dir_hash};
 use crate::probe::{DefaultProbe, SystemProbe};
 use crate::progress::{FailureCounts, FailureKind, PauseReasons, Progress, RunState};
 use crate::queue::{Job, JobQueue, Prioritizer, Source};
@@ -163,6 +164,8 @@ struct State {
     docs_per_sec: f64,
     /// Folders on hold (drives unplugged): no work under them, see [`ContentScheduler::hold`].
     held: Vec<PathBuf>,
+    /// The folders already seen: a change reported for one of them does not list it again.
+    known_dirs: KnownDirs,
 }
 
 impl State {
@@ -430,6 +433,7 @@ impl ContentScheduler {
         let state = State {
             queue: JobQueue::default(),
             backlog: Backlog::default(),
+            known_dirs: KnownDirs::default(),
             in_flight: HashSet::new(),
             outstanding: 0,
             uncommitted: 0,
@@ -519,12 +523,18 @@ impl ContentScheduler {
         let mut backlog = BacklogBuilder::default();
         // Files the backlog cannot hold (a path that is not Unicode): the job queue takes them.
         let mut others = Vec::new();
+        // Every folder of the snapshot: a change reported for one of them later is a change
+        // inside an old folder, not a new folder to list (see the `known_dirs` module).
+        let mut dirs = Vec::new();
         for id in 0..snapshot.id_bound() {
             let Ok(id) = u32::try_from(id) else { break };
             if !snapshot.contains(id) {
                 continue;
             }
             let m = snapshot.meta(id);
+            if m.is_dir && !m.is_symlink {
+                dirs.push(dir_hash(&snapshot.path(id)));
+            }
             if m.is_dir || m.is_symlink || m.size > max {
                 continue;
             }
@@ -557,9 +567,11 @@ impl ContentScheduler {
         }
         drop(current);
         let backlog = backlog.finish();
+        let known_dirs = KnownDirs::new(dirs);
         let total = backlog.len() + others.len();
         {
             let mut st = self.shared.lock();
+            st.known_dirs = known_dirs;
             let old = std::mem::replace(&mut st.backlog, backlog);
             st.outstanding =
                 st.outstanding.saturating_sub(old.len() as u64) + st.backlog.len() as u64;
@@ -875,7 +887,7 @@ fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
                 }
             },
             Ok(md) if md.is_dir() => {
-                expand_dir(sh, &key, &path);
+                check_dir(sh, &key, &path);
                 sh.finish(&key, true);
             }
             Ok(_) => sh.finish(&key, true), // symlink or special file: never followed
@@ -883,29 +895,66 @@ fn run_job(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String, job: Job) {
     }
 }
 
-/// A folder appeared (created, renamed or copied in): queue its entries. A folder with
-/// indexed files below it existed before, and its children report their own changes.
-fn expand_dir(sh: &Shared, key: &str, dir: &Path) {
-    if sh.config.filter.is_excluded_dir(dir) || has_documents_below(sh, key) {
+/// A folder was reported as changed. If it appeared (created, renamed or copied in) its files
+/// are queued: they are not reported one by one. A folder seen before is left alone, its
+/// files report their own changes: one of the last snapshot, one listed since, or one with
+/// documents below it.
+fn check_dir(sh: &Shared, key: &str, dir: &Path) {
+    if sh.config.filter.is_excluded_dir(dir) || sh.lock().known_dirs.contains(dir) {
         return;
     }
+    if has_documents_below(sh, key) {
+        sh.lock().known_dirs.insert(dir);
+        return;
+    }
+    expand_dir(sh, dir);
+}
+
+/// Queues what is in the new folder `dir`: its candidate files, and its folders to be checked
+/// in turn. Files that are no candidates cost nothing more (a new folder has no documents to
+/// drop).
+fn expand_dir(sh: &Shared, dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let jobs = entries
-        .flatten()
-        .map(|e| {
-            let p = e.path();
-            (path_key(&p), Job::Check(p))
-        })
-        .collect();
+    let mut jobs = Vec::new();
+    let mut folders = Vec::new();
+    for e in entries.flatten() {
+        // The entry itself, never the target of a link.
+        let Ok(md) = e.metadata() else {
+            continue;
+        };
+        let p = e.path();
+        if md.is_dir() {
+            folders.push(p);
+        } else if md.is_file() {
+            if let Some(c) = sh.candidate(&p, md.len(), mtime_secs(&md)) {
+                jobs.push((path_key(&p), Job::Index(c)));
+            }
+        }
+    }
+    {
+        let mut st = sh.lock();
+        st.known_dirs.insert(dir);
+        // Whatever was at these paths before, the folders of a new folder are new too.
+        for f in &folders {
+            st.known_dirs.remove(f);
+        }
+    }
+    jobs.extend(folders.into_iter().map(|p| (path_key(&p), Job::Check(p))));
     sh.push_jobs(jobs, Source::Change);
 }
 
 /// True if the content index holds documents below the folder `key` (it existed before).
 fn has_documents_below(sh: &Shared, key: &str) -> bool {
-    let below = format!("{key}{}", std::path::MAIN_SEPARATOR);
-    sh.index.has_under(&below).unwrap_or(false)
+    sh.index.has_under(&below_prefix(key)).unwrap_or(false)
+}
+
+/// The prefix of every path below the folder `key`: one separator after it (the key of a
+/// drive's root already ends with one).
+fn below_prefix(key: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    format!("{}{sep}", key.trim_end_matches(sep))
 }
 
 /// The path `key` is gone: drops its queued jobs and failures and those below it, and deletes
@@ -915,6 +964,7 @@ fn delete_subtree(sh: &Shared, tx: &SyncSender<WriterMsg>, key: String) {
         let below = |k: &str| k.len() > key.len() && starts_with_ci(Path::new(k), Path::new(&key));
         let mut st = sh.lock();
         st.drop_queued_jobs(below);
+        st.known_dirs.remove(Path::new(&key));
         st.failures.retain(|k, _| k != &key && !below(k));
     }
     // Sent before the key leaves `in_flight`, so it stays ordered with any later version.
@@ -1194,5 +1244,13 @@ mod tests {
         assert_eq!(backoff_delay(3, &p), Some(Duration::from_millis(100)));
         assert_eq!(backoff_delay(4, &p), Some(Duration::from_millis(200)));
         assert_eq!(backoff_delay(40, &p), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn below_prefix_has_exactly_one_separator() {
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(below_prefix("docs"), format!("docs{sep}"));
+        // A drive's root: `D:\` must not become `D:\\`, which no path starts with.
+        assert_eq!(below_prefix(&format!("D:{sep}")), format!("D:{sep}"));
     }
 }

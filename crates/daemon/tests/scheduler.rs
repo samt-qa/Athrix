@@ -200,12 +200,59 @@ fn modify_delete_and_folder_rename_update_the_index() {
         ]
     );
 
+    // Renamed back: `dir` and `dir/deep` were in the scan, but they went away since, so
+    // they are listed again.
+    fs::rename(&new_dir, root.join("dir")).unwrap();
+    sched.paths_changed(&[new_dir.clone(), root.join("dir")]);
+    assert!(sched.wait_idle(LONG));
+    assert_eq!(
+        hits(&index, "galaxy"),
+        [
+            key(&root.join("dir").join("deep").join("two.md")),
+            key(&root.join("dir").join("one.md")),
+        ]
+    );
+
     // Delete.
     fs::remove_file(&a).unwrap();
     sched.paths_changed(&[&a]);
     assert!(sched.wait_idle(LONG));
     assert!(hits(&index, "rewritten").is_empty());
     assert!(sched.progress().deleted >= 3);
+    sched.shutdown();
+}
+
+#[test]
+fn a_folder_of_the_last_scan_is_not_listed_again() {
+    let docs = tmp();
+    let root = docs.path();
+    // No document below `pics`, so the index cannot tell that the folder is an old one.
+    write(&root.join("pics/a.bin"), [0u8; 16]);
+    write(&root.join("pics/more/b.bin"), [0u8; 16]);
+    let (_ix, index) = open_index();
+    let sched = start(&index, config());
+    assert_eq!(sched.enqueue_snapshot(&snapshot(root)), 0);
+
+    // The folder is reported (something in it changed), the file itself is not: a folder
+    // that was in the scan is not read again, its files report their own changes.
+    let late = root.join("pics/more/late.txt");
+    write(&late, "a latecomer zygomorphic");
+    sched.paths_changed(&[root.join("pics"), root.join("pics/more")]);
+    assert!(sched.wait_idle(LONG));
+    assert!(hits(&index, "zygomorphic").is_empty());
+    sched.paths_changed(&[&late]);
+    assert!(sched.wait_idle(LONG));
+    assert_eq!(hits(&index, "zygomorphic"), [key(&late)]);
+
+    // A folder that appeared after the scan is listed, once, with everything below it.
+    write(&root.join("new/deep/c.txt"), "a newcomer xylophonic");
+    write(&root.join("new/deep/d.bin"), [0u8; 16]);
+    sched.paths_changed(&[root.join("new")]);
+    assert!(sched.wait_idle(LONG));
+    assert_eq!(
+        hits(&index, "xylophonic"),
+        [key(&root.join("new").join("deep").join("c.txt"))]
+    );
     sched.shutdown();
 }
 
