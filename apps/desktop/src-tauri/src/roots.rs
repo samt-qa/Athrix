@@ -16,7 +16,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,14 @@ pub struct DriveSettings {
     pub include_removable: bool,
     /// Mapped network drives are indexed while connected. Default off (slow, and often huge).
     pub include_network: bool,
+    /// The OneDrive folders ([`onedrive_folders`]) are indexed. Default on. Unlike the two
+    /// above, this applies to chosen folders too.
+    #[serde(default = "yes")]
+    pub include_onedrive: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for DriveSettings {
@@ -47,6 +55,7 @@ impl Default for DriveSettings {
         DriveSettings {
             include_removable: true,
             include_network: false,
+            include_onedrive: true,
         }
     }
 }
@@ -82,6 +91,7 @@ impl DriveSettingsStore {
     /// Points the setting at `file` and loads it.
     pub fn load_from(&self, file: PathBuf) {
         let settings = read_drive_settings(&file);
+        set_onedrive_excluded(!settings.include_onedrive);
         *self.lock() = (Some(file), settings);
     }
 
@@ -95,6 +105,7 @@ impl DriveSettingsStore {
     pub fn set(&self, settings: DriveSettings) -> io::Result<()> {
         let mut s = self.lock();
         s.1 = settings;
+        set_onedrive_excluded(!settings.include_onedrive);
         match &s.0 {
             Some(file) => {
                 let body = DriveSettingsFile {
@@ -113,6 +124,47 @@ impl DriveSettingsStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, (Option<PathBuf>, DriveSettings)> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Folders every walk leaves out (see [`excluded_folders`]): the OneDrive folders while
+/// [`DriveSettings::include_onedrive`] is off.
+static EXCLUDED_FOLDERS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
+
+fn set_onedrive_excluded(excluded: bool) {
+    let folders = if excluded {
+        onedrive_folders()
+    } else {
+        Vec::new()
+    };
+    *EXCLUDED_FOLDERS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = folders;
+}
+
+/// Folders left out of every walk by the settings (added to the walk options as prefixes).
+pub fn excluded_folders() -> Vec<PathBuf> {
+    EXCLUDED_FOLDERS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// The OneDrive folders of this user, from the variables OneDrive sets (`OneDrive`,
+/// `OneDriveConsumer`, `OneDriveCommercial`): existing absolute folders, without duplicates.
+pub fn onedrive_folders() -> Vec<PathBuf> {
+    onedrive_folders_from(|name| std::env::var_os(name))
+}
+
+fn onedrive_folders_from(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for name in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        let Some(v) = var(name) else { continue };
+        let p = PathBuf::from(v);
+        if p.is_absolute() && p.is_dir() && !out.iter().any(|o| path_key(o) == path_key(&p)) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn read_drive_settings(file: &Path) -> DriveSettings {
@@ -558,6 +610,26 @@ mod tests {
     }
 
     #[test]
+    fn onedrive_folders_are_existing_absolute_and_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let personal = dir.path().join("OneDrive");
+        fs::create_dir_all(&personal).unwrap();
+        let p = personal.clone();
+        let found = onedrive_folders_from(|name| match name {
+            "OneDrive" | "OneDriveConsumer" => Some(p.clone().into_os_string()),
+            "OneDriveCommercial" => Some("relative".into()),
+            _ => None,
+        });
+        assert_eq!(found, [personal]);
+        assert!(onedrive_folders_from(|_| None).is_empty());
+        // An older settings file without the field keeps OneDrive indexed.
+        let old: DriveSettingsFile =
+            serde_json::from_str(r#"{"version":1,"includeRemovable":true,"includeNetwork":false}"#)
+                .unwrap();
+        assert!(old.settings.include_onedrive);
+    }
+
+    #[test]
     fn drive_settings_default_round_trip_and_fall_back() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(DRIVE_SETTINGS_FILE);
@@ -567,19 +639,26 @@ mod tests {
             store.get(),
             DriveSettings {
                 include_removable: true,
-                include_network: false
+                include_network: false,
+                include_onedrive: true
             },
             "defaults: removable on, network off"
         );
         let changed = DriveSettings {
             include_removable: false,
             include_network: true,
+            include_onedrive: false,
         };
         store.set(changed).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"version": 1, "includeRemovable": false, "includeNetwork": true})
+            serde_json::json!({
+                "version": 1,
+                "includeRemovable": false,
+                "includeNetwork": true,
+                "includeOnedrive": false
+            })
         );
         let again = DriveSettingsStore::default();
         again.load_from(file.clone());
@@ -613,11 +692,13 @@ mod tests {
             let none = DriveSettings {
                 include_removable: false,
                 include_network: false,
+                include_onedrive: true,
             };
             assert_eq!(roots(none, &[]).roots, [PathBuf::from("C:\\")]);
             let all = DriveSettings {
                 include_removable: true,
                 include_network: true,
+                include_onedrive: true,
             };
             assert_eq!(roots(all, &[]).roots.len(), 3, "unknown kinds never");
             // A stick seen earlier and unplugged since stays known, offline.
@@ -682,6 +763,7 @@ mod tests {
         let off = DriveSettings {
             include_removable: false,
             include_network: false,
+            include_onedrive: true,
         };
         assert_eq!(
             plan(&chosen(&["/media/usb/docs"]), &vols, off, &[])

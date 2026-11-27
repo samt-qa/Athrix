@@ -1463,9 +1463,13 @@ fn root_strings(roots: &[PathBuf]) -> Vec<String> {
 }
 
 /// Walk options for `roots` with the default exclusions from the IPC contract (the shared list
-/// of [`athrix_fs_index::exclude`], also used by the CLI and the content daemon).
+/// of [`athrix_fs_index::exclude`], also used by the CLI and the content daemon), plus the
+/// folders the settings leave out ([`crate::roots::excluded_folders`]: OneDrive when off).
 pub fn walk_options(roots: &[PathBuf]) -> WalkOptions {
-    WalkOptions::new(roots.iter().cloned()).with_default_exclusions()
+    crate::roots::excluded_folders().into_iter().fold(
+        WalkOptions::new(roots.iter().cloned()).with_default_exclusions(),
+        WalkOptions::exclude_prefix,
+    )
 }
 
 #[cfg(test)]

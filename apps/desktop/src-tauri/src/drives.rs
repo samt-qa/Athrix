@@ -415,7 +415,33 @@ pub async fn set_drive_settings(
     if let Err(e) = state.drive_settings.set(settings) {
         tracing::warn!(error = %e, "cannot save the drive settings");
     }
-    if before != settings && state.roots.choice() == RootsChoice::WholeComputer {
+    if before.include_onedrive != settings.include_onedrive {
+        let handle = app.clone();
+        let dropped = before.include_onedrive;
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = handle.state::<AppState>();
+            let roots: Vec<PathBuf> = state
+                .indexer
+                .status()
+                .roots
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            if dropped {
+                state.content.forget_roots(&roots::onedrive_folders(), &[]);
+            }
+            // The exclusions changed: walk everything again with them.
+            if !roots.is_empty() {
+                let outcome = state.indexer.start(roots, status_listener(&handle));
+                tracing::info!(?outcome, dropped, "OneDrive setting changed; re-indexing");
+            }
+        })
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?;
+    }
+    let drives_changed = before.include_removable != settings.include_removable
+        || before.include_network != settings.include_network;
+    if drives_changed && state.roots.choice() == RootsChoice::WholeComputer {
         let handle = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let state = handle.state::<AppState>();

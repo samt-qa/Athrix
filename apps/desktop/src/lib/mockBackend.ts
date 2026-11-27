@@ -45,7 +45,7 @@ const VOLUMES: Volume[] = [
 /** The USB stick of `VOLUMES` (plugged in unless `?mockUsb` pulled it out). */
 const USB = "E:\\";
 let usbPlugged = true;
-let driveSettings: DriveSettings = { includeRemovable: true, includeNetwork: false };
+let driveSettings: DriveSettings = { includeRemovable: true, includeNetwork: false, includeOnedrive: true };
 const volumesNow = () => VOLUMES.filter((v) => usbPlugged || v.path !== USB);
 /** Fixed drives, plus the USB stick when the settings take it in (offline while unplugged). */
 const wholeComputer = () =>
@@ -1526,7 +1526,11 @@ export async function handle<C extends CommandName>(cmd: C, rawArgs: CommandArgs
       break;
     case "set_drive_settings": {
       const next = args.settings as DriveSettings;
-      driveSettings = { includeRemovable: next.includeRemovable !== false, includeNetwork: next.includeNetwork === true };
+      driveSettings = {
+        includeRemovable: next.includeRemovable !== false,
+        includeNetwork: next.includeNetwork === true,
+        includeOnedrive: next.includeOnedrive !== false,
+      };
       if (chosenRoots === null) {
         const roots = wholeComputer();
         const same = roots.length === indexedRoots.length && roots.every((x, i) => pathKey(x) === pathKey(indexedRoots[i]));

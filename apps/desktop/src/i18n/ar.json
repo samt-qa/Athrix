@@ -156,6 +156,8 @@
   "drives.includeRemovableHint": "تُفهرَس ذاكرات USB وبطاقات الذاكرة عند توصيلها، وتختفي نتائجها عند فصلها (مع خيار «كل الجهاز»).",
   "drives.includeNetwork": "تضمين أقراص الشبكة",
   "drives.includeNetworkHint": "قد تكون فهرسة أقراص الشبكة المعيّنة ومراقبتها بطيئة.",
+  "drives.includeOnedrive": "تضمين OneDrive",
+  "drives.includeOnedriveHint": "عند الإيقاف لا تُفهرَس مجلدات OneDrive ولا محتوى ملفاتها، وتُحذف نتائجها الحالية. يُعاد المسح بعد التغيير.",
   "search.region": "البحث",
   "search.inputLabel": "البحث عن الملفات",
   "search.placeholder": "ابحث عن ملف، أو محتوى، أو فكرة…",

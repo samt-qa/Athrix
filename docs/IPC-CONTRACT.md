@@ -89,6 +89,7 @@ interface IndexRoots {      // إعداد "ماذا نفهرس" (get_index_roots
 interface DriveSettings {   // (2.5) الأقراص الخارجية في «كل الجهاز» (get_drive_settings / set_drive_settings)
   includeRemovable: boolean; // ذاكرات USB وبطاقات الذاكرة؛ الافتراضي true
   includeNetwork: boolean;   // أقراص الشبكة المعيّنة بحرف؛ الافتراضي false
+  includeOnedrive: boolean;  // مجلدات OneDrive (متغيرات OneDrive*) في أي وضع؛ الافتراضي true
 }
 
 interface SearchResponse {
@@ -161,7 +162,7 @@ type PreviewBody =          // موسوم بالحقل kind
 | `get_index_roots` | — | `IndexRoots` | الإعداد الحالي والمجلدات التي يفهرسها |
 | `set_index_roots` | `{ roots: string[] \| null }` | `IndexRoots` | `null` = كل الجهاز؛ وإلا هذه الأقراص/المجلدات بالضبط (`"d:"` و `"D:/"` ⇠ `"D:\\"`، والمكرر أو المتداخل يُحذف). يُحفظ في `<app_data>/indexed-roots.json` ويُستخدم عند الإقلاع قبل تحميل الواجهة. إن تغيّرت المجلدات تُمشى المجلدات الجديدة وحدها وتُدمج (تُصفّ خلف فهرسة جارية، الأحدث يفوز)، وما أُزيل يُحذف من الفهرس **ومن فهرس المحتوى**. قائمة فارغة أو مسار نسبي ⇠ رفض |
 | `get_drive_settings` | — | `DriveSettings` | (2.5) هل تدخل الأقراص الخارجية في «كل الجهاز» |
-| `set_drive_settings` | `{ settings: DriveSettings }` | `DriveSettings` | (2.5) يحفظ في `<app_data>/drive-settings.json` (`{"version":1,"includeRemovable":true,"includeNetwork":false}`؛ ملف مفقود أو تالف ⇠ الافتراضي). مع «كل الجهاز»: الأقراص التي صار يشملها تُمشى وحدها، والتي استُبعدت تُحذف من الفهرس ومن فهرس المحتوى. فشل الحفظ يُسجَّل فقط |
+| `set_drive_settings` | `{ settings: DriveSettings }` | `DriveSettings` | (2.5) يحفظ في `<app_data>/drive-settings.json` (`{"version":1,"includeRemovable":true,"includeNetwork":false,"includeOnedrive":true}`؛ ملف مفقود أو تالف ⇠ الافتراضي، وحقل `includeOnedrive` المفقود ⇠ true). تغيير `includeOnedrive` يعيد المسح الكامل باستثناء مجلدات OneDrive أو بتضمينها، وإيقافه يحذف محتواها من فهرس المحتوى. مع «كل الجهاز»: الأقراص التي صار يشملها تُمشى وحدها، والتي استُبعدت تُحذف من الفهرس ومن فهرس المحتوى. فشل الحفظ يُسجَّل فقط |
 | `search` | `{ query: string, limit: number, requestId: number, scope?: string \| null }` | `SearchResponse` | كل طلب جديد يلغي السابق. الاستعلام الفارغ ⇠ `items: []`. إن لم يكن الفهرس جاهزًا ⇠ `items: []` بلا خطأ. `scope`: قرص (`"D:\\"`، يقبل `"d:"`) أو مجلد مطلق؛ تُعاد فقط العناصر تحته (مقارنة غير حساسة لحالة الأحرف على ويندوز). `null`/فارغ = كل الفهرس. نطاق خارج كل المجلدات المفهرسة ⇠ `items: []` بلا خطأ؛ مسار نسبي ⇠ رفض بـ `"invalid search scope: …"` |
 | `search_suggest` | وسائط `search` نفسها | `SuggestResponse` | «هل تقصد…» لاستعلام أعاد `search` له `items: []` بلا خطأ (انظر أدناه). تطلبه الواجهة بعد سكون قصير، فلا يؤخّر رد البحث الفارغ. يشارك `search` علم الإلغاء: أي `search` أحدث يلغيه (`cancelled: true`) |
 | `find_similar` | `{ id: number, requestId: number, scope?: string \| null, limit?: number }` | `SearchResponse` | (6.7) «صور مشابهة» للنتيجة `id` (صورة): الصور الأشبه بها أولًا، مع `similarity` لكل صف و`similar` في الاستجابة؛ انظر «الصور المشابهة» أدناه. يشارك `search` علم الإلغاء. معرّف قديم أو ليس صورة أو صورة تتعذّر قراءتها ⇠ رفض برسالة إنجليزية |

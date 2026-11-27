@@ -156,6 +156,8 @@
   "drives.includeRemovableHint": "USB sticks and memory cards are indexed when plugged in and hidden from results when removed (with \"Whole computer\").",
   "drives.includeNetwork": "Include network drives",
   "drives.includeNetworkHint": "Mapped network drives can be slow to index and to watch.",
+  "drives.includeOnedrive": "Include OneDrive",
+  "drives.includeOnedriveHint": "When off, OneDrive folders and their file contents are not indexed and their current results are removed. The index is rebuilt after a change.",
   "search.region": "Search",
   "search.inputLabel": "Search files",
   "search.placeholder": "Search for a file, content, or an idea…",

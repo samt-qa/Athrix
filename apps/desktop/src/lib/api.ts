@@ -224,6 +224,8 @@ export interface DriveSettings {
   includeRemovable: boolean;
   /** Mapped network drives. Default false. */
   includeNetwork: boolean;
+  /** The OneDrive folders, in any indexing mode. Default true. */
+  includeOnedrive: boolean;
 }
 
 /** Header of a preview: name, full path and metadata of the entry. */

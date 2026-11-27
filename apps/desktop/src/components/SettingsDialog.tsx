@@ -292,6 +292,13 @@ export default function SettingsDialog(props: Props) {
                         label={t("drives.includeNetwork")}
                         hint={t("drives.includeNetworkHint")}
                       />
+                      <SwitchRow
+                        checked={d().includeOnedrive}
+                        disabled={drivesBusy()}
+                        onChange={(on) => void changeDrives({ includeOnedrive: on })}
+                        label={t("drives.includeOnedrive")}
+                        hint={t("drives.includeOnedriveHint")}
+                      />
                     </>
                   )}
                 </Show>
