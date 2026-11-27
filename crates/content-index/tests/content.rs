@@ -190,7 +190,15 @@ fn snippet_highlights_point_at_the_diacritized_original() {
 fn snippet_of_a_long_document_is_short_and_centered() {
     let filler = "هذه جملة عادية لا تحتوي على الكلمة. ".repeat(200);
     let text = format!("{filler}وهنا الْكَلِمَةُ الْمَطْلُوبَةُ أخيرا. {filler}");
-    let (_d, idx) = index_with(&[("long", &text)]);
+    // Store more than the default 64 KiB so the scan goes past its first window.
+    let dir = TempDir::new().unwrap();
+    let opts = IndexOptions {
+        stored_text_limit: 512 << 10,
+        ..IndexOptions::default()
+    };
+    let idx = ContentIndex::open_or_create_with(dir.path(), opts).unwrap();
+    idx.add_or_update("long", META, &text).unwrap();
+    idx.commit().unwrap();
     let hit = &idx.search("المطلوبة", 1).unwrap()[0];
     let s = snippet(&idx, "المطلوبة", &hit.path);
     assert!(s.fragment.len() <= IndexOptions::default().snippet_bytes);
@@ -260,7 +268,15 @@ fn a_long_document_gets_the_same_snippet_as_a_full_scan() {
     let filler = "هذه جملة عادية لا تحتوي على الكلمة. ".repeat(5000);
     assert!(filler.len() > 200 << 10);
     let text = format!("{filler}وهنا الْكَلِمَةُ الْمَطْلُوبَةُ أخيرا. {filler}");
-    let (_d, idx) = index_with(&[("long", &text)]);
+    // Store more than the default 64 KiB so the scan goes past its first window.
+    let dir = TempDir::new().unwrap();
+    let opts = IndexOptions {
+        stored_text_limit: 512 << 10,
+        ..IndexOptions::default()
+    };
+    let idx = ContentIndex::open_or_create_with(dir.path(), opts).unwrap();
+    idx.add_or_update("long", META, &text).unwrap();
+    idx.commit().unwrap();
     let hits = idx.search("المطلوبة", 5).unwrap();
     assert_eq!(hits.len(), 1);
     let s = snippet(&idx, "المطلوبة", &hits[0].path);

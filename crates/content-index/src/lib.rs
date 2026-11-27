@@ -14,7 +14,7 @@
 //!
 //! Storage decision: snippets need the text, and re-extracting a PDF or DOCX for each of the
 //! 20 hits on screen costs tens to hundreds of milliseconds each. So the text is stored, but
-//! only a prefix (512 KiB by default, compressed with lz4 in pure Rust; zstd would need a C
+//! only a prefix (64 KiB by default, compressed with lz4 in pure Rust; zstd would need a C
 //! build). Most documents fit entirely. For a longer one, a match past the prefix still
 //! matches and ranks, and its snippet falls back to the start of the document; the preview
 //! pane (task 4.6) can re-extract that one file on demand. Set the limit to 0 to store
@@ -158,7 +158,7 @@ pub struct IndexOptions {
     /// Writer memory budget in bytes (default 64 MB; tantivy needs at least 15 MB). The
     /// writer flushes a segment when it is reached.
     pub memory_budget: usize,
-    /// How many bytes of each document's text are stored for snippets (default 512 KiB).
+    /// How many bytes of each document's text are stored for snippets (default 64 KiB).
     pub stored_text_limit: usize,
     /// Approximate snippet length in bytes (default 300: about 150 Arabic letters).
     pub snippet_bytes: usize,
@@ -172,7 +172,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         IndexOptions {
             memory_budget: 64 << 20,
-            stored_text_limit: 512 << 10,
+            stored_text_limit: 64 << 10,
             snippet_bytes: 300,
             pending_text_limit: 32 << 20,
         }
