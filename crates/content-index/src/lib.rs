@@ -108,7 +108,8 @@ use tantivy::{
 };
 
 /// Version of the schema below. Bump it when fields change; old indexes are then rebuilt.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: the stored preview became 64 KiB (was 512 KiB); rebuilding frees the space.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// File written next to the tantivy files: marks the directory as ours and records versions.
 const MARKER_FILE: &str = "athrix-content-index.version";

@@ -262,7 +262,7 @@ fn paging_and_totals() {
 
 #[test]
 fn schema_1_index_is_rebuilt() {
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(SCHEMA_VERSION, 3);
     let dir = TempDir::new().unwrap();
     drop(ContentIndex::open_or_create(dir.path()).unwrap());
     std::fs::write(
